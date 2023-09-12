@@ -159,7 +159,7 @@ void SoapyRPITX::setGainMode(const int direction, const size_t channel, const bo
 }
 
 bool SoapyRPITX::getGainMode(const int direction, const size_t channel) const {
-    return Soapy_libRPITX_getGainMode();
+    return Soapy_libRPITX_getGainMode(direction, channel, 0);
 }
 
 void SoapyRPITX::setGain(const int direction, const size_t channel, const double value) {

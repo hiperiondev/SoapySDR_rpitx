@@ -44,6 +44,6 @@ int Soapy_libRPITX_getSampleRate(void);
 int Soapy_libRPITX_setIQBurst(unsigned int iqburst);
 unsigned int Soapy_libRPITX_getIQBurst(void);
 void Soapy_libRPITX_setGainMode(const int direction, const size_t channel, const bool automatic);
-int Soapy_libRPITX_getGainMode(void);
+bool Soapy_libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic);
 void Soapy_libRPITX_setGain(const int direction, const size_t channel, const double value);
 double Soapy_libRPITX_getGain(void);
