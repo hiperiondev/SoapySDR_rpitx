@@ -27,11 +27,26 @@
  */
 
 #include <stddef.h>
+#include <complex>
+
+#include "Soapy_libRPITX.hpp"
 
 float Soapy_libRPITX_Frequency = 01e6;
 float Soapy_libRPITX_PPM = 0;
 int Soapy_libRPITX_SampleRate = 48000;
 int Soapy_libRPITX_IQBurst = 4000;
+double Soapy_libRPITX_Gain = 0;
+
+std::complex<float> *CIQBuffer;
+
+std::complex<float>* Soapy_libRPITX_init(void) {
+    CIQBuffer = (std::complex<float>*) malloc(Soapy_libRPITX_IQBurst * sizeof(std::complex<float>));
+    return CIQBuffer;
+}
+
+void Soapy_libRPITX_deinit(void) {
+    free(CIQBuffer);
+}
 
 int Soapy_libRPITX_setFrequency(float frequency) {
     Soapy_libRPITX_Frequency = frequency;
@@ -78,9 +93,9 @@ int Soapy_libRPITX_getGainMode(const int direction, const size_t channel, const 
 }
 
 void Soapy_libRPITX_setGain(const int direction, const size_t channel, const double value) {
-
+    Soapy_libRPITX_Gain = value;
 }
 
 double Soapy_libRPITX_getGain(void) {
-    return 0;
+    return Soapy_libRPITX_Gain;
 }

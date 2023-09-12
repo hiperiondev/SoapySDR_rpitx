@@ -30,6 +30,11 @@
 
 #include <stddef.h>
 
+extern std::complex<float> *CIQBuffer;
+
+std::complex<float>* Soapy_libRPITX_init(void);
+void Soapy_libRPITX_deinit(void);
+
 int Soapy_libRPITX_setFrequency(float frequency);
 float Soapy_libRPITX_getFrequency(void);
 int Soapy_libRPITX_setPPM(float ppm);

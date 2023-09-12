@@ -35,6 +35,7 @@
 #include <chrono>
 
 #include "SoapyRPITX.hpp"
+#include "Soapy_libRPITX.hpp"
 
 //TODO: Need to be a power of 2 for maximum efficiency ?
 # define DEFAULT_RX_BUFFER_SIZE (1 << 16)
@@ -50,7 +51,7 @@ std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const
 
 std::string SoapyRPITX::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
     if (direction == SOAPY_SDR_TX) {
-        // TODO:
+        fullScale = 32768;
     }
 
     return SOAPY_SDR_CF32;
@@ -63,19 +64,12 @@ SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const s
     return streamArgs;
 }
 
-bool SoapyRPITX::IsValidRxStreamHandle(SoapySDR::Stream *handle) const {
-    return false;
-}
-
 bool SoapyRPITX::IsValidTxStreamHandle(SoapySDR::Stream *handle) const {
     if (handle == nullptr) {
         return false;
     }
 
-    //handle is an opaque pointer hiding either rx_stream or tx_streamer:
-    //check that the handle matches one of them, consistently with direction:
     if (tx_stream) {
-        //test if these handles really belong to us:
         if (reinterpret_cast<tx_streamer*>(handle) == tx_stream.get()) {
             return true;
         }
@@ -85,25 +79,21 @@ bool SoapyRPITX::IsValidTxStreamHandle(SoapySDR::Stream *handle) const {
 }
 
 SoapySDR::Stream* SoapyRPITX::setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels, const SoapySDR::Kwargs &args) {
-    //check the format
-    rpitxStreamFormat streamFormat;
-    if (format == SOAPY_SDR_CF32) {
-        SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32.");
-        streamFormat = RPITX_SDR_CF32;
-    } else if (format == SOAPY_SDR_CS16) {
-        SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16.");
-        streamFormat = RPITX_SDR_CS16;
-    } else {
-        throw std::runtime_error("setupStream invalid format '" + format + "' -- Only CS16 and CF32 are supported by RPITX module.");
-    }
-
     if (direction == SOAPY_SDR_TX) {
+        rpitxStreamFormat streamFormat;
+        if (format == SOAPY_SDR_CF32) {
+            SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32.");
+            streamFormat = RPITX_SDR_CF32;
+        } else if (format == SOAPY_SDR_CS16) {
+            SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16.");
+            streamFormat = RPITX_SDR_CS16;
+        } else {
+            throw std::runtime_error("setupStream invalid format '" + format + "' -- Only CS16 and CF32 are supported by RPITX module.");
+        }
 
         std::lock_guard<rpitx_spin_mutex> lock(tx_device_mutex);
 
-        // TODO:
-
-        this->tx_stream = std::unique_ptr<tx_streamer>(new tx_streamer(streamFormat, channels, args));
+        this->tx_stream = std::unique_ptr<tx_streamer>(new tx_streamer(streamFormat, args));
 
         return reinterpret_cast<SoapySDR::Stream*>(this->tx_stream.get());
     }
@@ -118,15 +108,13 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
         if (IsValidTxStreamHandle(handle)) {
             this->tx_stream.reset();
-
-            // TODO:
         }
     }
 }
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
     if (IsValidTxStreamHandle(handle)) {
-        return 4096;
+        return Soapy_libRPITX_getIQBurst();
     }
 
     return 0;
@@ -173,25 +161,80 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
     return SOAPY_SDR_NOT_SUPPORTED;
 }
 
-tx_streamer::tx_streamer(const rpitxStreamFormat _format, const std::vector<size_t> &channels, const SoapySDR::Kwargs &args) {
+////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // TODO:
+tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
+    buf_size = (size_t) Soapy_libRPITX_getIQBurst;
+    items_in_buf = 0;
+    buf = Soapy_libRPITX_init();
+    if (!buf) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "Unable to create buffer!");
+        throw std::runtime_error("Unable to create buffer!");
+    }
     direct_copy = has_direct_copy();
-
-    SoapySDR_logf(SOAPY_SDR_INFO, "Has direct TX copy: %d", (int) direct_copy);
 }
 
 tx_streamer::~tx_streamer() {
-    //TODO:
+    Soapy_libRPITX_deinit();
 }
 
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
     size_t items = std::min(buf_size - items_in_buf, numElems);
+    //ptrdiff_t buf_step =  //in bytes step(buf);
 
-    if (direct_copy && format == RPITX_SDR_CS16) {
-        // TODO:
+    if (direct_copy) {
+        switch (format) {
+            case RPITX_SDR_CS16:
+                // TODO:
+                break;
+
+            case RPITX_SDR_CF32:
+                // TODO:
+                break;
+
+            default:
+                SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
+                throw std::runtime_error("Stream format not allowed");
+        }
     } else {
-        // TODO:
+        switch (format) {
+            case RPITX_SDR_CS16:
+                //int16_t *samples_cs16 = (int16_t*) buffs[0];
+
+                for (size_t j = 0; j < items; ++j) {
+                    //src = samples_cs16[j * 2];
+
+                    //dst_ptr += buf_step;
+                }
+                break;
+
+            case RPITX_SDR_CF32:
+                //float *samples_cf32 = (float*) buffs[0];
+
+                for (size_t j = 0; j < items; ++j) {
+                    //src = (int16_t) (samples_cf32[j * 2 + k] * 32767.999f); // 32767.999f (0x46ffffff) will ensure better distribution
+
+                    //dst_ptr += buf_step;
+                }
+                break;
+
+            default:
+                SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
+                throw std::runtime_error("Stream format not allowed");
+        }
+    }
+    items_in_buf += items;
+
+    if (items_in_buf == buf_size || ((flags & SOAPY_SDR_END_BURST) && numElems == items)) {
+        int ret = send_buf();
+
+        if (ret < 0) {
+            return SOAPY_SDR_ERROR;
+        }
+
+        if ((size_t) ret != buf_size) {
+            return SOAPY_SDR_ERROR;
+        }
     }
 
     return items;
@@ -202,19 +245,29 @@ int tx_streamer::flush() {
 }
 
 int tx_streamer::send_buf() {
+    if (!buf) {
+        return 0;
+    }
+
     if (items_in_buf > 0) {
         if (items_in_buf < buf_size) {
-            // TODO:
+            /*
+            ptrdiff_t buf_step = iio_buffer_step(buf);
+            uint8_t *buf_ptr = (uint8_t*) iio_buffer_start(buf) + items_in_buf * buf_step;
+            uint8_t *buf_end = (uint8_t*) iio_buffer_end(buf);
+
+            memset(buf_ptr, 0, buf_end - buf_ptr);
+            */
         }
 
-        ssize_t ret = items_in_buf;
+        ssize_t ret = items_in_buf; //iio_buffer_push(buf);
         items_in_buf = 0;
 
         if (ret < 0) {
             return ret;
         }
 
-        return int(ret);
+        return int(ret / 1);//iio_buffer_step(buf));
     }
 
     return 0;
