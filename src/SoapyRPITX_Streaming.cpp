@@ -35,7 +35,7 @@
 #include <chrono>
 
 #include "SoapyRPITX.hpp"
-#include "Soapy_libRPITX.hpp"
+#include "libRPITX.hpp"
 
 //TODO: Need to be a power of 2 for maximum efficiency ?
 # define DEFAULT_RX_BUFFER_SIZE (1 << 16)
@@ -58,8 +58,16 @@ std::string SoapyRPITX::getNativeStreamFormat(const int direction, const size_t 
 }
 
 SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const size_t channel) const {
-    // TODO:
     SoapySDR::ArgInfoList streamArgs;
+
+    SoapySDR::ArgInfo buffersArg;
+    buffersArg.key = "buffers";
+    buffersArg.value = std::to_string(4000);
+    buffersArg.name = "Buffer Count";
+    buffersArg.description = "Number of buffers per read.";
+    buffersArg.units = "buffers";
+    buffersArg.type = SoapySDR::ArgInfo::INT;
+    streamArgs.push_back(buffersArg);
 
     return streamArgs;
 }
@@ -114,7 +122,7 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
     if (IsValidTxStreamHandle(handle)) {
-        return Soapy_libRPITX_getIQBurst();
+        return libRPITX_getIQBurst();
     }
 
     return 0;
@@ -125,6 +133,7 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
     if (flags & ~SOAPY_SDR_END_BURST)
         return SOAPY_SDR_NOT_SUPPORTED;
 
+    SoapySDR_logf(SOAPY_SDR_INFO, "Start TX");
     return 0;
 }
 
@@ -164,9 +173,9 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
-    buf_size = (size_t) Soapy_libRPITX_getIQBurst();
+    buf_size = (size_t) libRPITX_getIQBurst();
     items_in_buf = 0;
-    buf = Soapy_libRPITX_init();
+    buf = libRPITX_init();
     if (!buf) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "Unable to create buffer!");
         throw std::runtime_error("Unable to create buffer!");
@@ -175,7 +184,7 @@ tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs
 }
 
 tx_streamer::~tx_streamer() {
-    Soapy_libRPITX_deinit();
+    libRPITX_deinit();
 }
 
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
@@ -205,7 +214,7 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
                 float *samples_cf32 = (float*) buffs[0];
 
                 for (size_t j = 0; j < items; j += 2) {
-                    if(Soapy_libRPITX_bufferAdd(samples_cf32[j], samples_cf32[j + 1])){
+                    if(libRPITX_bufferAdd(samples_cf32[j], samples_cf32[j + 1])){
                         items = items - j;
                         break;
                     }
@@ -243,10 +252,10 @@ int tx_streamer::flush() {
 
 int tx_streamer::send_buf() {
     if (items_in_buf > 0) {
-        Soapy_libRPITX_transmit();
+        libRPITX_transmit();
         items_in_buf = 0;
 
-        return int(Soapy_libRPITX_getIQBurst());
+        return int(libRPITX_getIQBurst());
     }
 
     return 0;

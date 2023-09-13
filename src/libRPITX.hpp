@@ -32,20 +32,20 @@
 
 extern std::complex<float> *CIQBuffer;
 
-std::complex<float>* Soapy_libRPITX_init(void);
-void Soapy_libRPITX_deinit(void);
+std::complex<float>* libRPITX_init(void);
+void libRPITX_deinit(void);
 
-int Soapy_libRPITX_setFrequency(float frequency);
-float Soapy_libRPITX_getFrequency(void);
-int Soapy_libRPITX_setPPM(float ppm);
-float Soapy_libRPITX_getPPM(void);
-int Soapy_libRPITX_setSampleRate(int samplerate);
-int Soapy_libRPITX_getSampleRate(void);
-int Soapy_libRPITX_setIQBurst(unsigned int iqburst);
-unsigned int Soapy_libRPITX_getIQBurst(void);
-void Soapy_libRPITX_setGainMode(const int direction, const size_t channel, const bool automatic);
-bool Soapy_libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic);
-void Soapy_libRPITX_setGain(const int direction, const size_t channel, const double value);
-double Soapy_libRPITX_getGain(void);
-void Soapy_libRPITX_transmit(void);
-int Soapy_libRPITX_bufferAdd(float I, float Q);
+int libRPITX_setFrequency(float frequency);
+float libRPITX_getFrequency(void);
+int libRPITX_setPPM(float ppm);
+float libRPITX_getPPM(void);
+int libRPITX_setSampleRate(int samplerate);
+int libRPITX_getSampleRate(void);
+int libRPITX_setIQBurst(unsigned int iqburst);
+unsigned int libRPITX_getIQBurst(void);
+void libRPITX_setGainMode(const int direction, const size_t channel, const bool automatic);
+bool libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic);
+void libRPITX_setGain(const int direction, const size_t channel, const double value);
+double libRPITX_getGain(void);
+void libRPITX_transmit(void);
+int libRPITX_bufferAdd(float I, float Q);

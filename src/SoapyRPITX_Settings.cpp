@@ -27,7 +27,7 @@
  */
 
 #include "SoapyRPITX.hpp"
-#include "Soapy_libRPITX.hpp"
+#include "libRPITX.hpp"
 
 SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) :
         gainMode(false), decimation(false), interpolation(false) {
@@ -42,7 +42,6 @@ SoapyRPITX::~SoapyRPITX(void) {
 /*******************************************************************
  * Identification API
  ******************************************************************/
-
 std::string SoapyRPITX::getDriverKey(void) const {
     return "rpitx";
 }
@@ -67,7 +66,6 @@ SoapySDR::Kwargs SoapyRPITX::getHardwareInfo(void) const {
 /*******************************************************************
  * Channels API
  ******************************************************************/
-
 size_t SoapyRPITX::getNumChannels(const int dir) const {
     return (1);
 }
@@ -79,7 +77,6 @@ bool SoapyRPITX::getFullDuplex(const int direction, const size_t channel) const 
 /*******************************************************************
  * Settings API
  ******************************************************************/
-
 SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     SoapySDR::ArgInfoList setArgs;
 
@@ -99,7 +96,6 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
 /*******************************************************************
  * Antenna API
  ******************************************************************/
-
 std::vector<std::string> SoapyRPITX::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> options;
 
@@ -131,7 +127,6 @@ std::string SoapyRPITX::getAntenna(const int direction, const size_t channel) co
 /*******************************************************************
  * Frontend corrections API
  ******************************************************************/
-
 bool SoapyRPITX::hasDCOffsetMode(const int direction, const size_t channel) const {
     return (false);
 }
@@ -139,7 +134,6 @@ bool SoapyRPITX::hasDCOffsetMode(const int direction, const size_t channel) cons
 /*******************************************************************
  * Gain API
  ******************************************************************/
-
 std::vector<std::string> SoapyRPITX::listGains(const int direction, const size_t channel) const {
     std::vector<std::string> options;
     options.push_back("rpitx_gain_0");
@@ -154,17 +148,17 @@ bool SoapyRPITX::hasGainMode(const int direction, const size_t channel) const {
 
 void SoapyRPITX::setGainMode(const int direction, const size_t channel, const bool automatic) {
     if (direction == SOAPY_SDR_TX) {
-        Soapy_libRPITX_setGainMode(direction, channel, automatic);
+        libRPITX_setGainMode(direction, channel, automatic);
     }
 }
 
 bool SoapyRPITX::getGainMode(const int direction, const size_t channel) const {
-    return Soapy_libRPITX_getGainMode(direction, channel, 0);
+    return libRPITX_getGainMode(direction, channel, 0);
 }
 
 void SoapyRPITX::setGain(const int direction, const size_t channel, const double value) {
     if (direction == SOAPY_SDR_TX) {
-        Soapy_libRPITX_setGain(direction, channel, value);
+        libRPITX_setGain(direction, channel, value);
     }
 }
 
@@ -174,7 +168,7 @@ void SoapyRPITX::setGain(const int direction, const size_t channel, const std::s
 
 double SoapyRPITX::getGain(const int direction, const size_t channel, const std::string &name) const {
     if (direction == SOAPY_SDR_TX) {
-        return Soapy_libRPITX_getGain();
+        return libRPITX_getGain();
     }
     return 0;
 }
@@ -190,15 +184,15 @@ SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t chann
 /*******************************************************************
  * Frequency API
  ******************************************************************/
-
 void SoapyRPITX::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
+    SoapySDR_logf(SOAPY_SDR_NOTICE, "FREQUENCY: %f", frequency);
     if (direction == SOAPY_SDR_TX)
-        Soapy_libRPITX_setFrequency(frequency);
+        libRPITX_setFrequency(frequency);
 }
 
 double SoapyRPITX::getFrequency(const int direction, const size_t channel, const std::string &name) const {
     if (direction == SOAPY_SDR_TX)
-        return Soapy_libRPITX_getFrequency();
+        return libRPITX_getFrequency();
 
     return 0;
 }
@@ -225,30 +219,16 @@ SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const siz
  * Sample Rate API
  ******************************************************************/
 void SoapyRPITX::setSampleRate(const int direction, const size_t channel, const double rate) {
-    long long samplerate = (long long) rate;
-    int const fir = 1;
-
+    SoapySDR_logf(SOAPY_SDR_NOTICE, "SAMPLE RATE: %f", rate);
     if (direction == SOAPY_SDR_TX) {
-        Soapy_libRPITX_setSampleRate(rate);
-
-        std::lock_guard<rpitx_spin_mutex> lock(tx_device_mutex);
+        libRPITX_setSampleRate(48000);
         interpolation = false;
-        if (samplerate < (25e6 / (12 * fir))) {
-            if (samplerate * 8 < (25e6 / 48)) {
-                SoapySDR_logf(SOAPY_SDR_CRITICAL, "sample rate is not supported.");
-            } else if (samplerate * 8 < (25e6 / 12)) {
-                SoapySDR_logf(SOAPY_SDR_NOTICE, "sample rate needs a FIR setting loaded.");
-            }
-
-            interpolation = true;
-            samplerate = samplerate * 8;
-        }
     }
 }
 
 double SoapyRPITX::getSampleRate(const int direction, const size_t channel) const {
-    if (direction == SOAPY_SDR_TX) {
-        return Soapy_libRPITX_getSampleRate();
+if (direction == SOAPY_SDR_TX) {
+    return libRPITX_getSampleRate();
     }
 
     return 0;
@@ -259,7 +239,7 @@ std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_
     std::vector<double> options;
 
     options.push_back(48000);
-    //options.push_back(65105); //25M/48/8+1
+    options.push_back(65105); //25M/48/8+1
     //options.push_back(1e6);
     //options.push_back(2e6);
     //options.push_back(3e6);
@@ -278,7 +258,7 @@ SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const si
     SoapySDR::RangeList results;
 
     // sample rates below 25e6/12 need x8 decimation/interpolation (or x4 FIR to 25e6/48)
-    results.push_back(SoapySDR::Range(48000, 48000));
+    results.push_back(SoapySDR::Range(48000, 65105));
 
     return results;
 }

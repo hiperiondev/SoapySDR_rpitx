@@ -28,8 +28,10 @@
 
 #include <stddef.h>
 #include <complex>
+#include <unistd.h>
 
-#include "Soapy_libRPITX.hpp"
+#include "libRPITX.hpp"
+#include "librpitx.hpp"
 
 using namespace std::complex_literals;
 
@@ -39,79 +41,82 @@ float Soapy_libRPITX_PPM = 0;
 int Soapy_libRPITX_SampleRate = 48000;
 int Soapy_libRPITX_IQBurst = 4000;
 double Soapy_libRPITX_Gain = 0;
+bool Soapy_libRPITX_GainMode = false;
 
 std::complex<float> *CIQBuffer;
 
-std::complex<float>* Soapy_libRPITX_init(void) {
+std::complex<float>* libRPITX_init(void) {
     CIQBuffer = (std::complex<float>*) malloc(Soapy_libRPITX_IQBurst * sizeof(std::complex<float>));
     return CIQBuffer;
 }
 
-void Soapy_libRPITX_deinit(void) {
+void libRPITX_deinit(void) {
     free(CIQBuffer);
 }
 
-int Soapy_libRPITX_setFrequency(float frequency) {
+int libRPITX_setFrequency(float frequency) {
     Soapy_libRPITX_Frequency = frequency;
     return 0;
 }
 
-float Soapy_libRPITX_getFrequency(void) {
+float libRPITX_getFrequency(void) {
     return Soapy_libRPITX_Frequency;
 }
 
-int Soapy_libRPITX_setPPM(float ppm) {
+int libRPITX_setPPM(float ppm) {
     Soapy_libRPITX_PPM = ppm;
     return 0;
 }
 
-float Soapy_libRPITX_getPPM(void) {
+float libRPITX_getPPM(void) {
     return Soapy_libRPITX_PPM;
 }
 
-int Soapy_libRPITX_setSampleRate(int samplerate) {
+int libRPITX_setSampleRate(int samplerate) {
     Soapy_libRPITX_SampleRate = samplerate;
     return 0;
 }
 
-int Soapy_libRPITX_getSampleRate(void) {
+int libRPITX_getSampleRate(void) {
     return Soapy_libRPITX_SampleRate;
 }
 
-int Soapy_libRPITX_setIQBurst(unsigned int iqburst) {
+int libRPITX_setIQBurst(unsigned int iqburst) {
     Soapy_libRPITX_IQBurst = iqburst;
     return 0;
 }
 
-unsigned int Soapy_libRPITX_getIQBurst(void) {
+unsigned int libRPITX_getIQBurst(void) {
     return Soapy_libRPITX_IQBurst;
 }
 
-void Soapy_libRPITX_setGainMode(const int direction, const size_t channel, const bool automatic) {
-
+void libRPITX_setGainMode(const int direction, const size_t channel, const bool automatic) {
+    Soapy_libRPITX_GainMode = automatic;
 }
 
-bool Soapy_libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic) {
-    return 0;
+bool libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic) {
+    return Soapy_libRPITX_GainMode;
 }
 
-void Soapy_libRPITX_setGain(const int direction, const size_t channel, const double value) {
+void libRPITX_setGain(const int direction, const size_t channel, const double value) {
     Soapy_libRPITX_Gain = value;
 }
 
-double Soapy_libRPITX_getGain(void) {
+double libRPITX_getGain(void) {
     return Soapy_libRPITX_Gain;
 }
 
-void Soapy_libRPITX_transmit(void) {
+void libRPITX_transmit(void) {
     if (CIQBuffer == nullptr)
         return;
+    usleep(1000);
+    // TODO:
 }
 
-int Soapy_libRPITX_bufferAdd(float I, float Q) { // return 1 if full
+int libRPITX_bufferAdd(float I, float Q) { // return 1 if full
     CIQBuffer[buffer_qty++] = { I, Q };
 
-    if (buffer_qty >= Soapy_libRPITX_getIQBurst() - 1) {
+    if (buffer_qty > libRPITX_getIQBurst() - 1) {
         buffer_qty = 0;
         return 1;
     }

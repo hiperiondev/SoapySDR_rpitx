@@ -27,7 +27,7 @@
  */
 
 #include "SoapyRPITX.hpp"
-#include "Soapy_libRPITX.hpp"
+#include "libRPITX.hpp"
 
 /*******************************************************************
  * Sensor API
