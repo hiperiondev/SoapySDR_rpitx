@@ -43,19 +43,34 @@ int Soapy_libRPITX_IQBurst = 4000;
 double Soapy_libRPITX_Gain = 0;
 bool Soapy_libRPITX_GainMode = false;
 
+iqdmasync *iqsender = NULL;
+int FifoSize = Soapy_libRPITX_IQBurst * 4;
+float ppmpll = 0.0;
+int Harmonic = 1;
 std::complex<float> *CIQBuffer;
 
 std::complex<float>* libRPITX_init(void) {
+    iqsender = new iqdmasync(Soapy_libRPITX_Frequency, Soapy_libRPITX_SampleRate, 14, FifoSize, MODE_IQ);
+    iqsender->Setppm(ppmpll);
     CIQBuffer = (std::complex<float>*) malloc(Soapy_libRPITX_IQBurst * sizeof(std::complex<float>));
+
     return CIQBuffer;
 }
 
 void libRPITX_deinit(void) {
     free(CIQBuffer);
+    delete (iqsender);
 }
 
 int libRPITX_setFrequency(float frequency) {
-    Soapy_libRPITX_Frequency = frequency;
+    if (Soapy_libRPITX_Frequency != frequency) {
+        Soapy_libRPITX_Frequency = frequency;
+        delete (iqsender);
+        usleep(1000);
+        iqsender = new iqdmasync(Soapy_libRPITX_Frequency, Soapy_libRPITX_SampleRate, 14, FifoSize, MODE_IQ);
+        iqsender->Setppm(ppmpll);
+    }
+
     return 0;
 }
 
@@ -109,8 +124,8 @@ double libRPITX_getGain(void) {
 void libRPITX_transmit(void) {
     if (CIQBuffer == nullptr)
         return;
-    usleep(1000);
-    // TODO:
+
+    iqsender->SetIQSamples(CIQBuffer, Soapy_libRPITX_IQBurst, Harmonic);
 }
 
 int libRPITX_bufferAdd(float I, float Q) { // return 1 if full
