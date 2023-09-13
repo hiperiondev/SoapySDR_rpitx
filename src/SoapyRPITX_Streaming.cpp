@@ -164,7 +164,7 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
-    buf_size = (size_t) Soapy_libRPITX_getIQBurst;
+    buf_size = (size_t) Soapy_libRPITX_getIQBurst();
     items_in_buf = 0;
     buf = Soapy_libRPITX_init();
     if (!buf) {
@@ -180,8 +180,6 @@ tx_streamer::~tx_streamer() {
 
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
     size_t items = std::min(buf_size - items_in_buf, numElems);
-    //ptrdiff_t buf_step =  //in bytes step(buf);
-
     if (direct_copy) {
         switch (format) {
             case RPITX_SDR_CS16:
@@ -198,24 +196,21 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
         }
     } else {
         switch (format) {
-            case RPITX_SDR_CS16:
-                //int16_t *samples_cs16 = (int16_t*) buffs[0];
-
-                for (size_t j = 0; j < items; ++j) {
-                    //src = samples_cs16[j * 2];
-
-                    //dst_ptr += buf_step;
-                }
+            case RPITX_SDR_CS16: {
+                // TODO:
+            }
                 break;
 
-            case RPITX_SDR_CF32:
-                //float *samples_cf32 = (float*) buffs[0];
+            case RPITX_SDR_CF32: {
+                float *samples_cf32 = (float*) buffs[0];
 
-                for (size_t j = 0; j < items; ++j) {
-                    //src = (int16_t) (samples_cf32[j * 2 + k] * 32767.999f); // 32767.999f (0x46ffffff) will ensure better distribution
-
-                    //dst_ptr += buf_step;
+                for (size_t j = 0; j < items; j += 2) {
+                    if(Soapy_libRPITX_bufferAdd(samples_cf32[j], samples_cf32[j + 1])){
+                        items = items - j;
+                        break;
+                    }
                 }
+            }
                 break;
 
             default:
@@ -223,9 +218,11 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
                 throw std::runtime_error("Stream format not allowed");
         }
     }
+
+
     items_in_buf += items;
 
-    if (items_in_buf == buf_size || ((flags & SOAPY_SDR_END_BURST) && numElems == items)) {
+    if (items_in_buf >= buf_size || ((flags & SOAPY_SDR_END_BURST) && numElems == items)) {
         int ret = send_buf();
 
         if (ret < 0) {
@@ -245,29 +242,11 @@ int tx_streamer::flush() {
 }
 
 int tx_streamer::send_buf() {
-    if (!buf) {
-        return 0;
-    }
-
     if (items_in_buf > 0) {
-        if (items_in_buf < buf_size) {
-            /*
-            ptrdiff_t buf_step = iio_buffer_step(buf);
-            uint8_t *buf_ptr = (uint8_t*) iio_buffer_start(buf) + items_in_buf * buf_step;
-            uint8_t *buf_end = (uint8_t*) iio_buffer_end(buf);
-
-            memset(buf_ptr, 0, buf_end - buf_ptr);
-            */
-        }
-
-        ssize_t ret = items_in_buf; //iio_buffer_push(buf);
+        Soapy_libRPITX_transmit();
         items_in_buf = 0;
 
-        if (ret < 0) {
-            return ret;
-        }
-
-        return int(ret / 1);//iio_buffer_step(buf));
+        return int(Soapy_libRPITX_getIQBurst());
     }
 
     return 0;

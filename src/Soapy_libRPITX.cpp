@@ -31,6 +31,9 @@
 
 #include "Soapy_libRPITX.hpp"
 
+using namespace std::complex_literals;
+
+unsigned int buffer_qty = 0;
 float Soapy_libRPITX_Frequency = 01e6;
 float Soapy_libRPITX_PPM = 0;
 int Soapy_libRPITX_SampleRate = 48000;
@@ -98,4 +101,20 @@ void Soapy_libRPITX_setGain(const int direction, const size_t channel, const dou
 
 double Soapy_libRPITX_getGain(void) {
     return Soapy_libRPITX_Gain;
+}
+
+void Soapy_libRPITX_transmit(void) {
+    if (CIQBuffer == nullptr)
+        return;
+}
+
+int Soapy_libRPITX_bufferAdd(float I, float Q) { // return 1 if full
+    CIQBuffer[buffer_qty++] = { I, Q };
+
+    if (buffer_qty >= Soapy_libRPITX_getIQBurst() - 1) {
+        buffer_qty = 0;
+        return 1;
+    }
+
+    return 0;
 }

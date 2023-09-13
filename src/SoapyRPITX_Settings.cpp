@@ -104,8 +104,8 @@ std::vector<std::string> SoapyRPITX::listAntennas(const int direction, const siz
     std::vector<std::string> options;
 
     if (direction == SOAPY_SDR_TX) {
-        options.push_back("TX antenna 1 (GPIO 4)");
-        options.push_back("TX antenna 2 (GPIO 12)");
+        options.push_back("Antenna 1");
+        options.push_back("Antenna 2");
     }
 
     return (options);
@@ -258,17 +258,18 @@ std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_
     // TODO:
     std::vector<double> options;
 
-    options.push_back(65105); //25M/48/8+1
-    options.push_back(1e6);
-    options.push_back(2e6);
-    options.push_back(3e6);
-    options.push_back(4e6);
-    options.push_back(5e6);
-    options.push_back(6e6);
-    options.push_back(7e6);
-    options.push_back(8e6);
-    options.push_back(9e6);
-    options.push_back(10e6);
+    options.push_back(48000);
+    //options.push_back(65105); //25M/48/8+1
+    //options.push_back(1e6);
+    //options.push_back(2e6);
+    //options.push_back(3e6);
+    //options.push_back(4e6);
+    //options.push_back(5e6);
+    //options.push_back(6e6);
+    //options.push_back(7e6);
+    //options.push_back(8e6);
+    //options.push_back(9e6);
+    //options.push_back(10e6);
 
     return (options);
 }
@@ -277,7 +278,7 @@ SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const si
     SoapySDR::RangeList results;
 
     // sample rates below 25e6/12 need x8 decimation/interpolation (or x4 FIR to 25e6/48)
-    results.push_back(SoapySDR::Range(25e6 / 96, 61440000));
+    results.push_back(SoapySDR::Range(48000, 48000));
 
     return results;
 }

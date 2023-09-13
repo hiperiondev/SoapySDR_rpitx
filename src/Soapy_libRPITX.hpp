@@ -47,3 +47,5 @@ void Soapy_libRPITX_setGainMode(const int direction, const size_t channel, const
 bool Soapy_libRPITX_getGainMode(const int direction, const size_t channel, const bool automatic);
 void Soapy_libRPITX_setGain(const int direction, const size_t channel, const double value);
 double Soapy_libRPITX_getGain(void);
+void Soapy_libRPITX_transmit(void);
+int Soapy_libRPITX_bufferAdd(float I, float Q);
