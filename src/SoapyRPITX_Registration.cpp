@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 Emiliano Gonzalez (egonzalez . hiperion @ gmail . com))
+ * Copyright 2023 Emiliano Augusto Gonzalez (egonzalez . hiperion @ gmail . com))
  * * Project Site: https://github.com/hiperiondev/SoapySDR_rpitx *
  *
  * This is based on other projects:
