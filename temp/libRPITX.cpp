@@ -36,7 +36,7 @@
 using namespace std::complex_literals;
 
 unsigned int buffer_qty = 0;
-float Soapy_libRPITX_Frequency = 01e6;
+float Soapy_libRPITX_Frequency = 144e6;
 float Soapy_libRPITX_PPM = 0;
 int Soapy_libRPITX_SampleRate = 48000;
 int Soapy_libRPITX_IQBurst = 4000;
@@ -50,6 +50,7 @@ int Harmonic = 1;
 std::complex<float> *CIQBuffer;
 
 std::complex<float>* libRPITX_init(void) {
+    printf("TX freq: %f");
     iqsender = new iqdmasync(Soapy_libRPITX_Frequency, Soapy_libRPITX_SampleRate, 14, FifoSize, MODE_IQ);
     iqsender->Setppm(ppmpll);
     CIQBuffer = (std::complex<float>*) malloc(Soapy_libRPITX_IQBurst * sizeof(std::complex<float>));

@@ -26,6 +26,8 @@
  *
  */
 
+#pragma once
+
 #include <vector>
 #include <mutex>
 #include <thread>
@@ -41,6 +43,15 @@ typedef enum rpitxStreamFormat {
     RPITX_SDR_CS16,
 } rpitxStreamFormat_t;
 
+extern unsigned int buffer_qty;
+extern float libRPITX_Frequency;
+extern float libRPITX_PPM;
+extern int libRPITX_SampleRate;
+extern int libRPITX_IQBurst;
+extern int FifoSize;
+extern double libRPITX_Gain;
+extern bool libRPITX_GainMode;
+
 class tx_streamer {
 public:
     tx_streamer(const rpitxStreamFormat format, const SoapySDR::Kwargs &args);
@@ -53,7 +64,6 @@ private:
     bool has_direct_copy();
 
     const rpitxStreamFormat format = RPITX_SDR_CF32;
-    std::complex<float> *buf = nullptr;
     size_t buf_size = 0;
     size_t items_in_buf = 0;
     bool direct_copy = false;
@@ -183,8 +193,9 @@ private:
     double get_sensor_value(int channel) const;
     std::string id_to_unit(const std::string &id) const;
 
-    bool gainMode;
+    bool gainMode = false;
     mutable rpitx_spin_mutex tx_device_mutex;
-    bool decimation, interpolation;
+    bool decimation = false;
+    bool interpolation = false;
     std::unique_ptr<tx_streamer> tx_stream;
 };

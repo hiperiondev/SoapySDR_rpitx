@@ -27,11 +27,17 @@
  */
 
 #include "SoapyRPITX.hpp"
-#include "libRPITX.hpp"
 
-SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) :
-        gainMode(false), decimation(false), interpolation(false) {
+unsigned int buffer_qty = 0;
+float libRPITX_Frequency = 144e6;
+float libRPITX_PPM = 0;
+int libRPITX_SampleRate = 48000;
+int libRPITX_IQBurst = 4000;
+int FifoSize = libRPITX_IQBurst * 4;
+double libRPITX_Gain = 0;
+bool libRPITX_GainMode = false;
 
+SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
     SoapySDR_logf(SOAPY_SDR_INFO, "Opening %s...", args.at("label").c_str());
 }
 
@@ -148,17 +154,17 @@ bool SoapyRPITX::hasGainMode(const int direction, const size_t channel) const {
 
 void SoapyRPITX::setGainMode(const int direction, const size_t channel, const bool automatic) {
     if (direction == SOAPY_SDR_TX) {
-        libRPITX_setGainMode(direction, channel, automatic);
+        libRPITX_GainMode = automatic;
     }
 }
 
 bool SoapyRPITX::getGainMode(const int direction, const size_t channel) const {
-    return libRPITX_getGainMode(direction, channel, 0);
+    return libRPITX_GainMode;
 }
 
 void SoapyRPITX::setGain(const int direction, const size_t channel, const double value) {
     if (direction == SOAPY_SDR_TX) {
-        libRPITX_setGain(direction, channel, value);
+        libRPITX_Gain = value;
     }
 }
 
@@ -168,7 +174,7 @@ void SoapyRPITX::setGain(const int direction, const size_t channel, const std::s
 
 double SoapyRPITX::getGain(const int direction, const size_t channel, const std::string &name) const {
     if (direction == SOAPY_SDR_TX) {
-        return libRPITX_getGain();
+        return libRPITX_Gain;
     }
     return 0;
 }
@@ -187,12 +193,12 @@ SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t chann
 void SoapyRPITX::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
     SoapySDR_logf(SOAPY_SDR_NOTICE, "FREQUENCY: %f", frequency);
     if (direction == SOAPY_SDR_TX)
-        libRPITX_setFrequency(frequency);
+        libRPITX_Frequency = frequency;
 }
 
 double SoapyRPITX::getFrequency(const int direction, const size_t channel, const std::string &name) const {
     if (direction == SOAPY_SDR_TX)
-        return libRPITX_getFrequency();
+        return libRPITX_Frequency;
 
     return 0;
 }
@@ -221,14 +227,14 @@ SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const siz
 void SoapyRPITX::setSampleRate(const int direction, const size_t channel, const double rate) {
     SoapySDR_logf(SOAPY_SDR_NOTICE, "SAMPLE RATE: %f", rate);
     if (direction == SOAPY_SDR_TX) {
-        libRPITX_setSampleRate(48000);
+        libRPITX_SampleRate = 48000;
         interpolation = false;
     }
 }
 
 double SoapyRPITX::getSampleRate(const int direction, const size_t channel) const {
 if (direction == SOAPY_SDR_TX) {
-    return libRPITX_getSampleRate();
+    return libRPITX_SampleRate;
     }
 
     return 0;
@@ -239,7 +245,7 @@ std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_
     std::vector<double> options;
 
     options.push_back(48000);
-    options.push_back(65105); //25M/48/8+1
+    //options.push_back(65105); //25M/48/8+1
     //options.push_back(1e6);
     //options.push_back(2e6);
     //options.push_back(3e6);
@@ -258,7 +264,7 @@ SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const si
     SoapySDR::RangeList results;
 
     // sample rates below 25e6/12 need x8 decimation/interpolation (or x4 FIR to 25e6/48)
-    results.push_back(SoapySDR::Range(48000, 65105));
+    results.push_back(SoapySDR::Range(48000, 48000));
 
     return results;
 }

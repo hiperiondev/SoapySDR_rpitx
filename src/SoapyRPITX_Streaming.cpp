@@ -26,19 +26,18 @@
  *
  */
 
-#include <memory>
-#include <iostream>
-#include <cstdint>
-#include <cstring>
-#include <iterator>
-#include <algorithm>
-#include <chrono>
+#include <stddef.h>
+#include <complex>
+#include <unistd.h>
 
+#include "librpitx.hpp"
 #include "SoapyRPITX.hpp"
-#include "libRPITX.hpp"
 
-//TODO: Need to be a power of 2 for maximum efficiency ?
-# define DEFAULT_RX_BUFFER_SIZE (1 << 16)
+iqdmasync *iqsender = NULL;
+
+float ppmpll = 0.0;
+int Harmonic = 1;
+std::complex<float> *CIQBuffer;
 
 std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
@@ -122,7 +121,7 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
     if (IsValidTxStreamHandle(handle)) {
-        return libRPITX_getIQBurst();
+        return libRPITX_IQBurst;
     }
 
     return 0;
@@ -173,10 +172,13 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
-    buf_size = (size_t) libRPITX_getIQBurst();
+    buf_size = (size_t) libRPITX_IQBurst;
     items_in_buf = 0;
-    buf = libRPITX_init();
-    if (!buf) {
+    iqsender = new iqdmasync(libRPITX_Frequency, libRPITX_SampleRate, 14, FifoSize, MODE_IQ);
+    iqsender->Setppm(ppmpll);
+    CIQBuffer = (std::complex<float>*) malloc(libRPITX_IQBurst * sizeof(std::complex<float>));
+
+    if (!CIQBuffer) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "Unable to create buffer!");
         throw std::runtime_error("Unable to create buffer!");
     }
@@ -184,7 +186,8 @@ tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs
 }
 
 tx_streamer::~tx_streamer() {
-    libRPITX_deinit();
+    free(CIQBuffer);
+    delete (iqsender);
 }
 
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
@@ -206,15 +209,24 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
     } else {
         switch (format) {
             case RPITX_SDR_CS16: {
-                // TODO:
+                for (size_t j = 0; j < items; j += 2) {
+                    CIQBuffer[buffer_qty++] = { (float)(((short*) buffs[0])[j] / 32768.0), (float)(((short*) buffs[0])[j + 1] / 32768.0) };
+
+                    if (buffer_qty > libRPITX_IQBurst - 1) {
+                        buffer_qty = 0;
+                        items = items - j;
+                        break;
+                    }
+                }
             }
                 break;
 
             case RPITX_SDR_CF32: {
-                float *samples_cf32 = (float*) buffs[0];
-
                 for (size_t j = 0; j < items; j += 2) {
-                    if(libRPITX_bufferAdd(samples_cf32[j], samples_cf32[j + 1])){
+                    CIQBuffer[buffer_qty++] = { ((float*) buffs[0])[j], ((float*) buffs[0])[j + 1] };
+
+                    if (buffer_qty > libRPITX_IQBurst - 1) {
+                        buffer_qty = 0;
                         items = items - j;
                         break;
                     }
@@ -252,10 +264,10 @@ int tx_streamer::flush() {
 
 int tx_streamer::send_buf() {
     if (items_in_buf > 0) {
-        libRPITX_transmit();
+        iqsender->SetIQSamples(CIQBuffer, libRPITX_IQBurst, Harmonic);
         items_in_buf = 0;
 
-        return int(libRPITX_getIQBurst());
+        return int(libRPITX_IQBurst);
     }
 
     return 0;

@@ -26,10 +26,6 @@
  *
  */
 
-#include <sstream>
-#include <chrono>
-#include <thread>
-
 #include <SoapySDR/Registry.hpp>
 #include "SoapyRPITX.hpp"
 
