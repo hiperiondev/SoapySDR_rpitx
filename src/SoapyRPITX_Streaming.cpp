@@ -137,6 +137,7 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
 }
 
 int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int flags, const long long timeNs) {
+    SoapySDR_logf(SOAPY_SDR_INFO, "Stop TX");
     //scope lock :
     {
         std::lock_guard<rpitx_spin_mutex> lock(tx_device_mutex);

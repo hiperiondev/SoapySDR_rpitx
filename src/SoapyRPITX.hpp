@@ -37,6 +37,7 @@
 #include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Types.hpp>
 #include <SoapySDR/Formats.hpp>
+#include "librpitx.hpp"
 
 typedef enum rpitxStreamFormat {
     RPITX_SDR_CF32,
@@ -198,4 +199,5 @@ private:
     bool decimation = false;
     bool interpolation = false;
     std::unique_ptr<tx_streamer> tx_stream;
+    iqdmasync *iqsender = nullptr;
 };
