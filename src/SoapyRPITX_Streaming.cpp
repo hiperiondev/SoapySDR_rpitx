@@ -29,15 +29,10 @@
 #include <stddef.h>
 #include <complex>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "librpitx.hpp"
 #include "SoapyRPITX.hpp"
-
-iqdmasync *iqsender = NULL;
-
-float ppmpll = 0.0;
-int Harmonic = 1;
-std::complex<float> *CIQBuffer;
 
 std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
@@ -171,7 +166,6 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
-
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
     buf_size = (size_t) libRPITX_IQBurst;
     items_in_buf = 0;
@@ -180,16 +174,29 @@ tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs
     CIQBuffer = (std::complex<float>*) malloc(libRPITX_IQBurst * sizeof(std::complex<float>));
 
     if (!CIQBuffer) {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "Unable to create buffer!");
+        SoapySDR_logf(SOAPY_SDR_NOTICE, "Unable to create buffer!");
         throw std::runtime_error("Unable to create buffer!");
     }
     direct_copy = has_direct_copy();
+    tx_init = true;
+    thrd = new tx_thread();
+    thrd->txthargs.CIQBuffer = &CIQBuffer;
+    thrd->txthargs.Harmonic = &Harmonic;
+    thrd->txthargs.iqsender = iqsender;
+    thrd->txthargs.tx_init = &tx_init;
+    thrd->txthargs.tx_thread_exit = &tx_thread_exit;
+    thrd->txthargs.error = false;
+
+    thrd->start();
 }
 
 tx_streamer::~tx_streamer() {
+    tx_thread_exit = true;
+    usleep(1000);
     free(CIQBuffer);
     delete (iqsender);
 }
+
 
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
     size_t items = std::min(buf_size - items_in_buf, numElems);
@@ -226,11 +233,11 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
                 for (size_t j = 0; j < items; j += 2) {
                     CIQBuffer[buffer_qty++] = { ((float*) buffs[0])[j], ((float*) buffs[0])[j + 1] };
 
-                    if (buffer_qty > libRPITX_IQBurst - 1) {
+                    if (buffer_qty > libRPITX_IQBurst - 1)
                         buffer_qty = 0;
-                        items = items - j;
-                        break;
-                    }
+                }
+                if (thrd->txthargs.error) {
+                    SoapySDR_logf(SOAPY_SDR_ERROR, "Thread error!");
                 }
             }
                 break;
@@ -238,21 +245,6 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
             default:
                 SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
                 throw std::runtime_error("Stream format not allowed");
-        }
-    }
-
-
-    items_in_buf += items;
-
-    if (items_in_buf >= buf_size || ((flags & SOAPY_SDR_END_BURST) && numElems == items)) {
-        int ret = send_buf();
-
-        if (ret < 0) {
-            return SOAPY_SDR_ERROR;
-        }
-
-        if ((size_t) ret != buf_size) {
-            return SOAPY_SDR_ERROR;
         }
     }
 
@@ -264,13 +256,6 @@ int tx_streamer::flush() {
 }
 
 int tx_streamer::send_buf() {
-    if (items_in_buf > 0) {
-        iqsender->SetIQSamples(CIQBuffer, libRPITX_IQBurst, Harmonic);
-        items_in_buf = 0;
-
-        return int(libRPITX_IQBurst);
-    }
-
     return 0;
 }
 

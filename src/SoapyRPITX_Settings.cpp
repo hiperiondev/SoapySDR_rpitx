@@ -241,21 +241,9 @@ if (direction == SOAPY_SDR_TX) {
 }
 
 std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_t channel) const {
-    // TODO:
     std::vector<double> options;
 
     options.push_back(48000);
-    //options.push_back(65105); //25M/48/8+1
-    //options.push_back(1e6);
-    //options.push_back(2e6);
-    //options.push_back(3e6);
-    //options.push_back(4e6);
-    //options.push_back(5e6);
-    //options.push_back(6e6);
-    //options.push_back(7e6);
-    //options.push_back(8e6);
-    //options.push_back(9e6);
-    //options.push_back(10e6);
 
     return (options);
 }
