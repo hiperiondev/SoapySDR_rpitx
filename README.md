@@ -2,7 +2,7 @@
 SoapySDR driver for librpitx ( https://github.com/F5OEO/librpitx )
 
 WIP!!!! 
-Working but stable
+Working but unstable. A lot of glitches
 
 *COMPILE*
 - git clone https://github.com/hiperiondev/SoapySDR_rpitx.git
