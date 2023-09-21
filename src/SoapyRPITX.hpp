@@ -44,16 +44,13 @@
 #include "librpitx.hpp"
 
 typedef enum rpitxStreamFormat {
-    RPITX_SDR_CF32,
-    RPITX_SDR_CS16,
+    RPITX_SDR_CF32, //
 } rpitxStreamFormat_t;
 
-extern unsigned int buffer_qty;
+extern unsigned int buffer_pos;
 extern float libRPITX_Frequency;
 extern float libRPITX_PPM;
-extern int libRPITX_SampleRate;
-extern int libRPITX_IQBurst;
-extern int FifoSize;
+extern int libRPITX_fifoSize;
 extern double libRPITX_Gain;
 extern bool libRPITX_GainMode;
 
@@ -66,22 +63,11 @@ public:
     int send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs);
     int flush();
 
-private:
-    int send_buf();
-    bool has_direct_copy();
-
 public:
     const rpitxStreamFormat format = RPITX_SDR_CF32;
-    size_t buf_size = 0;
-    size_t items_in_buf = 0;
-    bool direct_copy = false;
     float ppmpll = 0.0;
     int Harmonic = 1;
-    std::complex<float> *CIQBuffer = nullptr;
     iqdmasync *iqsender = nullptr;
-    bool tx_init = false;
-    bool tx_thread_exit = false;
-    tx_thread *thrd = nullptr;
 };
 
 class rpitx_spin_mutex {
@@ -214,66 +200,4 @@ private:
 public:
     std::unique_ptr<tx_streamer> tx_stream;
     iqdmasync *iqsender = nullptr;
-    //tx_thread *thread = nullptr;
-};
-
-
-typedef struct tx_thread_args {
-    int *Harmonic;
-    std::complex<float> **CIQBuffer;
-    iqdmasync *iqsender;
-    bool *tx_init;
-    bool *tx_thread_exit;
-    bool error;
-} tx_thread_args_t;
-
-class tx_thread {
-public:
-    tx_thread() {
-    }
-
-    void start() {
-        pthread_create(&mThreadId, 0, &tx_thread::txthread, this);
-    }
-
-    void doThings(int x) {
-        // something to be done in the thread.
-    }
-
-    static void* txthread(void *arg) {
-        tx_thread *_this = (tx_thread*)(arg);
-
-        SoapySDR_logf(SOAPY_SDR_NOTICE, "START SENDER THREAD\n");
-        int buffer_offset = 0;
-
-        if (*(_this->txthargs.CIQBuffer) == nullptr) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "ERROR: tx buffer not allocated\n");
-            _this->txthargs.error = true;
-            return NULL;
-        }
-
-        while (1) {
-            if (*(_this->txthargs.tx_thread_exit)) {
-                SoapySDR_logf(SOAPY_SDR_NOTICE, "STOP SENDER THREAD\n");
-                pthread_exit(0);
-            }
-
-            if (!*(_this->txthargs.tx_init)) {
-                usleep(100);
-                continue;
-            }
-
-            _this->txthargs.iqsender->SetIQSamples(*(_this->txthargs.CIQBuffer), libRPITX_IQBurst, *(_this->txthargs.Harmonic));
-            memset((void*)(*(_this->txthargs.CIQBuffer)), '\0', sizeof(*(_this->txthargs.CIQBuffer)));
-        }
-
-        SoapySDR_logf(SOAPY_SDR_NOTICE,"STOP SENDER THREAD\n");
-
-        return nullptr;
-    }
-
-    tx_thread_args_t txthargs;
-
-private:
-    pthread_t mThreadId = 0;
 };

@@ -86,9 +86,6 @@ SoapySDR::Stream* SoapyRPITX::setupStream(const int direction, const std::string
         if (format == SOAPY_SDR_CF32) {
             SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32.");
             streamFormat = RPITX_SDR_CF32;
-        } else if (format == SOAPY_SDR_CS16) {
-            SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16.");
-            streamFormat = RPITX_SDR_CS16;
         } else {
             throw std::runtime_error("setupStream invalid format '" + format + "' -- Only CS16 and CF32 are supported by RPITX module.");
         }
@@ -116,7 +113,7 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
     if (IsValidTxStreamHandle(handle)) {
-        return libRPITX_IQBurst;
+        return libRPITX_fifoSize;
     }
 
     return 0;
@@ -128,20 +125,12 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
         return SOAPY_SDR_NOT_SUPPORTED;
 
     SoapySDR_logf(SOAPY_SDR_INFO, "Start TX");
+
     return 0;
 }
 
 int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int flags, const long long timeNs) {
     SoapySDR_logf(SOAPY_SDR_INFO, "Stop TX");
-    //scope lock :
-    {
-        std::lock_guard<rpitx_spin_mutex> lock(tx_device_mutex);
-
-        if (IsValidTxStreamHandle(handle)) {
-            this->tx_stream->flush();
-            return 0;
-        }
-    }
 
     return 0;
 }
@@ -167,98 +156,30 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
-    buf_size = (size_t) libRPITX_IQBurst;
-    items_in_buf = 0;
-    iqsender = new iqdmasync(libRPITX_Frequency, libRPITX_SampleRate, 14, FifoSize, MODE_IQ);
+    iqsender = new iqdmasync(libRPITX_Frequency, 48000, 14, libRPITX_fifoSize);
     iqsender->Setppm(ppmpll);
-    CIQBuffer = (std::complex<float>*) malloc(libRPITX_IQBurst * sizeof(std::complex<float>));
-
-    if (!CIQBuffer) {
-        SoapySDR_logf(SOAPY_SDR_NOTICE, "Unable to create buffer!");
-        throw std::runtime_error("Unable to create buffer!");
-    }
-    direct_copy = has_direct_copy();
-    tx_init = true;
-    thrd = new tx_thread();
-    thrd->txthargs.CIQBuffer = &CIQBuffer;
-    thrd->txthargs.Harmonic = &Harmonic;
-    thrd->txthargs.iqsender = iqsender;
-    thrd->txthargs.tx_init = &tx_init;
-    thrd->txthargs.tx_thread_exit = &tx_thread_exit;
-    thrd->txthargs.error = false;
-
-    thrd->start();
 }
 
 tx_streamer::~tx_streamer() {
-    tx_thread_exit = true;
-    usleep(1000);
-    free(CIQBuffer);
     delete (iqsender);
 }
 
-
 int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs) {
-    size_t items = std::min(buf_size - items_in_buf, numElems);
-    if (direct_copy) {
-        switch (format) {
-            case RPITX_SDR_CS16:
-                // TODO:
-                break;
+    int elemToSend = (numElems >= (libRPITX_fifoSize * 2) * 3 / 4) ? ((libRPITX_fifoSize * 2) * 3 / 4) : numElems;
 
-            case RPITX_SDR_CF32:
-                // TODO:
-                break;
+    switch (format) {
+        case RPITX_SDR_CF32:
+            iqsender->SetIQSamples2((float*) buffs[0], elemToSend, Harmonic, timeoutUs);
+            break;
 
-            default:
-                SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
-                throw std::runtime_error("Stream format not allowed");
-        }
-    } else {
-        switch (format) {
-            case RPITX_SDR_CS16: {
-                for (size_t j = 0; j < items; j += 2) {
-                    CIQBuffer[buffer_qty++] = { (float)(((short*) buffs[0])[j] / 32768.0), (float)(((short*) buffs[0])[j + 1] / 32768.0) };
-
-                    if (buffer_qty > libRPITX_IQBurst - 1) {
-                        buffer_qty = 0;
-                        items = items - j;
-                        break;
-                    }
-                }
-            }
-                break;
-
-            case RPITX_SDR_CF32: {
-                for (size_t j = 0; j < items; j += 2) {
-                    CIQBuffer[buffer_qty++] = { ((float*) buffs[0])[j], ((float*) buffs[0])[j + 1] };
-
-                    if (buffer_qty > libRPITX_IQBurst - 1)
-                        buffer_qty = 0;
-                }
-                if (thrd->txthargs.error) {
-                    SoapySDR_logf(SOAPY_SDR_ERROR, "Thread error!");
-                }
-            }
-                break;
-
-            default:
-                SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
-                throw std::runtime_error("Stream format not allowed");
-        }
+        default:
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Stream format not allowed");
+            throw std::runtime_error("Stream format not allowed");
     }
 
-    return items;
+    return numElems;
 }
 
 int tx_streamer::flush() {
-    return send_buf();
-}
-
-int tx_streamer::send_buf() {
-    return 0;
-}
-
-bool tx_streamer::has_direct_copy() {
     return 0;
 }

@@ -21,13 +21,12 @@
 #include <sched.h>
 #include "util.hpp"
 
-iqdmasync::iqdmasync(uint64_t TuneFrequency, uint32_t SR, int Channel, uint32_t FifoSize, int Mode) :
+iqdmasync::iqdmasync(uint64_t TuneFrequency, uint32_t SR, int Channel, uint32_t FifoSize) :
         bufferdma(Channel, FifoSize, 4, 3) {
 // Usermem :
 // FRAC frequency
 // PAD Amplitude
 // FSEL for amplitude 0
-    ModeIQ = Mode;
     SampleRate = SR;
     tunefreq = TuneFrequency;
     clkgpio::SetAdvancedPllMode(true);
@@ -94,6 +93,7 @@ void iqdmasync::SetDmaAlgo() {
 }
 
 void iqdmasync::SetIQSample(uint32_t Index, std::complex<float> sample, int Harmonic) {
+
     Index = Index % buffersize;
     mydsp.pushsample(sample);
     /*if(mydsp.frequency>2250) mydsp.frequency=2250;
@@ -121,38 +121,9 @@ void iqdmasync::SetIQSample(uint32_t Index, std::complex<float> sample, int Harm
     PushSample(Index);
 }
 
-void iqdmasync::SetFreqAmplitudeSample(uint32_t Index, std::complex<float> sample, int Harmonic) {
-    Index = Index % buffersize;
-
-    sampletab[Index * registerbysample] = (0x5A << 24) | GetMasterFrac(sample.real() / Harmonic); //Frequency
-    int IntAmplitude = (int) roundf(sample.imag()) - 1; //0->8 become -1->7
-
-    int IntAmplitudePAD = IntAmplitude;
-    if (IntAmplitude > 7)
-        IntAmplitudePAD = 7;
-    if (IntAmplitude < 0) {
-        IntAmplitudePAD = 0;
-        IntAmplitude = -1;
-    }
-    sampletab[Index * registerbysample + 1] = (0x5A << 24) + (IntAmplitudePAD & 0x7) + (1 << 4) + (0 << 3); // Amplitude PAD
-
-    //dbg_printf(1,"amp%d PAD %d\n",IntAmplitude,IntAmplitudePAD);
-
-    //sampletab[Index*registerbysample+2]=(Originfsel & ~(7 << 12)) | (4 << 12); //Alternate is CLK
-    if (IntAmplitude == -1) {
-        sampletab[Index * registerbysample + 2] = (Originfsel & ~(7 << 12)) | (0 << 12); //Pin is in -> Amplitude 0
-    } else {
-        sampletab[Index * registerbysample + 2] = (Originfsel & ~(7 << 12)) | (4 << 12); //Alternate is CLK : Fixme : do not work with clk2
-    }
-
-    //dbg_printf(1,"amp%f %d\n",mydsp.amplitude,IntAmplitudePAD);
-    PushSample(Index);
-}
-
-void iqdmasync::SetIQSamples(std::complex<float> *sample, size_t Size, int Harmonic = 1) {
+void iqdmasync::SetIQSamples(std::complex<float> *sample, float *buff, size_t Size, int Harmonic = 1, bool noComplex = false, const long timeoutUs = 0) {
     size_t NbWritten = 0;
     int OSGranularity = 100;
-
     long int start_time;
     long time_difference = 0;
     struct timespec gettime_now;
@@ -167,6 +138,9 @@ void iqdmasync::SetIQSamples(std::complex<float> *sample, size_t Size, int Harmo
         int Available = GetBufferAvailable();
         //printf("Available before=%d\n",Available);
         int TimeToSleep = 1e6 * ((int) buffersize * 3 / 4 - Available) / (float) SampleRate/*-OSGranularity*/; // Sleep for theorically fill 3/4 of Fifo
+        if (TimeToSleep > timeoutUs)
+            TimeToSleep = timeoutUs;
+
         if (TimeToSleep > 0) {
             //dbg_printf(1,"buffer size %d Available %d SampleRate %d Sleep %d\n",buffersize,Available,SampleRate,TimeToSleep);
             usleep(TimeToSleep);
@@ -183,20 +157,50 @@ void iqdmasync::SetIQSamples(std::complex<float> *sample, size_t Size, int Harmo
             //dbg_printf(1,"Available %d Measure samplerate=%d\n",GetBufferAvailable(),(int)((GetBufferAvailable()-Available)*1e9/time_difference));
             debug--;
         }
+
         Available = GetBufferAvailable();
 
         int Index = GetUserMemIndex();
         int ToWrite = ((int) Size - (int) NbWritten) < Available ? Size - NbWritten : Available;
         //printf("Available after=%d Timetosleep %d To Write %d\n",Available,TimeToSleep,ToWrite);
-        if (ModeIQ == MODE_IQ) {
-            for (int i = 0; i < ToWrite; i++) {
+
+        for (int i = 0; i < ToWrite; i++) {
+            if (!noComplex)
                 SetIQSample(Index + i, sample[NbWritten++], Harmonic);
-            }
-        }
-        if (ModeIQ == MODE_FREQ_A) {
-            for (int i = 0; i < ToWrite; i++) {
-                SetFreqAmplitudeSample(Index + i, sample[NbWritten++], Harmonic);
+            else {
+                std::complex<float> smpl = { buff[NbWritten], buff[NbWritten + 1] };
+                SetIQSample(Index + i, smpl, Harmonic);
+                NbWritten++;
             }
         }
     }
+}
+
+int iqdmasync::SetIQSamples2(float *buff, size_t Size, int Harmonic = 1, const long timeoutUs = 0) {
+    size_t NbWritten = 0;
+    int Available = 0;
+    //long int start_time;
+    //long time_difference = 0;
+    //struct timespec gettime_now;
+    int ToWrite;
+
+    //clock_gettime(CLOCK_REALTIME, &gettime_now);
+    //start_time = gettime_now.tv_nsec;
+
+    int Index = GetUserMemIndex();
+    ToWrite = (int) Size  < Available ? Size - NbWritten : GetBufferAvailable();
+    while (ToWrite < Size)
+        ToWrite = (int) Size < Available ? Size : GetBufferAvailable();
+
+    for (int i = 0; i < ToWrite; i++) {
+        std::complex<float> smpl = { buff[NbWritten], buff[NbWritten + 1] };
+        SetIQSample(Index + i, smpl, Harmonic);
+        NbWritten += 2;
+
+        //clock_gettime(CLOCK_REALTIME, &gettime_now);
+        //if (gettime_now.tv_nsec - start_time > timeoutUs / 1000)
+        //    return NbWritten;
+    }
+
+    return ToWrite * 2;
 }

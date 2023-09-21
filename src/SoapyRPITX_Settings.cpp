@@ -28,12 +28,10 @@
 
 #include "SoapyRPITX.hpp"
 
-unsigned int buffer_qty = 0;
+unsigned int buffer_pos = 0;
 float libRPITX_Frequency = 144e6;
 float libRPITX_PPM = 0;
-int libRPITX_SampleRate = 48000;
-int libRPITX_IQBurst = 4000;
-int FifoSize = libRPITX_IQBurst * 4;
+int libRPITX_fifoSize = 1000;
 double libRPITX_Gain = 0;
 bool libRPITX_GainMode = false;
 
@@ -227,14 +225,13 @@ SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const siz
 void SoapyRPITX::setSampleRate(const int direction, const size_t channel, const double rate) {
     SoapySDR_logf(SOAPY_SDR_NOTICE, "SAMPLE RATE: %f", rate);
     if (direction == SOAPY_SDR_TX) {
-        libRPITX_SampleRate = 48000;
-        interpolation = false;
+
     }
 }
 
 double SoapyRPITX::getSampleRate(const int direction, const size_t channel) const {
-if (direction == SOAPY_SDR_TX) {
-    return libRPITX_SampleRate;
+    if (direction == SOAPY_SDR_TX) {
+        return 48000;
     }
 
     return 0;
@@ -251,7 +248,6 @@ std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_
 SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const size_t channel) const {
     SoapySDR::RangeList results;
 
-    // sample rates below 25e6/12 need x8 decimation/interpolation (or x4 FIR to 25e6/48)
     results.push_back(SoapySDR::Range(48000, 48000));
 
     return results;
