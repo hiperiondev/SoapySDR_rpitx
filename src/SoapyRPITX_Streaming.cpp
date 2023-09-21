@@ -31,8 +31,8 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#include "librpitx.hpp"
 #include "SoapyRPITX.hpp"
+#include "SoapyRPITX_IQ_dmaSync.hpp"
 
 std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
@@ -156,7 +156,7 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 tx_streamer::tx_streamer(const rpitxStreamFormat _format, const SoapySDR::Kwargs &args) {
-    iqsender = new iqdmasync(libRPITX_Frequency, 48000, 14, libRPITX_fifoSize);
+    iqsender = new SoapyRPITX_IQ_dmaSync(libRPITX_TX_frequency, 48000, 14, libRPITX_fifoSize);
     iqsender->Setppm(ppmpll);
 }
 
@@ -169,7 +169,7 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
 
     switch (format) {
         case RPITX_SDR_CF32:
-            iqsender->SetIQSamples2((float*) buffs[0], elemToSend, Harmonic, timeoutUs);
+            iqsender->SetIQSamples((float*) buffs[0], elemToSend, Harmonic, timeoutUs);
             break;
 
         default:
@@ -178,8 +178,4 @@ int tx_streamer::send(const void *const*buffs, const size_t numElems, int &flags
     }
 
     return numElems;
-}
-
-int tx_streamer::flush() {
-    return 0;
 }

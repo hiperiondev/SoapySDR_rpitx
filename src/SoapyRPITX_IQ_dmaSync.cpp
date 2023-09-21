@@ -1,27 +1,39 @@
 /*
- Copyright (C) 2018  Evariste COURJAUD F5OEO
-
- This program is free software: you can redistribute it and/or modify
- it under the terms of the GNU General Public License as published by
- the Free Software Foundation, either version 3 of the License, or
- (at your option) any later version.
-
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
-
- You should have received a copy of the GNU General Public License
- along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Copyright 2023 Emiliano Augusto Gonzalez (egonzalez . hiperion @ gmail . com))
+ * * Project Site: https://github.com/hiperiondev/SoapySDR_rpitx *
+ *
+ * This is based on other projects:
+ *    librpitx (https://github.com/F5OEO/librpitx)
+ *        Copyright (C) 2018  Evariste COURJAUD F5OEO
+ *    SoapyPlutoSDR (https://github.com/pothosware/SoapyPlutoSDR)
+ *
+ *    please contact their authors for more information.
+ *
+ * This is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3, or (at your option)
+ * any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this software; see the file COPYING.  If not, write to
+ * the Free Software Foundation, Inc., 51 Franklin Street,
+ * Boston, MA 02110-1301, USA.
+ *
  */
 
-#include "stdio.h"
-#include "iqdmasync.hpp"
 #include <unistd.h>
 #include <sched.h>
-#include "util.hpp"
+#include <stdio.h>
 
-iqdmasync::iqdmasync(uint64_t TuneFrequency, uint32_t SR, int Channel, uint32_t FifoSize) :
+#include "util.hpp"
+#include "SoapyRPITX_IQ_dmaSync.hpp"
+
+SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(uint64_t TuneFrequency, uint32_t SR, int Channel, uint32_t FifoSize) :
         bufferdma(Channel, FifoSize, 4, 3) {
 // Usermem :
 // FRAC frequency
@@ -55,16 +67,12 @@ iqdmasync::iqdmasync(uint64_t TuneFrequency, uint32_t SR, int Channel, uint32_t 
 
 }
 
-iqdmasync::~iqdmasync() {
+SoapyRPITX_IQ_dmaSync::~SoapyRPITX_IQ_dmaSync() {
     clkgpio::gengpio.gpioreg[GPFSEL0] = Originfsel;
     clkgpio::disableclk(4);
 }
 
-void iqdmasync::SetPhase(bool inversed) {
-    clkgpio::SetPhase(inversed);
-}
-
-void iqdmasync::SetDmaAlgo() {
+void SoapyRPITX_IQ_dmaSync::SetDmaAlgo() {
     dma_cb_t *cbp = cbarray;
     for (uint32_t samplecnt = 0; samplecnt < buffersize; samplecnt++) {
 
@@ -92,7 +100,7 @@ void iqdmasync::SetDmaAlgo() {
     //dbg_printf(1,"Last cbp :  src %x dest %x next %x\n",cbp->src,cbp->dst,cbp->next);
 }
 
-void iqdmasync::SetIQSample(uint32_t Index, std::complex<float> sample, int Harmonic) {
+void SoapyRPITX_IQ_dmaSync::SetIQSample(uint32_t Index, std::complex<float> sample, int Harmonic) {
 
     Index = Index % buffersize;
     mydsp.pushsample(sample);
@@ -121,62 +129,7 @@ void iqdmasync::SetIQSample(uint32_t Index, std::complex<float> sample, int Harm
     PushSample(Index);
 }
 
-void iqdmasync::SetIQSamples(std::complex<float> *sample, float *buff, size_t Size, int Harmonic = 1, bool noComplex = false, const long timeoutUs = 0) {
-    size_t NbWritten = 0;
-    int OSGranularity = 100;
-    long int start_time;
-    long time_difference = 0;
-    struct timespec gettime_now;
-
-    int debug = 1;
-
-    while (NbWritten < Size) {
-        if (debug > 0) {
-            clock_gettime(CLOCK_REALTIME, &gettime_now);
-            start_time = gettime_now.tv_nsec;
-        }
-        int Available = GetBufferAvailable();
-        //printf("Available before=%d\n",Available);
-        int TimeToSleep = 1e6 * ((int) buffersize * 3 / 4 - Available) / (float) SampleRate/*-OSGranularity*/; // Sleep for theorically fill 3/4 of Fifo
-        if (TimeToSleep > timeoutUs)
-            TimeToSleep = timeoutUs;
-
-        if (TimeToSleep > 0) {
-            //dbg_printf(1,"buffer size %d Available %d SampleRate %d Sleep %d\n",buffersize,Available,SampleRate,TimeToSleep);
-            usleep(TimeToSleep);
-        } else {
-            dbg_printf(1, "No Sleep %d\n", TimeToSleep);
-            //sched_yield();
-        }
-
-        if (debug > 0) {
-            clock_gettime(CLOCK_REALTIME, &gettime_now);
-            time_difference = gettime_now.tv_nsec - start_time;
-            if (time_difference < 0)
-                time_difference += 1E9;
-            //dbg_printf(1,"Available %d Measure samplerate=%d\n",GetBufferAvailable(),(int)((GetBufferAvailable()-Available)*1e9/time_difference));
-            debug--;
-        }
-
-        Available = GetBufferAvailable();
-
-        int Index = GetUserMemIndex();
-        int ToWrite = ((int) Size - (int) NbWritten) < Available ? Size - NbWritten : Available;
-        //printf("Available after=%d Timetosleep %d To Write %d\n",Available,TimeToSleep,ToWrite);
-
-        for (int i = 0; i < ToWrite; i++) {
-            if (!noComplex)
-                SetIQSample(Index + i, sample[NbWritten++], Harmonic);
-            else {
-                std::complex<float> smpl = { buff[NbWritten], buff[NbWritten + 1] };
-                SetIQSample(Index + i, smpl, Harmonic);
-                NbWritten++;
-            }
-        }
-    }
-}
-
-int iqdmasync::SetIQSamples2(float *buff, size_t Size, int Harmonic = 1, const long timeoutUs = 0) {
+int SoapyRPITX_IQ_dmaSync::SetIQSamples(float *buff, size_t Size, int Harmonic = 1, const long timeoutUs = 0) {
     size_t NbWritten = 0;
     int Available = 0;
     //long int start_time;
@@ -188,7 +141,7 @@ int iqdmasync::SetIQSamples2(float *buff, size_t Size, int Harmonic = 1, const l
     //start_time = gettime_now.tv_nsec;
 
     int Index = GetUserMemIndex();
-    ToWrite = (int) Size  < Available ? Size - NbWritten : GetBufferAvailable();
+    ToWrite = (int) Size < Available ? Size - NbWritten : GetBufferAvailable();
     while (ToWrite < Size)
         ToWrite = (int) Size < Available ? Size : GetBufferAvailable();
 

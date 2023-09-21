@@ -28,8 +28,7 @@
 
 #include "SoapyRPITX.hpp"
 
-unsigned int buffer_pos = 0;
-float libRPITX_Frequency = 144e6;
+float libRPITX_TX_frequency = 144e6;
 float libRPITX_PPM = 0;
 int libRPITX_fifoSize = 1000;
 double libRPITX_Gain = 0;
@@ -191,12 +190,12 @@ SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t chann
 void SoapyRPITX::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
     SoapySDR_logf(SOAPY_SDR_NOTICE, "FREQUENCY: %f", frequency);
     if (direction == SOAPY_SDR_TX)
-        libRPITX_Frequency = frequency;
+        libRPITX_TX_frequency = frequency;
 }
 
 double SoapyRPITX::getFrequency(const int direction, const size_t channel, const std::string &name) const {
     if (direction == SOAPY_SDR_TX)
-        return libRPITX_Frequency;
+        return libRPITX_TX_frequency;
 
     return 0;
 }

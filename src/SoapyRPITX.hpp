@@ -41,14 +41,13 @@
 #include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Types.hpp>
 #include <SoapySDR/Formats.hpp>
-#include "librpitx.hpp"
+#include "SoapyRPITX_IQ_dmaSync.hpp"
 
 typedef enum rpitxStreamFormat {
     RPITX_SDR_CF32, //
 } rpitxStreamFormat_t;
 
-extern unsigned int buffer_pos;
-extern float libRPITX_Frequency;
+extern float libRPITX_TX_frequency;
 extern float libRPITX_PPM;
 extern int libRPITX_fifoSize;
 extern double libRPITX_Gain;
@@ -61,13 +60,12 @@ public:
     tx_streamer(const rpitxStreamFormat format, const SoapySDR::Kwargs &args);
     ~tx_streamer();
     int send(const void *const*buffs, const size_t numElems, int &flags, const long long timeNs, const long timeoutUs);
-    int flush();
 
 public:
     const rpitxStreamFormat format = RPITX_SDR_CF32;
     float ppmpll = 0.0;
     int Harmonic = 1;
-    iqdmasync *iqsender = nullptr;
+    SoapyRPITX_IQ_dmaSync *iqsender = nullptr;
 };
 
 class rpitx_spin_mutex {
@@ -199,5 +197,5 @@ private:
 
 public:
     std::unique_ptr<tx_streamer> tx_stream;
-    iqdmasync *iqsender = nullptr;
+    SoapyRPITX_IQ_dmaSync *iqsender = nullptr;
 };
