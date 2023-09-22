@@ -181,7 +181,6 @@ SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t chann
         return (SoapySDR::Range(0, 0));
 
     return (SoapySDR::Range(0, 0));
-
 }
 
 /*******************************************************************
@@ -268,19 +267,9 @@ double SoapyRPITX::getBandwidth(const int direction, const size_t channel) const
 }
 
 std::vector<double> SoapyRPITX::listBandwidths(const int direction, const size_t channel) const {
-    // TODO:
     std::vector<double> options;
-    options.push_back(0.2e6);
-    options.push_back(1e6);
-    options.push_back(2e6);
-    //options.push_back(3e6);
-    //options.push_back(4e6);
-    //options.push_back(5e6);
-    //options.push_back(6e6);
-    //options.push_back(7e6);
-    //options.push_back(8e6);
-    //options.push_back(9e6);
-    //options.push_back(10e6);
+    // TODO:
+    //options.push_back(0.2e6);
 
     return (options);
 }
