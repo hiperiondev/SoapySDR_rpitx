@@ -346,8 +346,9 @@ sdr.closeStream(st)
   a tiempo. `SOAPY_SDR_HAS_TIME` no está soportado (`SOAPY_SDR_NOT_SUPPORTED`). La MTU es `min(4096, max(FIFO/4, 256))`.
 - `SOAPY_SDR_END_BURST` en la última escritura (o en una escritura de longitud cero) marca el fin de la ráfaga: el DMA
   arranca de inmediato aunque no se haya alcanzado el pre-roll, y tras la última muestra la portadora queda apagada.
+- `activateStream()` sobre un stream activo no tiene efecto (los contadores siguen, no se informa ningún evento).
 - `deactivateStream()` apaga la portadora. Si la última escritura llevaba `END_BURST`, primero espera (como máximo la
-  duración de la FIFO más el anillo más 200 ms) a que se hayan reproducido todas las muestras encoladas; mientras
+  duración de la FIFO a la frecuencia de muestreo, más dos anillos a la frecuencia de posiciones, más 200 ms) a que se hayan reproducido todas las muestras encoladas; mientras
   tanto no retiene el mutex del dispositivo, así que la API de control sigue disponible. Sin `END_BURST`, las
   muestras encoladas se descartan.
 - `closeStream()` (y la destrucción del dispositivo) apaga la portadora de inmediato y descarta las muestras
@@ -357,7 +358,9 @@ sdr.closeStream(st)
   dentro de una ráfaga, overrun del DMA o reinicio del DMA; si no, `SOAPY_SDR_TIMEOUT`.
 - La frecuencia, la frecuencia de muestreo, los ppm y la armónica pueden cambiar durante la transmisión: el
   alimentador detiene el DMA, apaga la portadora, reprograma el PLL y el reloj de cadencia y reanuda con las muestras
-  que ya estaban en el anillo DMA (ninguna se pierde; como mucho una se envía dos veces), seguidas por la FIFO.
+  que ya estaban en el anillo DMA (ninguna se pierde; como mucho una se envía dos veces), seguidas por la FIFO. Las
+  posiciones inactivas anteriores a la primera muestra encolada no se repiten; un hueco inactivo dentro de una ráfaga
+  (FIFO vacía) se repite como inactivo.
 
 ### Argumentos del stream
 
@@ -405,7 +408,8 @@ posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo rea
 | `eer_drive` | 7 | Corriente de los pines de reloj mientras se usa el DAC de envolvente |
 
 Ejemplo: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Los argumentos de dispositivo desconocidos se informan con
-una advertencia. Los enteros son decimales (un cero inicial no significa octal) y los números no pueden llevar
+una advertencia, salvo las claves de identificación (`driver`, `label`, `product`, `serial`, `manufacturer`, `tuner`,
+`type`) y las claves que contienen `:`. Los enteros son decimales (un cero inicial no significa octal) y los números no pueden llevar
 caracteres al final.
 
 ### Sensores
@@ -438,6 +442,9 @@ sudo rpitx_tone_test.py --freq 144.8M --jitter-ms 20 --args "preroll_ms=200,fifo
 sudo rpitx_tone_test.py --freq 144e6 --seconds 0              # solo abre/cierra: recupera una sesión caída
 ```
 
+Las listas `clave=valor` de las herramientas (`--args`, `--stream-args`, `--rx-args`) se verifican antes de abrir
+cualquier radio: un elemento sin `=` detiene la herramienta con un mensaje que lo nombra.
+
 ### `rpitx_amp_calibrate.py`
 
 Mide el camino de amplitud con un receptor SoapySDR (basta un RTL-SDR junto a una carga fantasma) e imprime los
@@ -452,12 +459,17 @@ sudo rpitx_amp_calibrate.py delay --freq 7.1M --envelope-output pcm           # 
 rpitx_amp_calibrate.py self-test                                              # verificación del análisis, sin radio
 ```
 
+Las tablas impresas ya tienen la forma que acepta el driver: tablas de amplitud estrictamente crecientes (un valor
+que el ruido de medición dejó fuera de orden se eleva lo mínimo, con una advertencia), fases dentro de ±180° y la fase
+del código EER 0 (sin portadora) tomada del código 1.
+
 ### `rpitx_reset`
 
 Devuelve el hardware al reposo después de que muriera un proceso que usaba el driver: recupera el registro de sesión
 (ver [Recuperación tras una caída](#recuperación-tras-una-caída)); sin registro, apaga una salida de reloj que haya
 quedado en GPIO4 y detiene GPCLK0. `--dma-channel N` además reinicia el canal DMA N (se rechaza si pertenece al
-kernel). Apto para `ExecStopPost=` en una unidad de systemd.
+kernel, y también cuando la máscara de canales DMA del kernel no se puede leer del device tree, salvo que se indique
+`--force` para un canal que se sabe libre). Apto para `ExecStopPost=` en una unidad de systemd.
 
 ### `hpsdr_rpitx_bridge.py` — puente HPSDR Protocol 1
 
@@ -720,16 +732,21 @@ posición 0 cuando hay `preroll_ms` de señal encolada, cuando se señala el fin
 cuando la primera muestra encolada lleva `preroll_ms` esperando (así las ráfagas cortas también salen).
 
 **Retune:** el hilo de control publica la petición con un número de secuencia y espera hasta 3 s a que el
-alimentador la tome (y luego hasta que termine). El alimentador registra la posición exacta del motor, detiene el
-DMA, **pasa GPIO4 a entrada y restaura los pads** antes de tocar el PLL, copia las posiciones no reproducidas del
-anillo (las muestras I/Q originales se conservan en un arreglo sombra) a un búfer de repetición, reprograma PLLC y el
-reloj PCM, reinicia el anillo y continúa: el búfer de repetición se envía antes que la FIFO. Una petición que el PLL
-no puede satisfacer deja vigente la configuración anterior.
+alimentador la tome (y luego hasta que termine). El alimentador pausa el motor y registra su posición exacta (a un
+motor que se detuvo solo no se le atribuyen vueltas), detiene el DMA, **pasa GPIO4 a entrada y restaura los pads**
+antes de tocar el PLL, copia las posiciones de datos no reproducidas del anillo (las muestras I/Q originales se
+conservan en un arreglo sombra y cada posición se marca como de datos o inactiva) a un búfer de repetición,
+reprograma PLLC y el reloj PCM, reinicia el anillo y continúa: el búfer de repetición se envía antes que la FIFO. Las
+posiciones inactivas anteriores a la primera posición de datos se descartan; las inactivas entre posiciones de datos se
+repiten como inactivas. Tras un error del DMA sin una posición válida del motor, pueden enviarse dos veces hasta 5
+periodos del alimentador. Una petición que el PLL, el reloj de cadencia o el DAC de envolvente no pueden satisfacer se
+rechaza antes de reprogramar nada y deja vigente la configuración anterior (incluidas las correcciones del cristal).
 
-**Detección de vaciado:** `WaitDrained()` compara el contador de muestras introducidas en la FIFO con un contador de
-muestras consumidas que el alimentador publica solo *después* de que las muestras están en el anillo y se actualizó
-la posición de fin de datos, de modo que nunca se informa una ráfaga como enviada mientras sus últimas muestras están
-en tránsito entre la FIFO y el anillo.
+**Detección de vaciado:** el alimentador evalúa la condición de vaciado en un solo lugar al final de cada periodo
+(todas las muestras introducidas hasta ese momento consumidas de la FIFO, búfer de repetición vacío, última posición
+de datos completada) y publica el contador de muestras introducidas al que corresponde; `WaitDrained()` lo compara con
+el contador actual. Un retune lo borra antes de reconstruir el anillo, de modo que nunca se informa una ráfaga como
+enviada mientras hay muestras en tránsito entre la FIFO, el búfer de repetición y el anillo.
 
 ### La FIFO
 
@@ -746,6 +763,9 @@ alimentador lo despierta cuando libera espacio.
   los pads, los pines del DAC de envolvente vuelven a su función original, se desactiva el bloque PCM y se restaura su
   reloj, se restaura el bloque PWM, se restaura el árbol de relojes (primero PLLC, esperando el enganche,
   luego sus canales, los relojes VPU y EMMC y GPCLK0), se libera la memoria VideoCore y se vacía el archivo de bloqueo.
+  El registro deja de nombrar el canal DMA y la memoria VideoCore antes de liberarlos, así que una caída en ese
+  intervalo puede dejar el bloque reservado (se recupera con un reinicio) pero nunca hace que el siguiente proceso
+  libere memoria que puede pertenecer a otro cliente de VideoCore.
 - **`exit()`:** un manejador `atexit` realiza una parada de emergencia (reinicio del DMA, portadora apagada, GPCLK0
   detenido) sin invalidar los objetos, de modo que un destructor posterior todavía completa el cierre.
 - **Señales** (`signal_cleanup=true`): manejadores para SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL
@@ -757,7 +777,7 @@ alimentador lo despierta cuando libera espacio.
 
 Mientras existe un transmisor, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, nunca sobrevive a un reinicio; directorio
 privado) se mantiene con un `flock()` exclusivo y contiene un registro `clave=valor` de todo lo que posee el proceso:
-PID, canal DMA y handle de memoria VideoCore (escritos en cuanto se reserva la memoria), valor original de los pads y
+PID, canal DMA y handle de memoria VideoCore (escritos en cuanto se reserva la memoria y borrados antes de liberarla), valor original de los pads y
 funciones de GPIO4 y de los demás pines usados, reloj PCM original o estado del PWM, y el árbol de relojes (guardado
 y registrado antes de su primera modificación).
 El kernel libera el bloqueo cuando el proceso muere, incluso con `kill -9`. El siguiente proceso que obtiene el
@@ -829,10 +849,10 @@ que sale de la FIFO).
 
 | Prueba | Cubre |
 |--------|-------|
-| `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
+| `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host, motor detenido sin vueltas atribuidas); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
 | `rpitx_devicetree_tests` | Base de periféricos, límite de canales DMA clásicos y máscara DMA del kernel con la nomenclatura antigua y la actual del device tree |
-| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, estado del stream, sensores |
+| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta, repetición solo de las posiciones de datos (retune antes del arranque del DMA y tras un hueco inactivo), vaciado durante un retune concurrente, liberación registrada antes de liberar la memoria VideoCore |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores |
 
 La CI (`.github/workflows/ci.yml`) ejecuta las pruebas en una compilación normal, con AddressSanitizer +
 UndefinedBehaviorSanitizer y con ThreadSanitizer (`tests/tsan.supp` suprime solo los accesos a registros simulados),

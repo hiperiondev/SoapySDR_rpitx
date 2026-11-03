@@ -46,6 +46,7 @@ uint32_t g_kernelDmaMask = 0;
 bool g_kernelDmaMaskKnown = true;
 bool g_failNextAlloc = false;
 std::function<void()> g_vcMapHook;
+std::function<void(unsigned)> g_vcFreeHook;
 
 constexpr unsigned kPeriBase = 0x20000000; // BCM2835 peripheral base reported without a device tree
 
@@ -99,6 +100,14 @@ unsigned mem_alloc(int, unsigned size, unsigned, unsigned) {
 }
 
 unsigned mem_free(int, unsigned handle) {
+    std::function<void(unsigned)> hook;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        hook.swap(g_vcFreeHook);
+    }
+    if (hook)
+        hook(handle);
+
     std::lock_guard<std::mutex> l(g_lock);
     auto it = g_vcmem.find(handle);
     if (it == g_vcmem.end())
@@ -175,6 +184,24 @@ void MockSetKernelDmaMask(uint32_t mask, bool known) {
 void MockOnNextVcMap(std::function<void()> hook) {
     std::lock_guard<std::mutex> l(g_lock);
     g_vcMapHook = std::move(hook);
+}
+
+void MockOnNextVcFree(std::function<void(unsigned)> hook) {
+    std::lock_guard<std::mutex> l(g_lock);
+    g_vcFreeHook = std::move(hook);
+}
+
+__attribute__((noinline)) uint32_t MockPeek(unsigned offset, unsigned index) {
+    return MockRegisters(offset)[index];
+}
+
+__attribute__((noinline)) void MockPoke(unsigned offset, unsigned index, uint32_t value) {
+    MockRegisters(offset)[index] = value;
+}
+
+__attribute__((noinline)) void MockPokeBits(unsigned offset, unsigned index, uint32_t clear, uint32_t set) {
+    volatile uint32_t *r = MockRegisters(offset);
+    r[index] = (r[index] & ~clear) | set;
 }
 
 void MockFailNextAlloc() {

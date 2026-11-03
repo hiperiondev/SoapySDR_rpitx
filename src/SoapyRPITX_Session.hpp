@@ -201,6 +201,10 @@ public:
 
     /**
      * @brief Stores a record in the lock file (the pid is filled in).
+     *
+     * The record is written over the previous one and the file is then cut to its length, so the file never
+     * holds an empty record in between. Write errors are reported on stderr.
+     *
      * @param r Record.
      */
     void Write(const SoapyRPITX_SessionRecord &r);

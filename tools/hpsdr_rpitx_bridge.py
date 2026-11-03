@@ -97,6 +97,17 @@ def parse_frequency(text):
         raise argparse.ArgumentTypeError("invalid frequency '%s'" % text)
 
 
+def parse_kwargs(text, option):
+    """Parses 'key=value,key=value' into a dict; exits with a message naming @option for a malformed item."""
+    out = {}
+    for item in filter(None, (s.strip() for s in text.split(","))):
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit("%s: invalid item '%s' (expected key=value)" % (option, item))
+        out[key.strip()] = value.strip()
+    return out
+
+
 def parse_mac(text):
     """Parses 'aa:bb:cc:dd:ee:ff' (or '-' separated) into 6 bytes."""
     parts = text.replace("-", ":").split(":")
@@ -371,6 +382,7 @@ class Transmitter:
         self.underflows = 0
         self.late = 0
         self.envelope = 0.0
+        stream_args = parse_kwargs(args.stream_args, "--stream-args")
 
         if args.dry_run:
             print("dry run: nothing is transmitted")
@@ -385,14 +397,24 @@ class Transmitter:
             if args.ppm is not None:
                 dev_args["ppm"] = str(args.ppm)
             self.sdr = SoapySDR.Device(dev_args)
-            self.sdr.setSampleRate(SOAPY_SDR_TX, 0, TX_RATE)
-            self.sdr.setGain(SOAPY_SDR_TX, 0, args.gain)
-            self.current_gain = args.gain
-            start_freq = args.freq if args.freq is not None else args.initial_freq
-            self._apply_frequency(start_freq)
-            stream_args = dict(kv.split("=", 1) for kv in args.stream_args.split(",") if kv)
-            self.stream = self.sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], stream_args)
-            self.sdr.activateStream(self.stream)
+            try:
+                self.sdr.setSampleRate(SOAPY_SDR_TX, 0, TX_RATE)
+                self.sdr.setGain(SOAPY_SDR_TX, 0, args.gain)
+                self.current_gain = args.gain
+                start_freq = args.freq if args.freq is not None else args.initial_freq
+                self._apply_frequency(start_freq)
+                self.stream = self.sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], stream_args)
+                self.sdr.activateStream(self.stream)
+            except BaseException:
+                # Release the transmitter before the error propagates: nothing else holds the device yet.
+                if self.stream is not None:
+                    try:
+                        self.sdr.closeStream(self.stream)
+                    except Exception:
+                        pass
+                self.stream = None
+                self.sdr = None
+                raise
 
         self.thread = threading.Thread(target=self._writer, name="rpitx-writer", daemon=True)
         self.thread.start()
@@ -521,7 +543,7 @@ class Transmitter:
         # The writer wakes up at least every 20 ms (queue and writeStream timeouts); the stream must not be
         # closed while it is still writing.
         self.thread.join()
-        if self.sdr is not None:
+        if self.sdr is not None and self.stream is not None:
             try:
                 self.sdr.deactivateStream(self.stream)
                 self.sdr.closeStream(self.stream)
@@ -844,12 +866,25 @@ class Bridge:
         self.control = ControlState(self.board)
         self.mac = args.mac if args.mac is not None else default_mac()
 
+        # Everything that can be refused (GPIO inputs, sockets) is set up before the transmitter is opened, and
+        # whatever was opened is released when the construction fails or is interrupted.
+        self.udp = None
+        self.tcp_listen = None
+        self.tx = None
+        self.keys = None
+        inputs = KeyInputs(args.gpio_chip, args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio)
+        try:
+            self._open(args, inputs)
+        except BaseException:
+            self._release()
+            raise
+
+    def _open(self, args, inputs):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         self.udp.bind((args.bind, args.port))
-        self.tcp_listen = None
         if args.tcp:
             self.tcp_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -866,7 +901,6 @@ class Bridge:
         self.ep2_packets = 0
         self.ep2_lost = 0
 
-        self.tx = Transmitter(args)
         self.tx_lock = threading.Lock()
         self.tx_source = None
         self.tx_priority = {"host": 0, "cwx": 1, "keyer": 2}
@@ -884,13 +918,23 @@ class Bridge:
         self.sender = None
         self._payload_cache = {}
 
-        inputs = KeyInputs(args.gpio_chip, args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio)
-        self.keys = None
+        self.tx = Transmitter(args)
         if inputs.enabled:
             if args.key_dot_gpio is not None or args.key_dash_gpio is not None:
                 self.keys = Keyer(self, inputs, args.cw_ramp_ms)
             else:
                 self.keys = PttInput(inputs)
+
+    def _release(self):
+        """Releases what a failed construction had opened."""
+        if self.keys is not None:
+            self.keys.stop()
+        if self.tx is not None:
+            self.tx.close()
+        if self.tcp_listen is not None:
+            self.tcp_listen.close()
+        if self.udp is not None:
+            self.udp.close()
 
     # ---- transmitter arbitration (host I/Q, Hermes-Lite 2 CWX, radio keyer) ----
 
@@ -1405,7 +1449,11 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, terminate)
 
-    Bridge(args).serve()
+    try:
+        bridge = Bridge(args)  # releases what it opened when it fails or is interrupted
+    except KeyboardInterrupt:
+        return 1
+    bridge.serve()
     return 0
 
 

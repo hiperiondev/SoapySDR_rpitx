@@ -39,6 +39,7 @@
 #include <chrono>
 #include <complex>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -181,11 +182,18 @@ protected:
     SoapyRPITX_HardwareClaim &operator=(const SoapyRPITX_HardwareClaim &) = delete;
 
     /**
-     * @brief Records the DMA channel and the VideoCore memory as soon as they are allocated.
-     * @param channel   DMA channel.
-     * @param memHandle VideoCore memory handle.
+     * @brief Records the DMA channel and the VideoCore memory as soon as they are allocated, and clears them
+     *        (channel -1, handle 0) before they are released.
+     * @param channel   DMA channel, or -1 when none is owned.
+     * @param memHandle VideoCore memory handle, or 0 when none is owned.
      */
     void RecordDmaAllocation(int channel, unsigned memHandle);
+
+    /**
+     * @brief Returns the allocation and release callback passed to the DMA object.
+     * @return Callback that forwards to RecordDmaAllocation() of this claim.
+     */
+    std::function<void(int, unsigned)> AllocationRecorder();
 
     /** @brief Writes @ref record to the session lock file. */
     void PublishRecord();
@@ -229,7 +237,9 @@ protected:
  * - detects and counts DMA overruns and FIFO starvation, and resynchronises after an overrun;
  * - restarts the DMA engine when it stops by itself;
  * - applies frequency / sample-rate changes requested through Retune(), with the carrier off while the PLL is
- *   reprogrammed, and replays the samples that were queued in the ring.
+ *   reprogrammed, and replays the data samples that were queued in the ring: idle slots before the first data
+ *   slot are dropped, idle slots between data slots (FIFO starvation inside a burst) are replayed as idle;
+ * - decides when every queued sample has been played and publishes it for WaitDrained().
  *
  * Every DMA start begins with idle slots that fill the pacing FIFO up to its DREQ level, so no data slot is
  * executed faster than the slot rate.
@@ -309,6 +319,11 @@ public:
 
     /**
      * @brief Waits until every queued sample has been played by the DMA.
+     *
+     * The feeder thread evaluates the drain condition (FIFO consumed, replay buffer empty, last data slot
+     * completed) in one place and publishes the FIFO push count it applies to, so a retune running meanwhile
+     * cannot make the queued samples appear played.
+     *
      * @param timeoutUs Maximum waiting time in microseconds.
      * @return True when drained, false on timeout or when the transmitter is not active.
      */
@@ -386,8 +401,9 @@ public:
     uint32_t SlotsPerSample() const;
 
     /**
-     * @brief Returns the IQ sample rate produced by the pacing clock.
-     * @return Rate in Hz (differs from the nominal rate by the divider quantisation).
+     * @brief Returns the IQ sample rate produced by the pacing clock (any thread).
+     * @return Rate in Hz (differs from the nominal rate by the divider quantisation), published by the last
+     *         successful frequency configuration.
      */
     double GetActualSampleRate() const;
 
@@ -440,6 +456,11 @@ private:
 
     /**
      * @brief Applies a tune configuration to the hardware (DMA must be stopped by the caller).
+     *
+     * The PLL divider, the pacing clock and the envelope DAC clock are checked before anything is
+     * reprogrammed; on such a refusal the crystal corrections of the carrier, PCM and PWM clocks are restored
+     * and the previous configuration stays in effect.
+     *
      * @param tune Configuration to apply.
      * @return True on success.
      */
@@ -467,11 +488,22 @@ private:
     void SetupFeederThread();
 
     /**
-     * @brief Performs a retune requested through Retune() (feeder thread).
-     * @param request New parameters.
+     * @brief Performs a retune requested through Retune() or a DMA restart (feeder thread).
+     *
+     * The data slots between the executing slot and the last data slot are kept for replay. With a running
+     * engine the position is taken from the engine; with an engine that stopped by itself no lap can have
+     * been completed since the last poll, so only the modular distance is used. When the engine reports no
+     * valid position the last confirmed position is used, and up to @ref kBadPollLimit feeder periods of
+     * samples may then be sent twice.
+     *
+     * @param request       New parameters.
+     * @param engineStopped The DMA engine stopped by itself (restart after an error).
      * @return True on success.
      */
-    bool FeederRetune(const SoapyRPITX_TuneConfig &request);
+    bool FeederRetune(const SoapyRPITX_TuneConfig &request, bool engineStopped);
+
+    /** @brief Evaluates the drain condition and publishes it for WaitDrained() (feeder thread). */
+    void PublishDrainState();
 
     /**
      * @brief Moves samples from the replay buffer and the FIFO into the ring up to the target fill.
@@ -489,6 +521,12 @@ private:
 
     /** @brief Overwrites the completed slots reported by the tracker with idle samples. */
     void ScrubCompleted();
+
+    /** @brief Consecutive polls without a valid DMA position before the engine is considered stopped. */
+    static constexpr int kBadPollLimit = 5;
+
+    /** @brief Value of @ref drainedPush while the transmitter is not known to be drained. */
+    static constexpr uint64_t kNotDrained = UINT64_MAX;
 
     /** @brief Restarts after the DMA engine stopped by itself (feeder thread). */
     void RecoverDma();
@@ -589,25 +627,28 @@ private:
     DmaRingTracker tracker;                  ///< Absolute ring positions (feeder thread only).
     std::vector<std::complex<float>> chunk;  ///< Transfer buffer between FIFO and ring (feeder thread only).
     std::vector<std::complex<float>> shadow; ///< Slot sample of every ring slot (zero for idle slots, feeder thread only).
+    std::vector<uint8_t> slotIsData;         ///< 1 for ring slots holding a data sample, 0 for idle slots (feeder thread only).
     std::vector<std::complex<float>> replay; ///< Slot samples queued in the ring before a retune, sent first (feeder thread only).
-    size_t replayPos = 0;                    ///< Next sample of @ref replay (feeder thread only).
-    std::atomic<size_t> replayLeft{0};       ///< Slot samples of @ref replay not yet in the ring.
+    std::vector<uint8_t> replayIsData;       ///< 1 for data entries of @ref replay, 0 for idle entries (feeder thread only).
+    size_t replayPos = 0;                    ///< Next entry of @ref replay (feeder thread only).
+    std::atomic<size_t> replayLeft{0};       ///< Entries of @ref replay not yet in the ring.
 
-    std::thread feeder;                     ///< Feeder thread.
-    std::atomic<bool> running{false};       ///< Feeder thread run flag.
-    std::atomic<bool> feederExited{true};   ///< The feeder thread is not executing its loop.
-    std::atomic<bool> active{false};        ///< True between Start() and Stop().
-    std::atomic<bool> endBurst{false};      ///< Burst end signalled by the producer.
-    std::atomic<bool> dmaRunning{false};    ///< DMA engine running (published by the feeder).
-    std::atomic<uint64_t> playedPos{0};     ///< Absolute read position (published by the feeder).
-    std::atomic<uint64_t> lastDataPos{0};   ///< Absolute position after the last data slot (published by the feeder).
-    std::atomic<uint64_t> consumedTotal{0}; ///< FIFO samples written to the ring, on the scale of SpscFifo::pushedTotal() (published by the feeder).
-    std::atomic<uint64_t> underflows{0};    ///< FIFO starvation events.
-    std::atomic<uint64_t> late{0};          ///< DMA overrun events.
-    std::atomic<uint64_t> dmaErrors{0};     ///< DMA restarts after the engine stopped by itself.
-    std::atomic<uint64_t> samplesSent{0};   ///< IQ samples taken from the FIFO into the ring.
-    std::atomic<uint64_t> envelopeClips{0}; ///< Envelope values limited to full scale.
-    std::atomic<uint64_t> envelopeLate{0};  ///< Envelope words dropped because their slot could already be executing.
+    std::thread feeder;                             ///< Feeder thread.
+    std::atomic<bool> running{false};               ///< Feeder thread run flag.
+    std::atomic<bool> feederExited{true};           ///< The feeder thread is not executing its loop.
+    std::atomic<bool> active{false};                ///< True between Start() and Stop().
+    std::atomic<bool> endBurst{false};              ///< Burst end signalled by the producer.
+    std::atomic<bool> dmaRunning{false};            ///< DMA engine running (published by the feeder).
+    uint64_t lastDataPos = 0;                       ///< Absolute position after the last data slot (feeder thread only).
+    uint64_t consumedTotal = 0;                     ///< FIFO samples written to the ring, on the scale of SpscFifo::pushedTotal() (feeder thread only).
+    std::atomic<uint64_t> drainedPush{kNotDrained}; ///< SpscFifo::pushedTotal() up to which every sample has been played, or @ref kNotDrained.
+    std::atomic<double> actualSampleRate{0.0};      ///< IQ sample rate produced by the pacing clock (published by ApplyTune()).
+    std::atomic<uint64_t> underflows{0};            ///< FIFO starvation events.
+    std::atomic<uint64_t> late{0};                  ///< DMA overrun events.
+    std::atomic<uint64_t> dmaErrors{0};             ///< DMA restarts after the engine stopped by itself.
+    std::atomic<uint64_t> samplesSent{0};           ///< IQ samples taken from the FIFO into the ring.
+    std::atomic<uint64_t> envelopeClips{0};         ///< Envelope values limited to full scale.
+    std::atomic<uint64_t> envelopeLate{0};          ///< Envelope words dropped because their slot could already be executing.
 
     mutable std::mutex tuneMutex;   ///< Protects @ref tuneCfg, @ref pendingTune and the retune handshake.
     std::condition_variable tuneCv; ///< Signals that a retune request was taken or completed.

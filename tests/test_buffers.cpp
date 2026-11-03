@@ -540,6 +540,23 @@ void testEnvelopePhaseAlignment() {
 
 } // namespace
 
+void testRingStoppedEngine() {
+    // With no expected progress (an engine that stopped by itself) only the modular distance counts, even
+    // when the time since the previous poll is longer than half a ring.
+    DmaRingTracker t(512);
+    t.advanceWrite(400);
+    CHECK(!t.update(100, 0.0));
+    CHECK(t.readPos() == 100);
+    CHECK(!t.update(100, 0.0));
+    CHECK(t.readPos() == 100);
+    // The same poll with an expected progress above half a ring is taken as a lap.
+    DmaRingTracker u(512);
+    u.advanceWrite(400);
+    u.update(100, 0.0);
+    u.update(100, 300.0);
+    CHECK(u.readPos() == 100 + 512);
+}
+
 int main() {
     testFifoBasic();
     testFifoLimit();
@@ -549,6 +566,7 @@ int main() {
     testRingLapLoss();
     testRingDoubleStall();
     testRingHostStarvation();
+    testRingStoppedEngine();
     testDsp();
     testAmplitudeModelLinear();
     testAmplitudeModelTables();

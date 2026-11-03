@@ -97,6 +97,8 @@ protected:
     int channel = 0;             ///< DMA channel in use.
     dmagpio dma_reg;             ///< Mapping of the DMA controller registers.
 
+    std::function<void(int, unsigned)> allocationCallback; ///< Allocation and release callback (may be empty).
+
     uint32_t mem_flag = 0;       ///< Allocation flags chosen from the SDRAM bus alias.
     uint32_t dram_phys_base = 0; ///< SDRAM bus alias reported by the device tree.
 
@@ -118,7 +120,8 @@ public:
      * @param Force       Reset an explicitly selected channel even when it is active.
      * @param Allocated   Called with the channel and the VideoCore memory handle as soon as the memory is
      *                    allocated and locked, before anything else can fail (used to record the allocation
-     *                    for crash recovery). May be empty.
+     *                    for crash recovery), and again with (-1, 0) by the destructor once the channel is
+     *                    stopped and before the memory is released. May be empty.
      *
      * @throws std::runtime_error when the channel is not usable (DMA4 channel on BCM2711, reserved for the
      *         kernel, or active and not forced), when no default channel is requested but the kernel channel
@@ -128,7 +131,10 @@ public:
      */
     dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force = false, const std::function<void(int, unsigned)> &Allocated = {});
 
-    /** @brief Stops the channel, unmaps and releases the VideoCore memory and closes the mailbox. */
+    /**
+     * @brief Stops the channel, reports the release through the allocation callback (channel -1, handle 0),
+     *        unmaps and releases the VideoCore memory and closes the mailbox.
+     */
     ~dma();
 
     dma(const dma &) = delete;
@@ -170,6 +176,13 @@ public:
      * @return Always 0.
      */
     int stop();
+
+    /**
+     * @brief Pauses the channel (clears ACTIVE) without resetting it, so that the control-block address stays
+     *        valid and stops moving; stop() or start() follows.
+     * @return Always 0.
+     */
+    int pause();
 
     /**
      * @brief Returns the byte offset of the control block currently loaded by the channel.
@@ -247,7 +260,7 @@ public:
      * @param tcbbysample       Control blocks per slot.
      * @param tregisterbysample User-memory words per slot.
      * @param Force             Reset an explicitly selected channel even when it is active.
-     * @param Allocated         Allocation callback (see dma::dma()).
+     * @param Allocated         Allocation and release callback (see dma::dma()).
      *
      * @throws std::runtime_error on channel or allocation failure (see dma::dma()).
      */

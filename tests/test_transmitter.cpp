@@ -213,17 +213,15 @@ void testRetuneCarrierOffAndReplay() {
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     // Watch PLLC_CTRL while the PLL is reprogrammed: GPIO4 must not be on the clock output meanwhile.
-    volatile uint32_t *clk = MockRegisters(CLK_BASE);
-    volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
     std::atomic<bool> stop{false};
     std::atomic<int> unsafe{0};
     std::thread monitor([&] {
-        uint32_t last = clk[PLLC_CTRL];
+        uint32_t last = MockPeek(CLK_BASE, PLLC_CTRL);
         while (!stop.load()) {
-            uint32_t c = clk[PLLC_CTRL];
+            uint32_t c = MockPeek(CLK_BASE, PLLC_CTRL);
             if (c != last) {
                 last = c;
-                if (((gpio[GPFSEL0] >> 12) & 7) == fsel_alt0)
+                if (((MockPeek(GENERAL_BASE, GPFSEL0) >> 12) & 7) == fsel_alt0)
                     unsafe++;
             }
         }
@@ -392,8 +390,7 @@ void testDmaRestartAndPads() {
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
     // The engine stops by itself: the feeder notices it and restarts.
-    volatile uint32_t *dmaRegs = MockRegisters(DMA_BASE);
-    dmaRegs[DMA_CS + 14 * DMA_CHANNEL_WORDS] &= ~(uint32_t) DMA_CS_ACTIVE;
+    MockPokeBits(DMA_BASE, DMA_CS + 14 * DMA_CHANNEL_WORDS, DMA_CS_ACTIVE, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(tx.GetStats().dmaErrors >= 1);
 
@@ -849,6 +846,99 @@ void testAllocationRecordedEarly() {
     CHECK(checked);
 }
 
+// Carrier-on slots of a burst in EER mode, where every data slot (even a zero sample) switches GPIO4 on.
+SoapyRPITX_TxConfig eerCountingConfig() {
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.envelopeOutput = SoapyRPITX_EnvelopeOutput::Pcm;
+    return cfg;
+}
+
+void testRetuneBeforeDmaStartKeepsData() {
+    // A retune before the DMA starts replays the queued samples, not the idle slots that precede them.
+    SoapyRPITX_TxConfig cfg = eerCountingConfig();
+    cfg.prerollMs = 1000;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+    tx.Start();
+    std::vector<std::complex<float>> burst = level(480, 0.5f);
+    CHECK(tx.Write(burst.data(), burst.size(), 1000000) == burst.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(!tx.GetStats().dmaRunning);
+    SoapyRPITX_TuneConfig t = tx.GetTune();
+    t.frequency = 145.0e6;
+    CHECK(tx.Retune(t));
+    tx.EndBurst();
+    CHECK(tx.WaitDrained(3000000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    size_t on = carrierOn(engine.Take());
+    CHECK(on >= burst.size() && on <= burst.size() + 1);
+    tx.Stop();
+}
+
+void testRetuneAfterGapKeepsData() {
+    // Idle slots written while the FIFO was empty are not replayed as data after a retune.
+    SoapyRPITX_IQ_dmaSync tx(eerCountingConfig());
+    MockDmaEngine engine(14, kRate);
+    tx.Start();
+    std::vector<std::complex<float>> first = level(2400, 0.5f);
+    CHECK(tx.Write(first.data(), first.size(), 1000000) == first.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::vector<std::complex<float>> second = level(4800, 0.5f);
+    CHECK(tx.Write(second.data(), second.size(), 1000000) == second.size());
+    SoapyRPITX_TuneConfig t = tx.GetTune();
+    t.frequency = 145.0e6;
+    CHECK(tx.Retune(t));
+    tx.EndBurst();
+    CHECK(tx.WaitDrained(3000000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    size_t on = carrierOn(engine.Take());
+    size_t total = first.size() + second.size();
+    CHECK(on >= total && on <= total + 1);
+    tx.Stop();
+}
+
+void testDrainDuringRetune() {
+    // A retune from another thread while WaitDrained() waits does not end the wait before the replayed
+    // samples are played.
+    for (int round = 0; round < 3; round++) {
+        SoapyRPITX_IQ_dmaSync tx(eerCountingConfig());
+        MockDmaEngine engine(14, kRate);
+        tx.Start();
+        std::vector<std::complex<float>> burst = level(9600, 0.5f);
+        CHECK(tx.Write(burst.data(), burst.size(), 1000000) == burst.size());
+        tx.EndBurst();
+        std::thread retuner([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60 + 20 * round));
+            SoapyRPITX_TuneConfig t = tx.GetTune();
+            t.frequency = round % 2 ? 144.8e6 : 145.0e6;
+            CHECK(tx.Retune(t));
+        });
+        CHECK(tx.WaitDrained(3000000));
+        size_t onAtDrain = carrierOn(engine.Take());
+        retuner.join();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        size_t on = onAtDrain + carrierOn(engine.Take());
+        CHECK(on >= burst.size() && on <= burst.size() + 1);
+        CHECK(onAtDrain + 1 >= burst.size());
+        tx.Stop();
+    }
+}
+
+void testReleaseRecordedBeforeFree() {
+    // The lock file stops naming the DMA channel and the VideoCore memory before the memory is released.
+    bool checked = false;
+    bool clear = false;
+    MockOnNextVcFree([&](unsigned) {
+        std::ifstream in(SoapyRPITX_Session::LockPath());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        SoapyRPITX_SessionRecord rec;
+        checked = SoapyRPITX_ParseRecord(text, rec);
+        clear = checked && rec.memHandle == 0 && rec.dmaChannel < 0;
+    });
+    { SoapyRPITX_IQ_dmaSync tx(baseConfig()); }
+    CHECK(checked && clear);
+}
+
 } // namespace
 
 int main() {
@@ -873,6 +963,10 @@ int main() {
     testEndBurstThenShortBurst();
     testSessionSecurity();
     testAllocationRecordedEarly();
+    testRetuneBeforeDmaStartKeepsData();
+    testRetuneAfterGapKeepsData();
+    testDrainDuringRetune();
+    testReleaseRecordedBeforeFree();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

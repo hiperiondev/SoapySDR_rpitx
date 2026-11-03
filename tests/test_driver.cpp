@@ -199,6 +199,10 @@ void testStatusAndSensors() {
     CHECK(dev.readStreamStatus(st, mask, flags, timeNs, 100000) == SOAPY_SDR_UNDERFLOW);
     CHECK(mask == 1);
 
+    // Activating the active stream again changes nothing and reports no event.
+    CHECK(dev.activateStream(st) == 0);
+    CHECK(dev.readStreamStatus(st, mask, flags, timeNs, 10000) == SOAPY_SDR_TIMEOUT);
+
     CHECK(dev.writeStream(nullptr, buffs, buf.size(), flags, 0, 1000) == SOAPY_SDR_STREAM_ERROR);
     flags = SOAPY_SDR_HAS_TIME;
     CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000) == SOAPY_SDR_NOT_SUPPORTED);

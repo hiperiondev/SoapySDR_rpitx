@@ -40,7 +40,8 @@ std::string hex(uint32_t v) {
 
 } // namespace
 
-dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const std::function<void(int, unsigned)> &Allocated) {
+dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const std::function<void(int, unsigned)> &Allocated) :
+        allocationCallback(Allocated) {
     const bool bcm2711 = dma_reg.pi_is_2711;
     const int maxChannel = bcm2711 ? 10 : 14;
     bool maskKnown = false;
@@ -101,9 +102,9 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const s
         mbox_close(mbox.handle);
         throw std::runtime_error("librpitx: VideoCore memory lock failed");
     }
-    if (Allocated) {
+    if (allocationCallback) {
         try {
-            Allocated(channel, mbox.mem_ref);
+            allocationCallback(channel, mbox.mem_ref);
         } catch (...) {
             mem_unlock(mbox.handle, mbox.mem_ref);
             mem_free(mbox.handle, mbox.mem_ref);
@@ -114,6 +115,12 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const s
 
     mbox.virt_addr = (uint8_t *) mapmem(BUS_TO_PHYS(mbox.bus_addr), (unsigned) NumPages * VC_PAGE_SIZE);
     if (mbox.virt_addr == nullptr) {
+        if (allocationCallback) {
+            try {
+                allocationCallback(-1, 0);
+            } catch (...) {
+            }
+        }
         mem_unlock(mbox.handle, mbox.mem_ref);
         mem_free(mbox.handle, mbox.mem_ref);
         mbox_close(mbox.handle);
@@ -147,6 +154,17 @@ void dma::GetRpiInfo() {
 
 dma::~dma() {
     stop();
+
+    // The crash record must stop naming the channel and the memory before they can be reused by others: a
+    // leaked block is recoverable, freeing memory that belongs to another VideoCore client is not.
+    // Nothing may leave the destructor: every exception is caught here.
+    if (allocationCallback) {
+        try {
+            allocationCallback(-1, 0);
+        } catch (...) {
+            dbg_printf(0, "DMA release record failed\n");
+        }
+    }
 
     unmapmem((void *) mbox.virt_addr, (unsigned) NumPages * VC_PAGE_SIZE);
     if (mem_unlock(mbox.handle, mbox.mem_ref) != 0)
@@ -190,6 +208,12 @@ int dma::stop() {
     dma_reg.gpioreg[DMA_DEBUG + channel * DMA_CHANNEL_WORDS] = 7; // clear debug error flags
     usleep(100);
     Started = false;
+    return 0;
+}
+
+int dma::pause() {
+    dma_reg.gpioreg[DMA_CS + channel * DMA_CHANNEL_WORDS] = DMA_CS_PRIORITY(7) | DMA_CS_PANIC_PRIORITY(7) | DMA_CS_DISDEBUG;
+    usleep(10); // the single-word transfer in progress completes
     return 0;
 }
 

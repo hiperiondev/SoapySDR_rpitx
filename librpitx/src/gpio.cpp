@@ -631,16 +631,23 @@ void pcmgpio::Setppm(double ppm) {
     Pllfrequency = GetPllFrequency(pllnumber);
 }
 
-int pcmgpio::ComputePrediv(uint64_t Frequency) {
+double pcmgpio::Getppm() const {
+    return clk_ppm;
+}
+
+int pcmgpio::ComputePrediv(uint64_t Frequency) const {
+    if (Frequency == 0)
+        return -1;
     for (int prediv = 10; prediv < 1000; prediv++) {
         double Freqresult = (double) Pllfrequency / (double) (Frequency * (uint64_t) prediv);
-        if ((Freqresult < 4096.0) && (Freqresult > 2.0)) {
-            dbg_printf(1, "PCM prediv = %d\n", prediv);
+        if ((Freqresult < 4096.0) && (Freqresult >= 2.0))
             return prediv;
-        }
     }
-    dbg_printf(0, "PCM: no frame length for %llu Hz\n", (unsigned long long) Frequency);
-    return 1000;
+    return -1;
+}
+
+bool pcmgpio::FrequencyFits(uint64_t Frequency) const {
+    return ComputePrediv(Frequency) > 0;
 }
 
 bool pcmgpio::ProgramClock(double bitRate) {
@@ -657,11 +664,20 @@ bool pcmgpio::ProgramClock(double bitRate) {
 }
 
 int pcmgpio::SetFrequency(uint64_t Frequency) {
+    int prediv = ComputePrediv(Frequency);
+    if (prediv < 0) {
+        dbg_printf(0, "PCM: no frame length for %llu Hz\n", (unsigned long long) Frequency);
+        return -1;
+    }
+    dbg_printf(1, "PCM prediv = %d\n", prediv);
+
     used = true;
     gpioreg[PCM_CS_A] = PCM_CS_EN | PCM_CS_STBY; // block enabled, transmitter and receiver off
-    Prediv = ComputePrediv(Frequency);
-    if (!ProgramClock((double) Frequency * (double) Prediv))
+    Prediv = prediv;
+    if (!ProgramClock((double) Frequency * (double) Prediv)) {
         dbg_printf(0, "PCM Frequency out of range\n");
+        return -1;
+    }
     SetPrediv(Prediv);
     return 0;
 }
@@ -763,6 +779,10 @@ pwmgpio::~pwmgpio() {
 void pwmgpio::Setppm(double ppm) {
     clk_ppm = ppm;
     Pllfrequency = cm_pll_frequency(clk.gpioreg, pllnumber, clk.XOSC_FREQUENCY, clk.pi_is_2711, clk_ppm);
+}
+
+double pwmgpio::Getppm() const {
+    return clk_ppm;
 }
 
 bool pwmgpio::FrequencyFits(uint64_t Frequency, uint32_t Range) const {

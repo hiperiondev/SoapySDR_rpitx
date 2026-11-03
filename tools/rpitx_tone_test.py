@@ -41,6 +41,17 @@ def parse_frequency(text):
         raise argparse.ArgumentTypeError("invalid frequency '%s'" % text)
 
 
+def parse_kwargs(text, option):
+    """Parses 'key=value,key=value' into a dict; exits with a message naming @option for a malformed item."""
+    out = {}
+    for item in filter(None, (s.strip() for s in text.split(","))):
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit("%s: invalid item '%s' (expected key=value)" % (option, item))
+        out[key.strip()] = value.strip()
+    return out
+
+
 def read_wav(path):
     """Reads a PCM WAV file (8/16/24/32-bit integer). Returns (samples[n, channels] in [-1, 1), rate)."""
     try:
@@ -186,6 +197,8 @@ def main():
     if mode == "auto":
         mode = "constant" if (baseband is None or a.mod == "fm") else "envelope"
 
+    stream_args = parse_kwargs(a.args, "--args")
+
     import SoapySDR
     from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_END_BURST, SOAPY_SDR_TIMEOUT, SOAPY_SDR_TX
 
@@ -194,7 +207,6 @@ def main():
     sdr.setFrequency(SOAPY_SDR_TX, 0, a.freq)
     sdr.setGain(SOAPY_SDR_TX, 0, a.gain)
 
-    stream_args = dict(kv.split("=", 1) for kv in a.args.split(",") if kv)
     st = sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], stream_args)
     sdr.activateStream(st)
 

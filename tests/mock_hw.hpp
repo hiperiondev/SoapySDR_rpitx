@@ -48,6 +48,41 @@ void MockFailNextAlloc();
 void MockOnNextVcMap(std::function<void()> hook);
 
 /**
+ * @brief Calls a function, once, when the next VideoCore allocation is released (before it is freed).
+ * @param hook Function receiving the memory handle (empty to cancel).
+ */
+void MockOnNextVcFree(std::function<void(unsigned)> hook);
+
+/**
+ * @brief Reads a simulated register from the test thread.
+ *
+ * Tests read and write simulated registers through these helpers only, so that the thread-sanitizer
+ * suppressions can name them instead of whole test functions: the hardware is shared by design.
+ *
+ * @param offset Peripheral offset of the register block (for example GENERAL_BASE).
+ * @param index  Word index inside the block.
+ * @return Register value.
+ */
+uint32_t MockPeek(unsigned offset, unsigned index);
+
+/**
+ * @brief Writes a simulated register from the test thread (see MockPeek()).
+ * @param offset Peripheral offset of the register block.
+ * @param index  Word index inside the block.
+ * @param value  Value to write.
+ */
+void MockPoke(unsigned offset, unsigned index, uint32_t value);
+
+/**
+ * @brief Clears and sets bits of a simulated register from the test thread (see MockPeek()).
+ * @param offset Peripheral offset of the register block.
+ * @param index  Word index inside the block.
+ * @param clear  Bits to clear.
+ * @param set    Bits to set after clearing.
+ */
+void MockPokeBits(unsigned offset, unsigned index, uint32_t clear, uint32_t set);
+
+/**
  * @brief Allocates simulated VideoCore memory outside the code under test.
  * @param size Size in bytes.
  * @return Memory handle.

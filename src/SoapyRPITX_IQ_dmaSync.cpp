@@ -49,8 +49,6 @@ constexpr auto kFeederPeriod = std::chrono::microseconds(1000);
 constexpr auto kProducerSlice = std::chrono::milliseconds(2);
 // Maximum time a control thread waits for the feeder to take a retune request.
 constexpr auto kRetuneTimeout = std::chrono::seconds(3);
-// Consecutive polls without a valid DMA position before the engine is considered stopped.
-constexpr int kBadPollLimit = 5;
 // Largest phase correction applied in one slot, in radians.
 constexpr double kMaxPhaseStep = 0.5;
 // Bound of the phase error carried between slots, in radians.
@@ -265,6 +263,10 @@ void SoapyRPITX_HardwareClaim::RecordDmaAllocation(int channel, unsigned memHand
     PublishRecord();
 }
 
+std::function<void(int, unsigned)> SoapyRPITX_HardwareClaim::AllocationRecorder() {
+    return [this](int channel, unsigned memHandle) { RecordDmaAllocation(channel, memHandle); };
+}
+
 void SoapyRPITX_HardwareClaim::PublishRecord() {
     session->Write(record);
 }
@@ -279,8 +281,7 @@ uint32_t SoapyRPITX_IQ_dmaSync::CbsPerSlot(const SoapyRPITX_TxConfig &cfg) {
 
 SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
         SoapyRPITX_HardwareClaim(cfg),
-        bufferdma(cfg.dmaChannel, clampRingSize(cfg.ringSize), CbsPerSlot(cfg), WordsPerSlot(cfg), cfg.dmaForce,
-                  [this](int ch, unsigned handle) { RecordDmaAllocation(ch, handle); }),
+        bufferdma(cfg.dmaChannel, clampRingSize(cfg.ringSize), CbsPerSlot(cfg), WordsPerSlot(cfg), cfg.dmaForce, AllocationRecorder()),
         clkgpio(),
         pcmgpio(),
         tuneCfg(cfg.tune),
@@ -306,7 +307,8 @@ SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
         fifo(fifoCapacityFor(cfg.fifoMs, RPITX_MAX_SAMPLE_RATE)),
         tracker(clampRingSize(cfg.ringSize)),
         chunk(512),
-        shadow(clampRingSize(cfg.ringSize)) {
+        shadow(clampRingSize(cfg.ringSize)),
+        slotIsData(clampRingSize(cfg.ringSize), 0) {
     volatile uint32_t *gp = clkgpio::gengpio.gpioreg;
     clkgpio::SaveClockTree();
     WriteSessionRecord();
@@ -420,7 +422,17 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     if (!SoapyRPITX_RingFitsRate(tracker.size(), rate))
         return false;
 
-    double previousPpm = clkgpio::Getppm();
+    // Every refusal below restores the three crystal corrections, so the clocks keep matching the hardware.
+    const double previousClkPpm = clkgpio::Getppm();
+    const double previousPcmPpm = pcmgpio::Getppm();
+    const double previousPwmPpm = pwm.Getppm();
+    auto rollback = [&] {
+        clkgpio::Setppm(previousClkPpm);
+        pcmgpio::Setppm(previousPcmPpm);
+        pwm.Setppm(previousPwmPpm);
+        return false;
+    };
+
     double basePpm = 0;
     if (tune.ppmFromNtp) {
         clkgpio::Setppm(0);
@@ -428,32 +440,25 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
         basePpm = clkgpio::Getppm();
     }
     clkgpio::Setppm(basePpm + tune.ppm);
+    const double ppm = clkgpio::Getppm();
 
-    // The envelope DAC must be able to run at the slot rate before anything is reprogrammed.
-    bool dacFits = true;
-    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
-        pcmgpio::Setppm(clkgpio::Getppm());
-        dacFits = pcmgpio::DacFrequencyFits(rate);
-        if (!dacFits)
-            pcmgpio::Setppm(previousPpm);
-    } else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
-        pwm.Setppm(clkgpio::Getppm());
-        dacFits = pwm.FrequencyFits(rate, pwmRange);
-        if (!dacFits)
-            pwm.Setppm(previousPpm);
+    // The pacing clock (and the envelope DAC) must be able to run at the slot rate before anything is reprogrammed.
+    bool pacingFits;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        pwm.Setppm(ppm);
+        pacingFits = pwm.FrequencyFits(rate, pwmRange);
+    } else {
+        pcmgpio::Setppm(ppm);
+        pacingFits = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm ? pcmgpio::DacFrequencyFits(rate) : pcmgpio::FrequencyFits(rate);
     }
-    if (!dacFits) {
-        clkgpio::Setppm(previousPpm);
-        return false;
-    }
+    if (!pacingFits)
+        return rollback();
 
     // Instantaneous frequencies stay within +/- rate / 2, plus the largest phase correction of one slot.
     const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
     uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
-    if (clkgpio::SetCenterFrequency(pllFrequency, bandwidth) != 0) {
-        clkgpio::Setppm(previousPpm);
-        return false;
-    }
+    if (clkgpio::SetCenterFrequency(pllFrequency, bandwidth) != 0)
+        return rollback();
     if (!clkgpio::WaitPllcLock(2000))
         SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: PLLC did not report lock at %.0f Hz", tune.frequency);
     if (clkgpio::CrossesBoundary())
@@ -462,15 +467,19 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
                       "(a slightly different frequency or a lower sample rate avoids it)",
                       tune.frequency, bandwidth);
 
-    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
-        pwm.SetFrequency(rate, pwmRange);
-    } else {
-        pcmgpio::Setppm(clkgpio::Getppm());
-        if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm)
-            pcmgpio::SetDacFrequency(rate);
-        else
-            pcmgpio::SetFrequency(rate);
+    int pacingError;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
+        pacingError = pwm.SetFrequency(rate, pwmRange);
+    else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm)
+        pacingError = pcmgpio::SetDacFrequency(rate);
+    else
+        pacingError = pcmgpio::SetFrequency(rate);
+    if (pacingError != 0) {
+        // Checked above with the same clock source and correction: only reached when the hardware changed.
+        SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA pacing clock cannot run at %u Hz; the carrier PLL is already reprogrammed", rate);
+        return rollback();
     }
+
     slotRate = rate;
     mydsp.samplerate = rate;
     mydsp.reset();
@@ -478,6 +487,8 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     appliedPhase = 0;
     carryToHz = (double) rate / (2.0 * M_PI);
     fifo.setLimit(fifoCapacityFor(fifoMs, tune.sampleRate));
+    const double frames = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm ? pwm.GetFrameRate() : pcmgpio::GetFrameRate();
+    actualSampleRate.store(frames / slotsPerSample);
 
     {
         std::lock_guard<std::mutex> lock(tuneMutex);
@@ -536,6 +547,7 @@ void SoapyRPITX_IQ_dmaSync::WriteIdleSlot(uint32_t slot) {
     if (wordEnv >= 0)
         tab[wordEnv] = idleEnv;
     shadow[slot] = std::complex<float>(0.0f, 0.0f);
+    slotIsData[slot] = 0;
 }
 
 void SoapyRPITX_IQ_dmaSync::UpdateBehindLimit() {
@@ -551,6 +563,7 @@ void SoapyRPITX_IQ_dmaSync::WriteDataSlot(uint64_t pos, std::complex<float> samp
     const uint32_t slot = tracker.slotOf(pos);
     mydsp.pushsample(sample);
     shadow[slot] = sample;
+    slotIsData[slot] = 1;
     envHistory.push(mydsp.amplitude);
 
     const SoapyRPITX_AmplitudeModel &m = *model;
@@ -680,8 +693,7 @@ void SoapyRPITX_IQ_dmaSync::ResetRing() {
     for (uint32_t i = 0; i < buffersize; i++)
         WriteIdleSlot(i);
     tracker.reset();
-    playedPos.store(0);
-    lastDataPos.store(0);
+    lastDataPos = 0;
     phaseCarry = 0;
     idlePrefix = 0;
 }
@@ -748,8 +760,10 @@ void SoapyRPITX_IQ_dmaSync::Start() {
     fsel2On = base2 | ((uint32_t) fsel_alt5 << (3 * (RPITX_TX2_GPIO % 10)));
 
     fifo.clear();
-    consumedTotal.store(fifo.pushedTotal());
+    consumedTotal = fifo.pushedTotal();
+    drainedPush.store(kNotDrained);
     replay.clear();
+    replayIsData.clear();
     replayPos = 0;
     replayLeft.store(0);
     endBurst.store(false);
@@ -786,11 +800,13 @@ void SoapyRPITX_IQ_dmaSync::Stop() {
         return;
 
     JoinFeeder();
+    drainedPush.store(kNotDrained);
     StopDma();
     RestoreGpio();
     ResetRing();
     fifo.clear();
     replay.clear();
+    replayIsData.clear();
     replayPos = 0;
     replayLeft.store(0);
     spaceCv.notify_all();
@@ -844,12 +860,9 @@ void SoapyRPITX_IQ_dmaSync::EndBurst() {
 bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
     const auto deadline = clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
     while (active.load()) {
-        // Samples are either in the FIFO (pushed, not consumed), in the replay buffer, or in the ring before
-        // lastDataPos; the counters are read in the reverse order of their updates by the feeder.
-        uint64_t consumed = consumedTotal.load();
-        size_t replaying = replayLeft.load();
-        uint64_t last = lastDataPos.load();
-        if (fifo.pushedTotal() == consumed && replaying == 0 && playedPos.load() >= last)
+        // The feeder publishes the push count up to which everything has been played; samples pushed later
+        // make the counts differ.
+        if (drainedPush.load() == fifo.pushedTotal())
             return true;
         if (clock::now() >= deadline)
             return false;
@@ -938,8 +951,7 @@ uint32_t SoapyRPITX_IQ_dmaSync::SlotsPerSample() const {
 }
 
 double SoapyRPITX_IQ_dmaSync::GetActualSampleRate() const {
-    double frames = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm ? pwm.GetFrameRate() : pcmgpio::GetFrameRate();
-    return frames / slotsPerSample;
+    return actualSampleRate.load();
 }
 
 bool SoapyRPITX_IQ_dmaSync::IsPllLocked() {
@@ -1002,19 +1014,25 @@ uint32_t SoapyRPITX_IQ_dmaSync::PumpData(uint32_t target) {
 
         uint64_t pos = tracker.writePos();
         if (replayPos < replay.size()) {
-            // Replayed samples are slot samples: one per slot.
+            // Replayed entries are slot samples (one per slot) or idle slots of a gap inside a burst.
             const size_t m = std::min<size_t>(std::min<size_t>(w, chunk.size()), replay.size() - replayPos);
-            for (size_t i = 0; i < m; i++)
-                WriteDataSlot(pos + i, replay[replayPos + i]);
+            for (size_t i = 0; i < m; i++) {
+                if (replayIsData[replayPos + i]) {
+                    WriteDataSlot(pos + i, replay[replayPos + i]);
+                    lastDataPos = pos + i + 1;
+                } else {
+                    WriteIdleSlot(tracker.slotOf(pos + i));
+                    if (i == 0 ? (replayPos > 0 && replayIsData[replayPos - 1]) : replayIsData[replayPos + i - 1])
+                        ResetAmplitudeState();
+                }
+            }
             replayPos += m;
             tracker.advanceWrite((uint32_t) m);
             total += (uint32_t) m;
 
-            // Publish the new end of data before the samples stop being counted as queued, so that
-            // WaitDrained() never sees them in neither place.
-            lastDataPos.store(tracker.writePos());
             if (replayPos == replay.size()) {
                 replay.clear();
+                replayIsData.clear();
                 replayPos = 0;
             }
             replayLeft.store(replay.size() - replayPos);
@@ -1043,8 +1061,8 @@ uint32_t SoapyRPITX_IQ_dmaSync::PumpData(uint32_t target) {
         total += (uint32_t) (m * k);
         fromFifo += m;
 
-        lastDataPos.store(tracker.writePos());
-        consumedTotal.fetch_add(m);
+        lastDataPos = tracker.writePos();
+        consumedTotal += m;
     }
 
     if (fromFifo > 0) {
@@ -1074,31 +1092,49 @@ void SoapyRPITX_IQ_dmaSync::ScrubCompleted() {
     tracker.markScrubbed(end);
 }
 
-bool SoapyRPITX_IQ_dmaSync::FeederRetune(const SoapyRPITX_TuneConfig &request) {
+bool SoapyRPITX_IQ_dmaSync::FeederRetune(const SoapyRPITX_TuneConfig &request, bool engineStopped) {
+    // Nothing published as drained may change while the ring is rebuilt.
+    drainedPush.store(kNotDrained);
+
     const bool wasRunning = dmaRunning.load();
     if (wasRunning) {
+        // The engine is paused before its position is read, so it cannot execute more slots meanwhile.
+        const bool stopped = engineStopped || !bufferdma::isrunning();
+        bufferdma::pause();
         int slot = GetCurrentSample();
         if (slot >= 0) {
             auto now = clock::now();
-            tracker.update((uint32_t) slot, std::chrono::duration<double>(now - lastPoll).count() * slotRate);
+            // An engine that stopped by itself cannot have completed laps since the last poll.
+            const double expected = stopped ? 0.0 : std::chrono::duration<double>(now - lastPoll).count() * slotRate;
+            tracker.update((uint32_t) slot, expected);
             lastPoll = now;
         }
     }
     StopDma();
     CarrierOff();
 
-    // Keep the samples that were written to the ring but not played: they are sent first after the retune.
-    // The slot that was executing is included, so at most one sample is sent twice and none is lost.
+    // Keep the data slots that were written to the ring but not played: they are sent first after the retune.
+    // The slot that was executing is included, so at most one sample is sent twice and none is lost. Idle
+    // slots before the first data slot are dropped; idle slots between data slots are kept as idle.
     std::vector<std::complex<float>> pending;
-    const uint64_t first = tracker.readPos();
-    const uint64_t end = lastDataPos.load();
+    std::vector<uint8_t> pendingIsData;
+    uint64_t first = tracker.readPos();
+    const uint64_t end = lastDataPos;
     if (end > first && end - first <= tracker.size()) {
+        while (first < end && !slotIsData[tracker.slotOf(first)])
+            first++;
         pending.reserve((size_t) (end - first) + (replay.size() - replayPos));
-        for (uint64_t p = first; p < end; p++)
-            pending.push_back(shadow[tracker.slotOf(p)]);
+        pendingIsData.reserve(pending.capacity());
+        for (uint64_t p = first; p < end; p++) {
+            const uint32_t slot = tracker.slotOf(p);
+            pending.push_back(shadow[slot]);
+            pendingIsData.push_back(slotIsData[slot]);
+        }
     }
     pending.insert(pending.end(), replay.begin() + (std::ptrdiff_t) replayPos, replay.end());
+    pendingIsData.insert(pendingIsData.end(), replayIsData.begin() + (std::ptrdiff_t) replayPos, replayIsData.end());
     replay.swap(pending);
+    replayIsData.swap(pendingIsData);
     replayPos = 0;
     replayLeft.store(replay.size());
 
@@ -1110,10 +1146,19 @@ bool SoapyRPITX_IQ_dmaSync::FeederRetune(const SoapyRPITX_TuneConfig &request) {
     return ok;
 }
 
+void SoapyRPITX_IQ_dmaSync::PublishDrainState() {
+    // The push count is read after the FIFO was consumed in this period: equal counts mean that every sample
+    // pushed so far is in the ring, and the ring position tells whether its last data slot has completed.
+    const uint64_t pushed = fifo.pushedTotal();
+    const bool drained = consumedTotal == pushed && replayLeft.load() == 0 && tracker.readPos() >= lastDataPos;
+    drainedPush.store(drained ? pushed : kNotDrained);
+}
+
 void SoapyRPITX_IQ_dmaSync::RecoverDma() {
     dmaErrors.fetch_add(1);
     SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA engine stopped (CS 0x%08x, DEBUG 0x%08x); restarting it", GetStatus(), GetDebugStatus());
-    FeederRetune(tuneCfg);
+    const SoapyRPITX_TuneConfig current = tuneCfg;
+    FeederRetune(current, true);
 }
 
 void SoapyRPITX_IQ_dmaSync::FeederLoop() {
@@ -1138,7 +1183,7 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
         }
         if (seq != 0) {
             tuneCv.notify_all();
-            bool ok = FeederRetune(request);
+            bool ok = FeederRetune(request, false);
             {
                 std::lock_guard<std::mutex> lock(tuneMutex);
                 tuneResult = ok;
@@ -1201,7 +1246,6 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
                     tracker.resync(guard);
                     SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: DMA overran the feeder");
                 }
-                playedPos.store(tracker.readPos());
 
                 ScrubCompleted();
                 if (PumpData(target) > 0)
@@ -1218,6 +1262,8 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
                 }
             }
         }
+
+        PublishDrainState();
 
         next += kFeederPeriod;
         if (next < now)

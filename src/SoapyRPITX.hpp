@@ -142,15 +142,16 @@ public:
     int readStatus(size_t &chanMask, int &flags, long long &timeNs, long timeoutUs);
 
     /**
-     * @brief Starts the transmitter.
+     * @brief Starts the transmitter; has no effect when it is already active.
      * @return 0.
      */
     int activate();
 
     /**
      * @brief Returns how long deactivation should wait for the last burst.
-     * @return FIFO + ring duration plus 200 ms in microseconds when the last write carried SOAPY_SDR_END_BURST,
-     *         otherwise 0.
+     * @return Duration of the FIFO at the sample rate plus two rings (queued slots and the slots replayed after a
+     *         retune) at the slot rate, plus 200 ms, in microseconds, when the last write carried
+     *         SOAPY_SDR_END_BURST; otherwise 0.
      */
     long drainTimeoutUs();
 
@@ -188,7 +189,8 @@ private:
  * iq_scale, debug_level, and the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
  * sigma_delta_order, envelope_delay, envelope_floor, rfdac_lut, eer_lut, eer_ampm_lut, eer_gain, eer_offset,
  * eer_idle, eer_drive). Other device arguments are reported with a warning, except the identification keys
- * produced by enumeration (driver, label, product, serial, manufacturer, tuner) and keys containing ':'.
+ * produced by enumeration or by SoapySDR (driver, label, product, serial, manufacturer, tuner, type) and keys
+ * containing ':'.
  * Stream arguments: see getStreamArgsInfo().
  */
 class SoapyRPITX : public SoapySDR::Device {
@@ -268,8 +270,9 @@ public:
     /**
      * @brief Describes the stream arguments.
      *
-     * - ring_size: DMA ring size in slots (default: 85 ms at the slot rate, at least 4096; at least 10 ms of
-     *   slots).
+     * - ring_size: DMA ring size in slots (default: 85 ms at the slot rate, sample rate x slots_per_sample,
+     *   rounded up to a multiple of 512 and at least 4096; at least 10 ms of slots). The advertised default is
+     *   the one of slots_per_sample = 1.
      * - fifo_ms: software FIFO capacity in milliseconds (follows sample-rate changes).
      * - preroll_ms: signal queued before the DMA starts, in milliseconds.
      * - dma_channel: DMA channel (-1 for the first free channel of the board).
@@ -321,7 +324,7 @@ public:
     size_t getStreamMTU(SoapySDR::Stream *stream) const;
 
     /**
-     * @brief Starts transmission.
+     * @brief Starts transmission; activating an active stream has no effect.
      * @param stream   Stream handle.
      * @param flags    SOAPY_SDR_HAS_TIME is not supported.
      * @param timeNs   Ignored.

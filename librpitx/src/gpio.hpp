@@ -691,11 +691,24 @@ public:
     void Setppm(double ppm);
 
     /**
+     * @brief Returns the crystal correction applied to the PCM clock.
+     * @return Correction in ppm.
+     */
+    double Getppm() const;
+
+    /**
      * @brief Sets the frame (sample) rate and starts the PCM block as a one-channel, 8-bit pacing source.
      * @param Frequency Frame rate in Hz.
-     * @return Always 0.
+     * @return 0, or -1 when no frame length keeps the clock divider in range for this rate (nothing is changed).
      */
     int SetFrequency(uint64_t Frequency);
+
+    /**
+     * @brief Tells whether SetFrequency() can produce a frame rate with the current source and correction.
+     * @param Frequency Frame rate in Hz.
+     * @return True when a frame length of 10 to 999 bit clocks keeps the clock divider within 2..4095.
+     */
+    bool FrequencyFits(uint64_t Frequency) const;
 
     /**
      * @brief Sets the frame rate and starts the PCM block as a 16-bit stereo I2S master transmitter.
@@ -731,9 +744,9 @@ public:
     /**
      * @brief Chooses the smallest frame length that keeps the clock divider in range.
      * @param Frequency Frame rate in Hz.
-     * @return Frame length in bit clocks.
+     * @return Frame length in bit clocks (10 to 999), or -1 when no frame length fits.
      */
-    int ComputePrediv(uint64_t Frequency);
+    int ComputePrediv(uint64_t Frequency) const;
 };
 
 /**
@@ -819,6 +832,12 @@ public:
      * @param ppm Correction in ppm (see clkgpio::Setppm()).
      */
     void Setppm(double ppm);
+
+    /**
+     * @brief Returns the crystal correction applied to the PWM clock.
+     * @return Correction in ppm.
+     */
+    double Getppm() const;
 
     /**
      * @brief Programs the period rate and the range and starts the channel with DMA requests.

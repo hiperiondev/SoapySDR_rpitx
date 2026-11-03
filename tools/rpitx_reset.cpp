@@ -23,7 +23,8 @@
 //   clock tree restored, VideoCore memory released.
 // - Without a record, a clock output left on GPIO4 is switched off and GPCLK0 is stopped.
 // - --dma-channel N additionally resets DMA channel N (e.g. after a crash of another librpitx program); only legacy
-//   channels not reserved for the kernel are accepted (0-10 on BCM2711, 0-14 otherwise).
+//   channels not reserved for the kernel are accepted (0-10 on BCM2711, 0-14 otherwise). When the kernel DMA
+//   channel mask cannot be read from the device tree the reset is refused, unless --force is given.
 //
 // Run as root. Suitable for ExecStopPost= in systemd units.
 
@@ -44,13 +45,15 @@ namespace {
 constexpr unsigned kRfGpio = 4;
 
 void usage(const char *argv0) {
-    std::fprintf(stderr, "usage: %s [--dma-channel N]\n", argv0);
+    std::fprintf(stderr, "usage: %s [--dma-channel N [--force]]\n", argv0);
+    std::fprintf(stderr, "  --force  reset the DMA channel even when the kernel DMA channel mask cannot be read\n");
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
     int extraChannel = -1;
+    bool force = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--dma-channel") == 0 && i + 1 < argc) {
             char *end = nullptr;
@@ -60,6 +63,8 @@ int main(int argc, char **argv) {
                 return 2;
             }
             extraChannel = (int) v;
+        } else if (std::strcmp(argv[i], "--force") == 0) {
+            force = true;
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -96,6 +101,13 @@ int main(int argc, char **argv) {
             }
             bool known = false;
             uint32_t mask = bcm_host_get_kernel_dma_mask(&known);
+            if (!known && !force) {
+                std::fprintf(stderr,
+                             "the kernel DMA channel mask cannot be read from the device tree; DMA channel %d not reset "
+                             "(use --force only for a channel known to be free)\n",
+                             extraChannel);
+                return 1;
+            }
             if (known && ((mask >> extraChannel) & 1u)) {
                 std::fprintf(stderr, "DMA channel %d is reserved for the Linux kernel; not reset\n", extraChannel);
                 return 1;

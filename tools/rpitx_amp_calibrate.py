@@ -118,6 +118,42 @@ def format_list(values, digits=4):
     return ",".join(("%." + str(digits) + "g") % v for v in values)
 
 
+def parse_kwargs(text, option):
+    """Parses 'key=value,key=value' into a dict; exits with a message naming @option for a malformed item."""
+    out = {}
+    for item in filter(None, (s.strip() for s in text.split(","))):
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit("%s: invalid item '%s' (expected key=value)" % (option, item))
+        out[key.strip()] = value.strip()
+    return out
+
+
+def increasing_table(name, values, first_min=None):
+    """Returns @values made strictly increasing as the driver requires, warning about every value that had to be
+    raised (measurement noise). With @first_min the first value is at least that much."""
+    v = np.array(values, dtype=np.float64)
+    fixed = []
+    if first_min is not None and not v[0] >= first_min:
+        v[0] = first_min
+        fixed.append(0)
+    eps = 1e-4 * max(float(np.max(np.abs(v))), 1e-6)
+    for i in range(1, len(v)):
+        if not v[i] > v[i - 1]:
+            v[i] = v[i - 1] + eps
+            fixed.append(i)
+    if fixed:
+        print("warning: %s was not strictly increasing at index %s (measurement noise); the values were raised "
+              "minimally, repeat the measurement with a longer --dwell or a stronger signal" % (name, ",".join(map(str, fixed))),
+              file=sys.stderr)
+    return v
+
+
+def phase_table(values):
+    """Wraps phases in degrees into [-180, 180], as the driver requires."""
+    return (np.asarray(values, dtype=np.float64) + 180.0) % 360.0 - 180.0
+
+
 def self_test():
     """Runs the analysis on synthetic captures and checks the recovered values."""
     fs, offset, dwell = 240000.0, 20000.0, 0.2
@@ -214,7 +250,7 @@ class Transmitter:
         self.dev.setGain(SOAPY_SDR_TX, 0, 7)
         # A short FIFO keeps the settings changed during the delay sweep close to the samples on air.
         sargs = dict(fifo_ms="40", preroll_ms="20")
-        sargs.update(dict(kv.split("=", 1) for kv in a.stream_args.split(",") if kv))
+        sargs.update(parse_kwargs(a.stream_args, "--stream-args"))
         sargs.update(stream_args)
         self.stream = self.dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], sargs)
         self.dev.activateStream(self.stream)
@@ -237,7 +273,7 @@ class Transmitter:
 def measure(a, SoapySDR, dev_args, stream_args, states, apply_state):
     """Transmits reference / state pairs (apply_state(tx, s) returns the IQ magnitude for state s) and returns
     the relative amplitude and phase of every state."""
-    rx = Receiver(SoapySDR, dict(kv.split("=", 1) for kv in a.rx_args.split(",") if kv), a.freq - a.offset, a.rx_rate, a.rx_gain)
+    rx = Receiver(SoapySDR, parse_kwargs(a.rx_args, "--rx-args"), a.freq - a.offset, a.rx_rate, a.rx_gain)
     tx = Transmitter(SoapySDR, a, dev_args, stream_args)
     n = int(round(a.dwell * a.rate))
     sequence = []
@@ -267,8 +303,8 @@ def run_pad(a, SoapySDR):
 
     dev_args = dict(amplitude_mode="envelope", amplitude_lut="", ampm_lut="", envelope_delay="0", amplitude_quantizer="nearest")
     amp, ph = measure(a, SoapySDR, dev_args, {}, list(range(8)), apply_state)
-    print("amplitude_lut=%s" % format_list(amp / amp[-1]))
-    print("ampm_lut=%s" % format_list(ph - ph[-1]))
+    print("amplitude_lut=%s" % format_list(increasing_table("amplitude_lut", amp / amp[-1], first_min=1e-4)))
+    print("ampm_lut=%s" % format_list(phase_table(ph - ph[-1])))
 
 
 def run_rfdac(a, SoapySDR):
@@ -280,7 +316,8 @@ def run_rfdac(a, SoapySDR):
 
     dev_args = dict(amplitude_mode="envelope", rfdac_lut="0.7,0.2,1", envelope_delay="0", amplitude_quantizer="nearest")
     amp, _ = measure(a, SoapySDR, dev_args, dict(rf_dac="true"), ["gpio4", "gpio20", "both"], apply_state)
-    print("rfdac_lut=%s" % format_list(amp / amp[-1]))
+    amp = np.maximum(amp / amp[-1], 1e-4)  # the driver requires positive values
+    print("rfdac_lut=%s" % format_list(amp))
 
 
 def run_eer(a, SoapySDR):
@@ -291,13 +328,16 @@ def run_eer(a, SoapySDR):
 
     dev_args = dict(amplitude_mode="envelope", envelope_delay="0")
     amp, ph = measure(a, SoapySDR, dev_args, dict(envelope_output=a.envelope_output), list(range(a.points)), apply_state)
-    print("eer_lut=%s" % format_list(amp / amp[-1]))
-    print("eer_ampm_lut=%s" % format_list(ph - ph[-1]))
+    print("eer_lut=%s" % format_list(increasing_table("eer_lut", amp / amp[-1], first_min=0.0)))
+    # The phase at code 0 is that of a carrier with (nearly) no amplitude, i.e. noise: the next code's is used.
+    ph = np.array(ph, dtype=np.float64)
+    ph[0] = ph[1]
+    print("eer_ampm_lut=%s" % format_list(phase_table(ph - ph[-1])))
 
 
 def run_delay(a, SoapySDR):
     f1, f2 = 700.0, 1900.0
-    rx = Receiver(SoapySDR, dict(kv.split("=", 1) for kv in a.rx_args.split(",") if kv), a.freq - a.offset, a.rx_rate, a.rx_gain)
+    rx = Receiver(SoapySDR, parse_kwargs(a.rx_args, "--rx-args"), a.freq - a.offset, a.rx_rate, a.rx_gain)
     stream_args = dict(envelope_output=a.envelope_output) if a.envelope_output != "none" else {}
     tx = Transmitter(SoapySDR, a, dict(amplitude_mode="envelope"), stream_args)
     n = int(round(a.dwell * a.rate))

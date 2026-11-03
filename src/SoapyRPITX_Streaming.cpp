@@ -146,8 +146,9 @@ SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const s
     }
 
     streamArgs.push_back(intArg("ring_size", SoapyRPITX_DefaultRingSize(rate), "DMA ring size",
-                                "Number of slots in the circular DMA buffer (default: 85 ms at the slot rate, at least 4096; at least 10 ms).", "slots",
-                                RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE));
+                                "Number of slots in the circular DMA buffer (default: 85 ms at the slot rate = sample rate x slots_per_sample, rounded up to "
+                                "512 slots, at least 4096; the value shown is for slots_per_sample=1; at least 10 ms).",
+                                "slots", RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE));
     streamArgs.push_back(intArg("fifo_ms", kDefaultFifoMs, "FIFO length",
                                 "Capacity of the software FIFO between writeStream() and the DMA ring (follows the sample rate).", "ms", 20, 5000));
     streamArgs.push_back(
@@ -345,6 +346,9 @@ size_t tx_streamer::mtu() const {
 }
 
 int tx_streamer::activate() {
+    // Activating an active stream changes nothing (the event counters keep running).
+    if (iqsender->IsActive())
+        return 0;
     endBurstPending.store(false);
     reportedEvents.store(0);
     iqsender->Start();
@@ -354,9 +358,12 @@ int tx_streamer::activate() {
 long tx_streamer::drainTimeoutUs() {
     if (!iqsender->IsActive() || !endBurstPending.load())
         return 0;
-    // Let the last burst reach the antenna: FIFO + ring duration plus a margin.
+    // Let the last burst reach the antenna: the FIFO (IQ samples), the ring and, after a retune, one more ring
+    // of replayed slots (slots run at the slot rate), plus a margin.
     SoapyRPITX_TuneConfig t = iqsender->GetTune();
-    double seconds = (double) (iqsender->FifoCapacity() + iqsender->RingSize()) / (double) t.sampleRate + 0.2;
+    const double sampleRate = (double) t.sampleRate;
+    const double slotRate = sampleRate * (double) iqsender->SlotsPerSample();
+    double seconds = (double) iqsender->FifoCapacity() / sampleRate + 2.0 * (double) iqsender->RingSize() / slotRate + 0.2;
     return (long) (seconds * 1e6);
 }
 

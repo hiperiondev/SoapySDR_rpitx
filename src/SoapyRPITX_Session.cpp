@@ -477,8 +477,15 @@ void SoapyRPITX_Session::Write(const SoapyRPITX_SessionRecord &r) {
     SoapyRPITX_SessionRecord copy = r;
     copy.pid = (long) getpid();
     std::string text = SoapyRPITX_FormatRecord(copy);
-    if (ftruncate(fd, 0) != 0 || pwrite(fd, text.data(), text.size(), 0) != (ssize_t) text.size())
+    // The new record overwrites the old one before the file is cut to its length, so the file never holds an
+    // empty record while the transmitter owns hardware.
+    ssize_t n = pwrite(fd, text.data(), text.size(), 0);
+    if (n < 0)
         std::fprintf(stderr, "rpitx: cannot write %s: %s\n", LockPath().c_str(), strerror(errno));
+    else if ((size_t) n != text.size())
+        std::fprintf(stderr, "rpitx: cannot write %s: short write (%zd of %zu bytes)\n", LockPath().c_str(), n, text.size());
+    else if (ftruncate(fd, (off_t) text.size()) != 0)
+        std::fprintf(stderr, "rpitx: cannot truncate %s: %s\n", LockPath().c_str(), strerror(errno));
     fdatasync(fd);
 }
 

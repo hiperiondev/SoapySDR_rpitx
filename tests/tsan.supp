@@ -4,10 +4,8 @@
 # DMA memory from its own thread while the code under test accesses them through volatile pointers, as it
 # does with real hardware. Those accesses are not data races of the driver.
 race:MockDmaEngine::Run
-# The retune test polls the simulated PLL and GPIO registers from a monitor thread.
-race:testRetuneCarrierOffAndReplay
-# These tests write simulated registers directly to emulate the hardware (DMA halted, channel busy, a
-# transmitter left running by a terminated process).
-race:testDmaRestartAndPads
-race:testDmaChannelSelection
-race:testSessionLockAndRecovery
+# The tests read and write simulated registers that the feeder thread also uses (a monitor polling the PLL
+# and GPIO registers, a DMA channel halted by hand) only through these helpers.
+race:MockPeek
+race:MockPoke
+race:MockPokeBits

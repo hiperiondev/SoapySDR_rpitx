@@ -342,8 +342,10 @@ sdr.closeStream(st)
   `SOAPY_SDR_HAS_TIME` is not supported (`SOAPY_SDR_NOT_SUPPORTED`). The MTU is `min(4096, max(FIFO/4, 256))`.
 - `SOAPY_SDR_END_BURST` on the last write (or on a zero-length write) marks the end of the burst: the DMA starts
   immediately even below the pre-roll, and after the last sample the carrier stays off.
-- `deactivateStream()` turns the carrier off. If the last write carried `END_BURST`, it first waits (for the FIFO
-  plus ring duration plus 200 ms at most) until every queued sample has been played; the device mutex is not held
+- `activateStream()` on an active stream has no effect (the counters keep running, no event is reported).
+- `deactivateStream()` turns the carrier off. If the last write carried `END_BURST`, it first waits (at most the
+  FIFO duration at the sample rate, plus two rings at the slot rate, plus 200 ms) until every queued sample has been
+  played; the device mutex is not held
   meanwhile, so the control API stays usable. Without `END_BURST`, queued samples are discarded.
 - `closeStream()` (and destroying the device) turns the carrier off at once and discards queued samples, also while
   another thread waits in `deactivateStream()`; the hardware is free for a new stream right after.
@@ -351,7 +353,8 @@ sdr.closeStream(st)
   burst, DMA overrun or DMA restart, otherwise `SOAPY_SDR_TIMEOUT`.
 - Frequency, sample rate, ppm and harmonic can change while streaming: the feeder stops the DMA, switches the
   carrier off, reprograms the PLL and the pacing clock and restarts with the samples that were already in the DMA
-  ring (none lost, at most one sent twice), followed by the FIFO.
+  ring (none lost, at most one sent twice), followed by the FIFO. Idle slots before the first queued sample are not
+  replayed; an idle gap inside a burst (FIFO starvation) is replayed as idle.
 
 ### Stream arguments
 
@@ -397,7 +400,9 @@ An application that writes faster than real time keeps the FIFO full: latency �
 | `eer_idle` | 0 | Envelope code while nothing is transmitted (fraction of full scale) |
 | `eer_drive` | 7 | Pad drive of the clock pins while the envelope DAC is used |
 
-Example: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Unknown device arguments are reported with a warning.
+Example: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Unknown device arguments are reported with a warning,
+except the identification keys (`driver`, `label`, `product`, `serial`, `manufacturer`, `tuner`, `type`) and keys
+containing `:`.
 Integers are decimal (a leading zero does not mean octal) and numbers must not carry trailing characters.
 
 ### Sensors
@@ -430,6 +435,9 @@ sudo rpitx_tone_test.py --freq 144.8M --jitter-ms 20 --args "preroll_ms=200,fifo
 sudo rpitx_tone_test.py --freq 144e6 --seconds 0              # open/close only: recovers a crashed session
 ```
 
+The `key=value` lists of the tools (`--args`, `--stream-args`, `--rx-args`) are checked before any radio is
+opened: an item without `=` stops the tool with a message naming it.
+
 ### `rpitx_amp_calibrate.py`
 
 Measures the amplitude path with a SoapySDR receiver (an RTL-SDR next to a dummy load is enough) and prints the
@@ -444,12 +452,17 @@ sudo rpitx_amp_calibrate.py delay --freq 7.1M --envelope-output pcm           # 
 rpitx_amp_calibrate.py self-test                                              # analysis check, no radio
 ```
 
+The printed tables are already in the form the driver accepts: amplitude tables strictly increasing (a value
+that measurement noise left out of order is raised minimally, with a warning), phases within ±180°, and the
+phase of the EER code 0 (no carrier) taken from code 1.
+
 ### `rpitx_reset`
 
 Returns the hardware to idle after a process using the driver died: recovers the session record (see
 [Crash recovery](#crash-recovery)); without a record it switches a clock output left on GPIO4 off and stops GPCLK0.
-`--dma-channel N` also resets DMA channel N (refused when the kernel owns it). Suitable for `ExecStopPost=` in a
-systemd unit.
+`--dma-channel N` also resets DMA channel N (refused when the kernel owns it, and refused when the kernel DMA channel
+mask cannot be read from the device tree unless `--force` is given for a channel known to be free). Suitable for
+`ExecStopPost=` in a systemd unit.
 
 ### `hpsdr_rpitx_bridge.py` — HPSDR Protocol 1 bridge
 
@@ -702,15 +715,21 @@ slot 0 when `preroll_ms` of signal is queued, when the burst end is signalled, w
 first queued sample has waited `preroll_ms` (so short bursts still go out).
 
 **Retune:** the control thread posts the request with a sequence number and waits up to 3 s for the feeder to
-take it (then until it completes). The feeder records the exact engine position, stops the DMA, **switches GPIO4
-to input and restores the pads** before touching the PLL, copies the unplayed slots of the ring (the original I/Q
-samples are kept in a shadow array) into a replay buffer, reprograms PLLC and the PCM clock, resets the ring and
-resumes: the replay buffer is sent before the FIFO. A request that the PLL cannot satisfy leaves the previous
-configuration in effect.
+take it (then until it completes). The feeder pauses the engine and records its exact position (an engine that
+stopped by itself is not credited with laps), stops the DMA, **switches GPIO4 to input and restores the pads**
+before touching the PLL, copies the unplayed data slots of the ring (the original I/Q samples are kept in a shadow
+array, and every slot is marked as data or idle) into a replay buffer, reprograms PLLC and the PCM clock, resets
+the ring and resumes: the replay buffer is sent before the FIFO. Idle slots before the first data slot are dropped;
+idle slots between data slots are replayed as idle. After a DMA error without a valid engine position, up to
+5 feeder periods of samples may be sent twice. A request that the PLL, the pacing clock or the envelope DAC cannot
+satisfy is refused before anything is reprogrammed and leaves the previous configuration (including the crystal
+corrections) in effect.
 
-**Drain detection:** `WaitDrained()` compares the FIFO's pushed counter with a consumed counter that the feeder
-publishes only *after* the samples are in the ring and the end-of-data position is updated, so a burst is never
-reported as sent while its last samples are in flight between the FIFO and the ring.
+**Drain detection:** the feeder evaluates the drain condition in one place at the end of every period (every
+sample pushed so far consumed from the FIFO, replay buffer empty, last data slot completed) and publishes the FIFO
+push count it applies to; `WaitDrained()` compares it with the current push count. A retune clears it before the
+ring is rebuilt, so a burst is never reported as sent while samples are in flight between the FIFO, the replay
+buffer and the ring.
 
 ### The FIFO
 
@@ -725,7 +744,9 @@ blocked producer waits on a condition variable in 2 ms slices, woken by the feed
   GPIO4 (and GPIO20) returned to their original function (input if it was the clock output), the pads restored, the
   envelope DAC pins returned to their original function, the PCM block disabled and its clock restored, the PWM
   block restored, the clock tree restored (PLLC first, waiting for lock, then its channels, the
-  VPU and EMMC clocks and GPCLK0), the VideoCore memory freed and the lock file cleared.
+  VPU and EMMC clocks and GPCLK0), the VideoCore memory freed and the lock file cleared. The record stops naming
+  the DMA channel and the VideoCore memory before they are released, so a crash in between can leak the block
+  (recovered by a reboot) but never makes the next process free memory that another VideoCore client may own.
 - **`exit()`:** an `atexit` handler performs an emergency stop (DMA reset, carrier off, GPCLK0 stopped) without
   invalidating the objects, so a later destructor still completes the shutdown.
 - **Signals** (`signal_cleanup=true`): handlers for SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL
@@ -737,7 +758,8 @@ blocked producer waits on a condition variable in 2 ms slices, woken by the feed
 
 While a transmitter exists, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, never survives a reboot; private
 directory) is held with an exclusive `flock()` and contains a `key=value` record of everything the process owns:
-PID, DMA channel and VideoCore memory handle (written as soon as the memory is allocated), original pad value and
+PID, DMA channel and VideoCore memory handle (written as soon as the memory is allocated, cleared before it is
+released), original pad value and
 functions of GPIO4 and of the other pins used, original PCM clock or PWM state, and the clock tree (saved and
 recorded before it is first changed). The
 kernel releases the lock when the process dies, even with `kill -9`. The next process that acquires the lock and
@@ -808,10 +830,10 @@ PCM / PWM pacing FIFO with its DREQ level, recording per frame the registers in 
 
 | Test | Covers |
 |------|--------|
-| `rpitx_unit_tests` | FIFO ordering under concurrency and capacity limit; ring accounting against a simulated engine (steady state, short stalls, lost laps, double stall, host starvation); DSP frequency estimation, gating and phase continuity through zero; amplitude model, tables, sigma-delta averages, envelope delay and envelope/phase alignment, EER code mapping |
+| `rpitx_unit_tests` | FIFO ordering under concurrency and capacity limit; ring accounting against a simulated engine (steady state, short stalls, lost laps, double stall, host starvation, stopped engine without lap credit); DSP frequency estimation, gating and phase continuity through zero; amplitude model, tables, sigma-delta averages, envelope delay and envelope/phase alignment, EER code mapping |
 | `rpitx_devicetree_tests` | Peripheral base, legacy DMA channel limit and kernel DMA mask with old and current device-tree naming |
-| `rpitx_transmitter_tests` | Feeder, pre-roll, drain, retune with the carrier off and ring replay, emergency stop then destruction, DMA restart, pad hysteresis, FIFO capacity vs rate, constructor failures (unreachable frequency, refused allocation, short ring), DMA channel selection (and no guess without the kernel mask), session lock and crash recovery (pins, PWM), private lock directory, symbolic link and implausible records, early allocation record, signal handlers, paced DMA start, envelope delay, sigma-delta, AM/PM correction, RF-DAC, slots per sample, PCM and PWM envelope output with envelope/phase alignment, burst end before a short burst |
-| `rpitx_driver_tests` | SoapySDR device: settings and ranges, strict number parsing, amplitude settings, frequency correction, stream arguments (including the envelope output), CF32/CS16/CS8 scaling, `END_BURST` drain, `closeStream()` during a drain, stream status, sensors |
+| `rpitx_transmitter_tests` | Feeder, pre-roll, drain, retune with the carrier off and ring replay, emergency stop then destruction, DMA restart, pad hysteresis, FIFO capacity vs rate, constructor failures (unreachable frequency, refused allocation, short ring), DMA channel selection (and no guess without the kernel mask), session lock and crash recovery (pins, PWM), private lock directory, symbolic link and implausible records, early allocation record, signal handlers, paced DMA start, envelope delay, sigma-delta, AM/PM correction, RF-DAC, slots per sample, PCM and PWM envelope output with envelope/phase alignment, burst end before a short burst, replay of data slots only (retune before the DMA start and after an idle gap), drain during a concurrent retune, release recorded before the VideoCore memory is freed |
+| `rpitx_driver_tests` | SoapySDR device: settings and ranges, strict number parsing, amplitude settings, frequency correction, stream arguments (including the envelope output), CF32/CS16/CS8 scaling, `END_BURST` drain, `closeStream()` during a drain, `activateStream()` on an active stream, stream status, sensors |
 
 CI (`.github/workflows/ci.yml`) runs the tests in a plain build, with AddressSanitizer + UndefinedBehaviorSanitizer
 and with ThreadSanitizer (`tests/tsan.supp` suppresses only the simulated-register accesses), and checks
