@@ -97,7 +97,7 @@ protected:
     int channel = 0;             ///< DMA channel in use.
     dmagpio dma_reg;             ///< Mapping of the DMA controller registers.
 
-    std::function<void(int, unsigned)> allocationCallback; ///< Allocation and release callback (may be empty).
+    std::function<void(int, unsigned, unsigned, unsigned)> allocationCallback; ///< Allocation and release callback (may be empty).
 
     uint32_t mem_flag = 0;       ///< Allocation flags chosen from the SDRAM bus alias.
     uint32_t dram_phys_base = 0; ///< SDRAM bus alias reported by the device tree.
@@ -118,9 +118,10 @@ public:
      * @param CBSize      Number of control blocks to allocate.
      * @param UserMemSize Number of 32-bit user-memory words to allocate after the control blocks.
      * @param Force       Reset an explicitly selected channel even when it is active.
-     * @param Allocated   Called with the channel and the VideoCore memory handle as soon as the memory is
-     *                    allocated and locked, before anything else can fail (used to record the allocation
-     *                    for crash recovery), and again with (-1, 0) by the destructor once the channel is
+     * @param Allocated   Called with the channel, the VideoCore memory handle, the bus address and the size in
+     *                    bytes of the block as soon as the memory is allocated and locked, before anything else
+     *                    can fail (used to record the allocation for crash recovery), and again with
+     *                    (-1, 0, 0, 0) by the destructor once the channel is
      *                    stopped and before the memory is released. May be empty.
      *
      * @throws std::runtime_error when the channel is not usable (DMA4 channel on BCM2711, reserved for the
@@ -129,10 +130,10 @@ public:
      *         cannot be opened, the VideoCore memory cannot be allocated or locked, or /dev/mem cannot be
      *         mapped (typically because the process is not root).
      */
-    dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force = false, const std::function<void(int, unsigned)> &Allocated = {});
+    dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force = false, const std::function<void(int, unsigned, unsigned, unsigned)> &Allocated = {});
 
     /**
-     * @brief Stops the channel, reports the release through the allocation callback (channel -1, handle 0),
+     * @brief Stops the channel, reports the release through the allocation callback (channel -1, handle 0, bus 0, size 0),
      *        unmaps and releases the VideoCore memory and closes the mailbox.
      */
     ~dma();
@@ -265,7 +266,7 @@ public:
      * @throws std::runtime_error on channel or allocation failure (see dma::dma()).
      */
     bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force = false,
-              const std::function<void(int, unsigned)> &Allocated = {});
+              const std::function<void(int, unsigned, unsigned, unsigned)> &Allocated = {});
 
     /** @brief Builds the control-block chain; the base implementation does nothing. */
     void SetDmaAlgo();

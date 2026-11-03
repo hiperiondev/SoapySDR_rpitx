@@ -355,7 +355,9 @@ sdr.closeStream(st)
   mutex del dispositivo, quindi l'API di controllo resta utilizzabile. Senza `END_BURST` i campioni in coda vengono
   scartati.
 - `closeStream()` (e la distruzione del dispositivo) spegne subito la portante e scarta i campioni in coda, anche mentre
-  un altro thread attende in `deactivateStream()`; l'hardware è subito libero per un nuovo stream.
+  un altro thread attende in `deactivateStream()`; l'hardware è subito libero per un nuovo stream. Un `writeStream()` o
+  `readStreamStatus()` in un altro thread viene svegliato e ritorna prima che lo stream sia distrutto (le chiamate in
+  corso sono contate e `closeStream()` le attende), quindi chiudere durante uno spegnimento è sicuro.
 - `readStreamStatus()` restituisce `SOAPY_SDR_UNDERFLOW` (maschera di canale 1) una volta per ogni nuovo svuotamento
   della FIFO durante un burst, overrun del DMA o riavvio del DMA; altrimenti `SOAPY_SDR_TIMEOUT`.
 - Frequenza, frequenza di campionamento, ppm e armonica possono cambiare durante la trasmissione: l'alimentatore ferma
@@ -747,10 +749,12 @@ La portante è GPCLK0 pilotato da **PLLC**. Alla creazione di uno stream il driv
 librpitx:
 
 1. Vengono salvati i registri dell'albero dei clock che stanno per cambiare (`CORECLK_CNTL/DIV`, `EMMCCLK_CNTL/DIV`,
-   `CM_GP0CTL/DIV`, `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`) e annotati nel file
-   di sessione.
+   `CM_GP0CTL/DIV`, `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`; su BCM2711 anche
+   `EMMC2CLK_CNTL/DIV`) e annotati nel file di sessione.
 2. Il clock del core VPU viene spostato su PLLA (divisore 4) e il clock EMMC su PLLD, perché nient'altro dipenda da
-   PLLC.
+   PLLC. Su BCM2711 anche il generatore EMMC2 (scheda SD) passa a PLLD_PER se era su PLLC_PER, con il divisore
+   ricalcolato per mantenerne la frequenza. I generatori ancora alimentati da PLLC (ad esempio tramite
+   `PLLC_CORE1/2`) vengono elencati in un avviso.
 3. `PLLC_CORE0` viene disattivato, il canale periferiche di PLLC viene abilitato con divisore 1 (2 su BCM2711) e GPCLK0
    vi prende la sorgente, con MASH 0 (divisore intero, senza spurie da noise shaping).
 
@@ -920,14 +924,17 @@ viene risvegliato dall'alimentatore quando libera spazio.
 
 Finché esiste un trasmettitore, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, non sopravvive mai a un riavvio;
 directory privata) è tenuto con un `flock()` esclusivo e contiene un registro `chiave=valore` di tutto ciò che il
-processo possiede: PID, canale DMA e handle della memoria VideoCore (scritti appena la memoria è allocata e cancellati prima che sia
-rilasciata, insieme all'informazione se la maschera dei canali DMA del kernel era leggibile), valore
+processo possiede: PID, canale DMA, handle della memoria VideoCore, indirizzo di bus e dimensione (scritti appena la memoria è allocata
+e cancellati prima che sia rilasciata, insieme all'informazione se la maschera dei canali DMA del kernel era leggibile), valore
 originale dei pad e funzioni di GPIO4 e degli altri pin usati, clock PCM originale o stato del PWM, e l'albero dei clock
 (salvato e registrato prima della sua prima modifica). Il registro termina con una riga `end=1`: ciò che segue
 (lasciato da un aggiornamento interrotto tra la scrittura di un registro più corto e il taglio del file) viene
 ignorato. Il kernel rilascia il lock quando il processo muore, anche con `kill -9`. Il processo successivo che ottiene
 il lock e trova un registro non vuoto sa che il proprietario è morto senza ripulire ed esegue il ripristino: reset del
-canale DMA, GPIO4 e pad ripristinati, GPCLK0 fermo, PCM disattivato e il suo clock ripristinato, albero dei clock
+canale DMA (solo se il canale è inattivo o il suo blocco di controllo corrente cade nel blocco registrato; se nel
+frattempo un altro programma ha preso il canale, non viene toccato e il rapporto dice «now used by another program;
+not reset»; un registro senza la posizione del blocco, di una versione precedente, usa l'indirizzo di bus fornito dal
+mailbox), GPIO4 e pad ripristinati, GPCLK0 fermo, PCM disattivato e il suo clock ripristinato, albero dei clock
 ripristinato, PWM ripristinato e memoria GPU del processo morto liberata (gli handle VideoCore sono globali per il
 firmware). Prima il registro viene verificato: un canale DMA che non sia un canale classico del SoC o che appartenga
 al kernel, pin fuori da GPIO 0–27 o valori di clock non validi lo fanno **scartare** (segnalato, non si applica nulla).

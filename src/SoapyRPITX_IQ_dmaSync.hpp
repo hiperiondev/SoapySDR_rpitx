@@ -216,14 +216,17 @@ protected:
      *
      * @param channel   DMA channel, or -1 when none is owned.
      * @param memHandle VideoCore memory handle, or 0 when none is owned.
+     * @param memBus    Bus address of the locked block (0 when none is owned); lets the crash recovery check that the
+     *                  channel still runs this transmitter's control blocks without access to the mailbox.
+     * @param memSize   Size of the block in bytes (0 when none is owned).
      */
-    void RecordDmaAllocation(int channel, unsigned memHandle);
+    void RecordDmaAllocation(int channel, unsigned memHandle, unsigned memBus, unsigned memSize);
 
     /**
      * @brief Returns the allocation and release callback passed to the DMA object.
      * @return Callback that forwards to RecordDmaAllocation() of this claim.
      */
-    std::function<void(int, unsigned)> AllocationRecorder();
+    std::function<void(int, unsigned, unsigned, unsigned)> AllocationRecorder();
 
     /** @brief Writes @ref record to the session lock file. */
     void PublishRecord();

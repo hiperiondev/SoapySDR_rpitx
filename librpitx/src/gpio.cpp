@@ -20,6 +20,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdexcept>
+#include <vector>
 #include <string>
 #include "util.hpp"
 #include "rpi.hpp"
@@ -125,12 +126,17 @@ uint64_t cm_pll_frequency(volatile uint32_t *cm, int pll, uint64_t xosc, bool bc
     return (uint64_t) (f * (1.0 - ppm * 1e-6));
 }
 
-void cm_save_tree(volatile uint32_t *cm, ClockTreeState &s) {
+void cm_save_tree(volatile uint32_t *cm, ClockTreeState &s, bool bcm2711) {
     const uint32_t m = 0x00FFFFFFu;
     s.coreCtl = cm[CORECLK_CNTL] & m;
     s.coreDiv = cm[CORECLK_DIV] & m;
     s.emmcCtl = cm[EMMCCLK_CNTL] & m;
     s.emmcDiv = cm[EMMCCLK_DIV] & m;
+    s.emmc2Valid = bcm2711;
+    if (bcm2711) {
+        s.emmc2Ctl = cm[EMMC2CLK_CNTL] & m;
+        s.emmc2Div = cm[EMMC2CLK_DIV] & m;
+    }
     s.gp0Ctl = cm[GPCLK_CNTL] & m;
     s.gp0Div = cm[GPCLK_DIV] & m;
     s.cmPllc = cm[CM_PLLC] & m;
@@ -181,8 +187,68 @@ void cm_restore_tree(volatile uint32_t *cm, const ClockTreeState &s) {
 
     cm_program_generator(cm, EMMCCLK_CNTL, s.emmcCtl & CM_SRC_MASK, (s.emmcCtl >> CM_MASH_SHIFT) & 3, (s.emmcDiv >> 12) & 0xFFF, s.emmcDiv & 0xFFF,
                          (s.emmcCtl & CM_ENAB) != 0);
+    if (s.emmc2Valid)
+        cm_program_generator(cm, EMMC2CLK_CNTL, s.emmc2Ctl & CM_SRC_MASK, (s.emmc2Ctl >> CM_MASH_SHIFT) & 3, (s.emmc2Div >> 12) & 0xFFF, s.emmc2Div & 0xFFF,
+                             (s.emmc2Ctl & CM_ENAB) != 0);
     cm_program_generator(cm, GPCLK_CNTL, s.gp0Ctl & CM_SRC_MASK, (s.gp0Ctl >> CM_MASH_SHIFT) & 3, (s.gp0Div >> 12) & 0xFFF, s.gp0Div & 0xFFF,
                          (s.gp0Ctl & CM_ENAB) != 0);
+}
+
+bool cm_move_emmc2_off_pllc(volatile uint32_t *cm, uint64_t xosc, bool bcm2711) {
+    if (!bcm2711)
+        return false;
+
+    const uint32_t ctl = cm[EMMC2CLK_CNTL];
+    if ((ctl & CM_SRC_MASK) != 5) // 5 = PLLC peripheral channel
+        return false;
+
+    const unsigned mash = (ctl >> CM_MASH_SHIFT) & 3;
+    uint32_t div = cm[EMMC2CLK_DIV] & 0xFFFFFFu; // 12.12 fixed point
+    const uint64_t fc = cm_pll_frequency(cm, clk_pllc, xosc, true, 0);
+    const uint64_t fd = cm_pll_frequency(cm, clk_plld, xosc, true, 0);
+
+    if (fc != 0 && fd != 0 && div != 0) {
+        // Same output frequency: new divider = old divider x (PLLD_PER / PLLC_PER).
+        double nd = (double) div * (double) fd / (double) fc;
+        if (mash == 0) // integer division only: a fractional divider without MASH adds jitter
+            nd = floor(nd / 4096.0 + 0.5) * 4096.0;
+        nd = floor(nd + 0.5);
+        if (nd < 4096.0)
+            nd = 4096.0;
+        if (nd > (double) 0xFFFFFF)
+            nd = (double) 0xFFFFFF;
+        div = (uint32_t) nd;
+    } else {
+        dbg_printf(0, "Warning: cannot compute the EMMC2 divider for PLLD (PLLC_PER=%llu Hz, PLLD_PER=%llu Hz); keeping the divider\n", (unsigned long long) fc,
+                   (unsigned long long) fd);
+    }
+
+    dbg_printf(1, "EMMC2 moved from PLLC_PER to PLLD_PER, divider %.4f\n", (double) div / 4096.0);
+    cm_program_generator(cm, EMMC2CLK_CNTL, 6, mash, (div >> 12) & 0xFFF, div & 0xFFF, (ctl & CM_ENAB) != 0);
+    return true;
+}
+
+std::vector<std::string> cm_pllc_clients(volatile uint32_t *cm, bool bcm2711) {
+    struct Gen {
+        const char *name;
+        unsigned ctl; // byte offset of the CTL register
+    };
+    // Clock generators of the clock manager (see drivers/clk/bcm/clk-bcm2835.c); GPCLK0 is the one of librpitx.
+    static const Gen gens[] = {{"VPU", 0x008},  {"H264", 0x028}, {"ISP", 0x030},  {"V3D", 0x038},  {"CAM0", 0x040}, {"CAM1", 0x048}, {"CCP2", 0x050},
+                               {"DSI0E", 0x058}, {"DSI0P", 0x060}, {"DPI", 0x068},  {"GPCLK1", 0x078}, {"GPCLK2", 0x080}, {"HSM", 0x088}, {"OTP", 0x090},
+                               {"PCM", 0x098},  {"PWM", 0x0a0},  {"SLIM", 0x0a8}, {"SMI", 0x0b0},  {"TEC", 0x0c0},  {"TD0", 0x0c8},  {"TD1", 0x0d0},
+                               {"TSENS", 0x0e0}, {"TIMER", 0x0e8}, {"UART", 0x0f0}, {"VEC", 0x0f8},  {"PULSE", 0x190}, {"SDC", 0x1a8}, {"ARM", 0x1b0},
+                               {"AVEO", 0x1b8}, {"EMMC", 0x1c0},  {"EMMC2", 0x1d0}};
+
+    std::vector<std::string> out;
+    for (const Gen &g : gens) {
+        if (!bcm2711 && g.ctl == 0x1d0) // EMMC2 exists on BCM2711 only
+            continue;
+        const uint32_t ctl = cm[g.ctl / 4];
+        if ((ctl & CM_ENAB) && (ctl & CM_SRC_MASK) == 5)
+            out.push_back(g.name);
+    }
+    return out;
 }
 
 // ***************** CLK Registers *****************************************
@@ -490,7 +556,7 @@ void clkgpio::print_clock_tree(void) {
 // See also https://github.com/raspberrypi/linux/blob/ffd7bf4085b09447e5db96edd74e524f118ca3fe/drivers/clk/bcm/clk-bcm2835.c#L695
 void clkgpio::SaveClockTree() {
     if (!SavedTree.valid)
-        cm_save_tree(gpioreg, SavedTree);
+        cm_save_tree(gpioreg, SavedTree, pi_is_2711);
 }
 
 void clkgpio::SetAdvancedPllMode(bool Advanced) {
@@ -520,6 +586,10 @@ void clkgpio::SetAdvancedPllMode(bool Advanced) {
         usleep(100);
         gpioreg[EMMCCLK_CNTL] = (0xF00 & clktmp) | (0x5a << 24) | (1 << 4) | (6); // run , src=PLLD
 
+        // BCM2711: EMMC2 drives the SD card; if it is fed by PLLC_PER it would follow the modulation (and the
+        // PLLC_PER divider change below). Move it to PLLD_PER at the same output frequency.
+        cm_move_emmc2_off_pllc(gpioreg, XOSC_FREQUENCY, pi_is_2711);
+
         SetPllNumber(clk_pllc, 0); // Use PLL_C , Do not USE MASH which generates spurious
 
         gpioreg[CM_PLLC] = 0x5A00022A; // Enable PllC_PER
@@ -533,6 +603,15 @@ void clkgpio::SetAdvancedPllMode(bool Advanced) {
         }
 
         usleep(100);
+
+        // Report what is still fed by PLLC (PLLC_CORE1/2 stay enabled and follow every PLLC_FRAC write).
+        std::vector<std::string> clients = cm_pllc_clients(gpioreg, pi_is_2711);
+        if (!clients.empty()) {
+            std::string list;
+            for (const std::string &c : clients)
+                list += (list.empty() ? "" : ", ") + c;
+            dbg_printf(0, "Warning: clock generators still fed by the modulated PLLC: %s\n", list.c_str());
+        }
     }
 }
 

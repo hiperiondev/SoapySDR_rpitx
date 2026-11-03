@@ -352,7 +352,9 @@ sdr.closeStream(st)
   played; the device mutex is not held
   meanwhile, so the control API stays usable. Without `END_BURST`, queued samples are discarded.
 - `closeStream()` (and destroying the device) turns the carrier off at once and discards queued samples, also while
-  another thread waits in `deactivateStream()`; the hardware is free for a new stream right after.
+  another thread waits in `deactivateStream()`; the hardware is free for a new stream right after. A `writeStream()` or
+  `readStreamStatus()` running in another thread is woken up and returns before the stream is destroyed (calls in
+  flight are counted and `closeStream()` waits for them), so closing during a shutdown is safe.
 - `readStreamStatus()` returns `SOAPY_SDR_UNDERFLOW` (channel mask 1) once for every new FIFO starvation inside a
   burst, DMA overrun or DMA restart, otherwise `SOAPY_SDR_TIMEOUT`.
 - Frequency, sample rate, ppm and harmonic can change while streaming: the feeder stops the DMA, switches the
@@ -731,8 +733,12 @@ The carrier is GPCLK0 driven by **PLLC**. When a stream is created, the driver e
 mode":
 
 1. The clock-tree registers about to change are saved (`CORECLK_CNTL/DIV`, `EMMCCLK_CNTL/DIV`, `CM_GP0CTL/DIV`,
-   `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`) and recorded in the session file.
+   `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`; on BCM2711 also `EMMC2CLK_CNTL/DIV`)
+   and recorded in the session file.
 2. The VPU core clock is moved to PLLA (divider 4) and the EMMC clock to PLLD, so that nothing else depends on PLLC.
+   On BCM2711 the EMMC2 generator (SD card) is moved to PLLD_PER as well when it is sourced from PLLC_PER, with the
+   divider recomputed to keep its frequency. Generators still fed by PLLC afterwards (for example through
+   `PLLC_CORE1/2`) are listed in a warning.
 3. `PLLC_CORE0` is disabled, the PLLC peripheral channel is enabled with divider 1 (2 on BCM2711) and GPCLK0 is
    sourced from it, MASH 0 (integer divider, no noise shaping spurs).
 
@@ -898,13 +904,16 @@ blocked producer waits on a condition variable in 2 ms slices, woken by the feed
 
 While a transmitter exists, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, never survives a reboot; private
 directory) is held with an exclusive `flock()` and contains a `key=value` record of everything the process owns:
-PID, DMA channel and VideoCore memory handle (written as soon as the memory is allocated, cleared before it is
-released, together with whether the kernel DMA channel mask was readable), original pad value and
+PID, DMA channel and VideoCore memory handle, bus address and size (written as soon as the memory is allocated,
+cleared before it is released, together with whether the kernel DMA channel mask was readable), original pad value and
 functions of GPIO4 and of the other pins used, original PCM clock or PWM state, and the clock tree (saved and
 recorded before it is first changed). The record ends with an `end=1` line: anything after it (left by an update
 interrupted between writing a shorter record and cutting the file) is ignored. The
 kernel releases the lock when the process dies, even with `kill -9`. The next process that acquires the lock and
-finds a non-empty record knows the owner died without cleaning up and recovers: DMA channel reset, GPIO4 and pads
+finds a non-empty record knows the owner died without cleaning up and recovers: DMA channel reset (only when the
+channel is idle or its current control block lies inside the recorded block; if another program has taken the channel
+meanwhile, it is left alone and the report says "now used by another program; not reset"; a record without the
+block location, from an older driver, uses the bus address given by the mailbox), GPIO4 and pads
 restored, GPCLK0 stopped, PCM disabled and its clock restored, PWM restored, clock tree restored, and the dead
 process's GPU memory released (VideoCore handles are global to the firmware). A record is first checked: a DMA
 channel that is not a legacy channel of the SoC or that belongs to the kernel, pins outside GPIO 0–27 or invalid

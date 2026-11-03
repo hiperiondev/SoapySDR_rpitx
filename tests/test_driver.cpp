@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -333,6 +334,58 @@ void testCloseDuringDrain() {
         dev.closeStream(again);
 }
 
+void testCloseWhileWriting() {
+    // closeStream() while other threads are blocked in writeStream() (full FIFO) and readStreamStatus(): both
+    // return and the stream is destroyed only afterwards (run under ThreadSanitizer / AddressSanitizer).
+    for (int round = 0; round < 5; round++) {
+        SoapyRPITX dev(SoapySDR::Kwargs{});
+        MockDmaEngine engine(14, kRate);
+        SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"fifo_ms", "50"}});
+        CHECK(dev.activateStream(st) == 0);
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> writers{0};
+        std::thread writer([&] {
+            std::vector<std::complex<float>> buf(1024, std::complex<float>(0.5f, 0.0f));
+            const void *buffs[] = {buf.data()};
+            writers++;
+            while (!stop.load()) {
+                int flags = 0;
+                int r = dev.writeStream(st, buffs, buf.size(), flags, 0, 2000000);
+                if (r == SOAPY_SDR_STREAM_ERROR)
+                    break;
+            }
+        });
+        std::thread status([&] {
+            size_t mask = 0;
+            int flags = 0;
+            long long t = 0;
+            writers++;
+            while (!stop.load()) {
+                if (dev.readStreamStatus(st, mask, flags, t, 5000000) == SOAPY_SDR_STREAM_ERROR)
+                    break;
+            }
+        });
+        while (writers.load() < 2)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50 + 20 * round)); // the writer is blocked on the full FIFO
+
+        auto t0 = std::chrono::steady_clock::now();
+        dev.closeStream(st);
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+        stop.store(true);
+        writer.join();
+        status.join();
+
+        // The handle is invalid now.
+        int flags = 0;
+        CHECK(dev.writeStream(st, nullptr, 0, flags, 0, 0) == SOAPY_SDR_STREAM_ERROR);
+        size_t mask = 0;
+        long long t = 0;
+        CHECK(dev.readStreamStatus(st, mask, flags, t, 0) == SOAPY_SDR_STREAM_ERROR);
+    }
+}
+
 } // namespace
 
 void writeFile(const char *name, const std::string &text) {
@@ -491,6 +544,7 @@ int main() {
     testAmplitudeSettings();
     testEnvelopeStreamArguments();
     testCloseDuringDrain();
+    testCloseWhileWriting();
     testProfileParser();
     testProfileDevice();
     testInputLimits();

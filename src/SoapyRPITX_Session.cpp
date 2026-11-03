@@ -40,6 +40,10 @@
 
 namespace {
 
+// Upper bound of the VideoCore block of a transmitter (RPITX_MAX_RING_SIZE slots of at most 5 control blocks and
+// 5 words each is below 6 MB): window used to recognise our control blocks when a record has no block size.
+constexpr uint32_t kMaxDmaBlockBytes = 8u << 20;
+
 std::string readAll(int fd) {
     std::string text;
     char buf[512];
@@ -66,6 +70,10 @@ std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r) {
     out << "dma_channel=" << r.dmaChannel << '\n';
     put(out, "dma_mask_known", r.dmaMaskKnown ? 1 : 0);
     put(out, "mem_handle", r.memHandle);
+    if (r.memBus != 0 && r.memSize != 0) {
+        put(out, "mem_bus", r.memBus);
+        put(out, "mem_size", r.memSize);
+    }
     put(out, "pads", r.pads);
     put(out, "gpio_function", r.gpioFunction);
     if (r.pcmValid) {
@@ -87,6 +95,10 @@ std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r) {
         put(out, "core_div", t.coreDiv);
         put(out, "emmc_ctl", t.emmcCtl);
         put(out, "emmc_div", t.emmcDiv);
+        if (t.emmc2Valid) {
+            put(out, "emmc2_ctl", t.emmc2Ctl);
+            put(out, "emmc2_div", t.emmc2Div);
+        }
         put(out, "gp0_ctl", t.gp0Ctl);
         put(out, "gp0_div", t.gp0Div);
         put(out, "cm_pllc", t.cmPllc);
@@ -110,6 +122,7 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
     int treeFields = 0;
     int pcmFields = 0;
     int pwmFields = 0;
+    int emmc2Fields = 0;
 
     std::istringstream in(text);
     std::string line;
@@ -138,6 +151,10 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
             r.dmaMaskKnown = v != 0;
         } else if (key == "mem_handle") {
             r.memHandle = u;
+        } else if (key == "mem_bus") {
+            r.memBus = u;
+        } else if (key == "mem_size") {
+            r.memSize = u;
         } else if (key == "pads") {
             r.pads = u;
         } else if (key == "gpio_function") {
@@ -179,7 +196,13 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
                 field = &t.emmcCtl;
             else if (key == "emmc_div")
                 field = &t.emmcDiv;
-            else if (key == "gp0_ctl")
+            else if (key == "emmc2_ctl") {
+                field = &t.emmc2Ctl;
+                emmc2Fields++;
+            } else if (key == "emmc2_div") {
+                field = &t.emmc2Div;
+                emmc2Fields++;
+            } else if (key == "gp0_ctl")
                 field = &t.gp0Ctl;
             else if (key == "gp0_div")
                 field = &t.gp0Div;
@@ -201,7 +224,8 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
                 field = &t.pllcAna[key[8] - '0'];
             if (field != nullptr) {
                 *field = u;
-                treeFields++;
+                if (field != &t.emmc2Ctl && field != &t.emmc2Div)
+                    treeFields++;
             }
         }
     }
@@ -209,6 +233,8 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
     r.pcmValid = pcmFields == 2;
     r.pwmValid = pwmFields == 5;
     r.clockTree.valid = treeFields == 17;
+    // Records written before EMMC2 was saved (or on other SoCs) have no emmc2_* keys: they stay valid without them.
+    r.clockTree.emmc2Valid = r.clockTree.valid && emmc2Fields == 2;
     return havePid;
 }
 
@@ -265,6 +291,10 @@ bool SoapyRPITX_RecordPlausible(const SoapyRPITX_SessionRecord &r, std::string &
             why = "invalid clock tree";
             return false;
         }
+        if (t.emmc2Valid && !validSource(t.emmc2Ctl)) {
+            why = "invalid clock tree";
+            return false;
+        }
     }
     return true;
 }
@@ -273,14 +303,40 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
     std::ostringstream log;
     log << "process " << r.pid << ":";
 
-    // Stop the transmission first: the DMA rewrites GPFSEL0 on every data slot.
+    // Stop the transmission first: the DMA rewrites GPFSEL0 on every data slot. The record can be hours old: the
+    // channel is only reset when it is idle or still runs our control blocks, never when another program took it.
     if (r.dmaChannel >= 0 && r.dmaChannel <= bcm_host_get_max_legacy_dma_channel()) {
         try {
             dmagpio d;
-            d.gpioreg[DMA_CS + r.dmaChannel * DMA_CHANNEL_WORDS] = BCM2708_DMA_RESET;
-            usleep(1000);
-            d.gpioreg[DMA_CS + r.dmaChannel * DMA_CHANNEL_WORDS] = BCM2708_DMA_INT | BCM2708_DMA_END;
-            log << " DMA channel " << r.dmaChannel << " reset;";
+            volatile uint32_t *regs = d.gpioreg + r.dmaChannel * DMA_CHANNEL_WORDS;
+            bool ours = true;
+            if ((regs[DMA_CS] & DMA_CS_ACTIVE) != 0) {
+                uint32_t bus = r.memBus;
+                uint32_t size = r.memSize;
+                if (bus == 0 || size == 0) {
+                    // Record without the block location (older version): ask the mailbox for the bus address; the
+                    // size is then bounded by the largest block a transmitter can allocate.
+                    bus = 0;
+                    size = kMaxDmaBlockBytes;
+                    int mb = r.memHandle != 0 ? mbox_open() : -1;
+                    if (mb >= 0) {
+                        bus = mem_lock(mb, r.memHandle);
+                        if (bus != 0)
+                            mem_unlock(mb, r.memHandle);
+                        mbox_close(mb);
+                    }
+                }
+                const uint32_t cb = regs[DMA_CONBLK_AD];
+                ours = bus != 0 && cb >= bus && cb - bus < size;
+            }
+            if (ours) {
+                regs[DMA_CS] = BCM2708_DMA_RESET;
+                usleep(1000);
+                regs[DMA_CS] = BCM2708_DMA_INT | BCM2708_DMA_END;
+                log << " DMA channel " << r.dmaChannel << " reset;";
+            } else {
+                log << " DMA channel " << r.dmaChannel << " is now used by another program; not reset;";
+            }
         } catch (const std::exception &e) {
             log << " DMA reset failed (" << e.what() << ");";
         }

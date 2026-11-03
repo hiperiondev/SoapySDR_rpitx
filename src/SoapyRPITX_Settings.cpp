@@ -196,10 +196,7 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
 
 SoapyRPITX::~SoapyRPITX(void) {
     std::lock_guard<std::mutex> lock(device_mutex);
-    streamHandle.store(nullptr);
-    if (tx_stream)
-        tx_stream->transmitter().Stop();
-    tx_stream.reset();
+    ReleaseTxStreamLocked();
 }
 
 // ******************** Identification API ********************

@@ -356,7 +356,8 @@ sdr.closeStream(st)
   muestras encoladas se descartan.
 - `closeStream()` (y la destrucción del dispositivo) apaga la portadora de inmediato y descarta las muestras
   encoladas, también mientras otro hilo espera en `deactivateStream()`; el hardware queda libre para un nuevo stream
-  enseguida.
+  enseguida. Un `writeStream()` o `readStreamStatus()` en otro hilo se despierta y retorna antes de destruir el stream
+  (las llamadas en curso se cuentan y `closeStream()` las espera), así que cerrar durante un apagado es seguro.
 - `readStreamStatus()` devuelve `SOAPY_SDR_UNDERFLOW` (máscara de canal 1) una vez por cada nuevo vaciado de la FIFO
   dentro de una ráfaga, overrun del DMA o reinicio del DMA; si no, `SOAPY_SDR_TIMEOUT`.
 - La frecuencia, la frecuencia de muestreo, los ppm y la armónica pueden cambiar durante la transmisión: el
@@ -748,9 +749,12 @@ La portadora es GPCLK0 alimentado por **PLLC**. Al crear un stream, el driver ac
 librpitx:
 
 1. Se guardan los registros del árbol de relojes que van a cambiar (`CORECLK_CNTL/DIV`, `EMMCCLK_CNTL/DIV`,
-   `CM_GP0CTL/DIV`, `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`) y se anotan en el
-   archivo de sesión.
+   `CM_GP0CTL/DIV`, `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`; en BCM2711 también
+   `EMMC2CLK_CNTL/DIV`) y se anotan en el archivo de sesión.
 2. El reloj del núcleo VPU se mueve a PLLA (divisor 4) y el reloj EMMC a PLLD, para que nada más dependa de PLLC.
+   En BCM2711 el generador EMMC2 (tarjeta SD) también pasa a PLLD_PER si estaba en PLLC_PER, recalculando el divisor
+   para conservar su frecuencia. Los generadores que sigan alimentados por PLLC (por ejemplo vía `PLLC_CORE1/2`) se
+   listan en un aviso.
 3. Se desactiva `PLLC_CORE0`, se habilita el canal de periféricos de PLLC con divisor 1 (2 en BCM2711) y GPCLK0 toma
    de él su fuente, con MASH 0 (divisor entero, sin espurias de modelado de ruido).
 
@@ -921,14 +925,17 @@ alimentador lo despierta cuando libera espacio.
 
 Mientras existe un transmisor, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, nunca sobrevive a un reinicio; directorio
 privado) se mantiene con un `flock()` exclusivo y contiene un registro `clave=valor` de todo lo que posee el proceso:
-PID, canal DMA y handle de memoria VideoCore (escritos en cuanto se reserva la memoria y borrados antes de liberarla,
-junto con si la máscara de canales DMA del kernel se podía leer), valor original de los pads y
+PID, canal DMA, handle de memoria VideoCore, dirección de bus y tamaño (escritos en cuanto se reserva la memoria y
+borrados antes de liberarla, junto con si la máscara de canales DMA del kernel se podía leer), valor original de los pads y
 funciones de GPIO4 y de los demás pines usados, reloj PCM original o estado del PWM, y el árbol de relojes (guardado
 y registrado antes de su primera modificación). El registro termina con una línea `end=1`: lo que haya después
 (dejado por una actualización interrumpida entre la escritura de un registro más corto y el recorte del archivo) se
 ignora.
 El kernel libera el bloqueo cuando el proceso muere, incluso con `kill -9`. El siguiente proceso que obtiene el
-bloqueo y encuentra un registro no vacío sabe que el dueño murió sin limpiar y lo recupera: reinicio del canal DMA,
+bloqueo y encuentra un registro no vacío sabe que el dueño murió sin limpiar y lo recupera: reinicio del canal DMA (solo
+si el canal está inactivo o su bloque de control actual está dentro del bloque registrado; si otro programa tomó el
+canal entretanto, no se toca y el informe dice «now used by another program; not reset»; un registro sin la
+ubicación del bloque, de una versión anterior, usa la dirección de bus que da el mailbox),
 GPIO4 y pads restaurados, GPCLK0 detenido, PCM desactivado y su reloj restaurado, PWM restaurado, árbol de relojes
 restaurado, y la memoria de GPU del proceso muerto liberada (los handles de VideoCore son globales para el firmware).
 Antes se verifica el registro: un canal DMA que no sea un canal clásico del SoC o que pertenezca al kernel, pines

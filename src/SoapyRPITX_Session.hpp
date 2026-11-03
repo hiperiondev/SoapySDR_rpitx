@@ -60,6 +60,8 @@ struct SoapyRPITX_SessionRecord {
     int dmaChannel = -1;                                     ///< DMA channel in use (-1 when none was allocated).
     bool dmaMaskKnown = true;                                ///< The kernel DMA channel mask was readable when @ref dmaChannel was allocated.
     unsigned memHandle = 0;                                  ///< VideoCore memory handle (0 when none was allocated).
+    uint32_t memBus = 0;                                     ///< Bus address of the locked block (0 when unknown, e.g. a record of an older version).
+    uint32_t memSize = 0;                                    ///< Size of the block in bytes (0 when unknown).
     uint32_t pads = 0x1B;                                    ///< PADS_GPIO_0 value (drive, hysteresis, slew) to restore.
     uint32_t gpioFunction = 0;                               ///< Function-select code to restore on the RF output GPIO.
     bool pcmValid = false;                                   ///< The PCM block was used; @ref pcmCtl and @ref pcmDiv hold its original clock.
@@ -125,7 +127,10 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
 /**
  * @brief Returns the hardware described by a record to its idle state.
  *
- * Resets the DMA channel, switches the RF output GPIO and the other recorded GPIOs to their recorded function
+ * Resets the DMA channel only when it is idle or still runs the control blocks of the recorded block
+ * (@ref SoapyRPITX_SessionRecord::memBus / @ref SoapyRPITX_SessionRecord::memSize, or the bus address returned by
+ * the mailbox for the recorded handle when the record has none): after a crash the channel may have been taken
+ * by another program, whose transfer must not be killed. Then switches the RF output GPIO and the other recorded GPIOs to their recorded function
  * (input instead of a clock output, see SoapyRPITX_RestoredFunction()), restores the pads, stops GPCLK0,
  * disables the PCM block and restores its clock (when it was used), stops the PWM block and restores it (when it
  * was used), restores the clock tree and releases the VideoCore memory. The VideoCore memory is released only

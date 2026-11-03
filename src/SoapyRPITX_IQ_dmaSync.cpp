@@ -261,18 +261,20 @@ SoapyRPITX_HardwareClaim::~SoapyRPITX_HardwareClaim() {
     g_hardwareClaimed.store(false);
 }
 
-void SoapyRPITX_HardwareClaim::RecordDmaAllocation(int channel, unsigned memHandle) {
+void SoapyRPITX_HardwareClaim::RecordDmaAllocation(int channel, unsigned memHandle, unsigned memBus, unsigned memSize) {
     bool known = false;
     if (channel >= 0)
         bcm_host_get_kernel_dma_mask(&known);
     record.dmaChannel = channel;
     record.dmaMaskKnown = channel < 0 || known;
     record.memHandle = memHandle;
+    record.memBus = memBus;
+    record.memSize = memSize;
     PublishRecord();
 }
 
-std::function<void(int, unsigned)> SoapyRPITX_HardwareClaim::AllocationRecorder() {
-    return [this](int channel, unsigned memHandle) { RecordDmaAllocation(channel, memHandle); };
+std::function<void(int, unsigned, unsigned, unsigned)> SoapyRPITX_HardwareClaim::AllocationRecorder() {
+    return [this](int channel, unsigned memHandle, unsigned memBus, unsigned memSize) { RecordDmaAllocation(channel, memHandle, memBus, memSize); };
 }
 
 void SoapyRPITX_HardwareClaim::PublishRecord() {

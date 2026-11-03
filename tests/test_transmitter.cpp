@@ -349,6 +349,9 @@ void testSessionLockAndRecovery() {
     r.pid = 999999;
     r.dmaChannel = 11;
     r.memHandle = leaked;
+    r.memBus = mem_lock(0, leaked);
+    r.memSize = 8192;
+    dmaRegs[DMA_CONBLK_AD + 11 * DMA_CHANNEL_WORDS] = r.memBus + 5 * 32; // still running our chain
     r.pads = kDefaultPads;
     r.gpioFunction = fsel_input;
     {
@@ -357,6 +360,22 @@ void testSessionLockAndRecovery() {
     }
     SoapyRPITX_SessionRecord parsed;
     CHECK(SoapyRPITX_ParseRecord(SoapyRPITX_FormatRecord(r), parsed) && parsed.memHandle == leaked && parsed.dmaChannel == 11);
+
+    // The EMMC2 pair of the clock tree survives the session record; a record without it (older version) still parses.
+    {
+        SoapyRPITX_SessionRecord t;
+        t.pid = 4242;
+        t.clockTree.valid = true;
+        t.clockTree.pllcCtrl = (1u << 12) | 52;
+        t.clockTree.emmc2Valid = true;
+        t.clockTree.emmc2Ctl = 0x15; // PLLC_PER, enabled
+        t.clockTree.emmc2Div = 0x4000;
+        SoapyRPITX_SessionRecord back;
+        CHECK(SoapyRPITX_ParseRecord(SoapyRPITX_FormatRecord(t), back) && back.clockTree.valid && back.clockTree.emmc2Valid &&
+              back.clockTree.emmc2Ctl == 0x15 && back.clockTree.emmc2Div == 0x4000);
+        t.clockTree.emmc2Valid = false;
+        CHECK(SoapyRPITX_ParseRecord(SoapyRPITX_FormatRecord(t), back) && back.clockTree.valid && !back.clockTree.emmc2Valid);
+    }
 
     {
         SoapyRPITX_IQ_dmaSync tx(baseConfig());
@@ -988,6 +1007,7 @@ void testUnknownMaskRecovery() {
     r.dmaChannel = 7;
     r.dmaMaskKnown = false;
     r.memHandle = leaked;
+    dmaRegs[DMA_CONBLK_AD + 7 * DMA_CHANNEL_WORDS] = mem_lock(0, leaked) + 64; // record without the block location: mailbox lookup
     r.pads = kDefaultPads;
     {
         std::ofstream out(SoapyRPITX_Session::LockPath(), std::ios::trunc);
@@ -1000,6 +1020,84 @@ void testUnknownMaskRecovery() {
         CHECK(!MockAllocated(leaked));
     }
     MockSetKernelDmaMask(0, true);
+}
+
+void testRecoveryKeepsForeignDma() {
+    // After a crash another program may own the DMA channel: it is reset only when idle or running our chain.
+    volatile uint32_t *dmaRegs = MockRegisters(DMA_BASE);
+    const std::string path = SoapyRPITX_Session::LockPath();
+    const unsigned ch = 9;
+    unsigned handle = MockAllocate(8192);
+    const uint32_t bus = mem_lock(0, handle);
+
+    SoapyRPITX_SessionRecord r;
+    r.pid = 999990;
+    r.dmaChannel = ch;
+    r.memHandle = handle;
+    r.memBus = bus;
+    r.memSize = 8192;
+    r.pads = kDefaultPads;
+
+    // Active, control block outside our block (another program): left running.
+    dmaRegs[DMA_CS + ch * DMA_CHANNEL_WORDS] = DMA_CS_ACTIVE;
+    dmaRegs[DMA_CONBLK_AD + ch * DMA_CHANNEL_WORDS] = 0x7E000000u + 0x1000;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.Recovered());
+        CHECK((dmaRegs[DMA_CS + ch * DMA_CHANNEL_WORDS] & DMA_CS_ACTIVE) != 0);
+        CHECK(s.RecoveryReport().find("now used by another program") != std::string::npos);
+        CHECK(!MockAllocated(handle)); // the leaked memory is still released
+    }
+
+    // Just past the end of our block: still foreign.
+    handle = MockAllocate(8192);
+    r.memHandle = handle;
+    r.memBus = mem_lock(0, handle);
+    dmaRegs[DMA_CONBLK_AD + ch * DMA_CHANNEL_WORDS] = r.memBus + 8192;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK((dmaRegs[DMA_CS + ch * DMA_CHANNEL_WORDS] & DMA_CS_ACTIVE) != 0);
+    }
+
+    // Last control block of our block: ours, reset.
+    handle = MockAllocate(8192);
+    r.memHandle = handle;
+    r.memBus = mem_lock(0, handle);
+    dmaRegs[DMA_CONBLK_AD + ch * DMA_CHANNEL_WORDS] = r.memBus + 8192 - 32;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK((dmaRegs[DMA_CS + ch * DMA_CHANNEL_WORDS] & DMA_CS_ACTIVE) == 0);
+    }
+
+    // Idle channel: reset (harmless).
+    handle = MockAllocate(8192);
+    r.memHandle = handle;
+    r.memBus = mem_lock(0, handle);
+    dmaRegs[DMA_CS + ch * DMA_CHANNEL_WORDS] = 0;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.RecoveryReport().find("reset") != std::string::npos && s.RecoveryReport().find("not reset") == std::string::npos);
+    }
+
+    // The block location survives the record text.
+    SoapyRPITX_SessionRecord back;
+    CHECK(SoapyRPITX_ParseRecord(SoapyRPITX_FormatRecord(r), back) && back.memBus == r.memBus && back.memSize == 8192);
 }
 
 void testIncompleteRecordKeepsMemory() {
@@ -1079,6 +1177,7 @@ int main() {
     testReleaseRecordedBeforeFree();
     testRecordFormat();
     testUnknownMaskRecovery();
+    testRecoveryKeepsForeignDma();
     testIncompleteRecordKeepsMemory();
     testDeviceTreeStatus();
 

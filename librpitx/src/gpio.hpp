@@ -23,6 +23,8 @@
 #define DEF_GPIO
 #include <stdint.h>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 /** @brief Bus address of the peripheral window as seen by the DMA engine. */
 #define PHYSICAL_BUS 0x7E000000
@@ -180,6 +182,8 @@ public:
 #define EMMCCLK_DIV (0x1C4 / 4)  ///< EMMC clock divider.
 #define CM_EMMC2CTL (0x1d0 / 4)  ///< EMMC2 clock control (BCM2711).
 #define CM_EMMC2DIV (0x1d4 / 4)  ///< EMMC2 clock divider (BCM2711).
+#define EMMC2CLK_CNTL CM_EMMC2CTL ///< EMMC2 clock control (BCM2711); drives the SD card.
+#define EMMC2CLK_DIV CM_EMMC2DIV  ///< EMMC2 clock divider (BCM2711).
 
 #define CM_VPUCTL 0x008       ///< VPU clock control (byte offset).
 #define CM_VPUDIV 0x00c       ///< VPU clock divider (byte offset).
@@ -336,6 +340,9 @@ struct ClockTreeState {
     uint32_t coreDiv = 0;               ///< CORECLK_DIV.
     uint32_t emmcCtl = 0;               ///< EMMCCLK_CNTL.
     uint32_t emmcDiv = 0;               ///< EMMCCLK_DIV.
+    bool emmc2Valid = false;            ///< True when @ref emmc2Ctl and @ref emmc2Div hold a snapshot (BCM2711 only).
+    uint32_t emmc2Ctl = 0;              ///< EMMC2CLK_CNTL (BCM2711; the SD card clock).
+    uint32_t emmc2Div = 0;              ///< EMMC2CLK_DIV (BCM2711).
     uint32_t gp0Ctl = 0;                ///< GPCLK_CNTL (GPCLK0).
     uint32_t gp0Div = 0;                ///< GPCLK_DIV (GPCLK0).
     uint32_t cmPllc = 0;                ///< CM_PLLC.
@@ -350,22 +357,49 @@ struct ClockTreeState {
 
 /**
  * @brief Reads the clock-tree registers modified by advanced (master PLL) mode.
- * @param cm    Mapped clock manager (@ref CLK_BASE).
- * @param state Receives the snapshot (@ref ClockTreeState::valid is set).
+ * @param cm      Mapped clock manager (@ref CLK_BASE).
+ * @param state   Receives the snapshot (@ref ClockTreeState::valid is set).
+ * @param bcm2711 True on BCM2711: the EMMC2 generator is saved as well (@ref ClockTreeState::emmc2Valid is set).
  */
-void cm_save_tree(volatile uint32_t *cm, ClockTreeState &state);
+void cm_save_tree(volatile uint32_t *cm, ClockTreeState &state, bool bcm2711 = false);
 
 /**
  * @brief Writes back a snapshot taken by cm_save_tree().
  *
  * GPCLK0 is stopped first, then PLLC is reprogrammed and given up to 10 ms to lock, then its channel
- * dividers, the VPU core clock and the EMMC clock are returned to their original source, and GPCLK0 gets
+ * dividers, the VPU core clock and the EMMC and EMMC2 clocks are returned to their original source, and GPCLK0 gets
  * its original configuration. Nothing is written when @p state is not valid.
  *
  * @param cm    Mapped clock manager.
  * @param state Snapshot.
  */
 void cm_restore_tree(volatile uint32_t *cm, const ClockTreeState &state);
+
+/**
+ * @brief Moves the EMMC2 generator (SD card clock, BCM2711) from the PLLC peripheral channel to PLLD.
+ *
+ * Does nothing when the generator is not sourced from PLLC_PER (source 5). Otherwise the generator is
+ * reprogrammed with source 6 (PLLD_PER) and a divider recomputed from the current PLLC_PER and PLLD_PER
+ * frequencies so that the output frequency is kept; when either frequency cannot be computed the divider is
+ * left as it was. The MASH setting and the enable state are preserved.
+ *
+ * @param cm      Mapped clock manager.
+ * @param xosc    Crystal frequency in Hz.
+ * @param bcm2711 True on BCM2711 (the function does nothing otherwise).
+ * @return True when the generator was moved.
+ */
+bool cm_move_emmc2_off_pllc(volatile uint32_t *cm, uint64_t xosc, bool bcm2711);
+
+/**
+ * @brief Lists the enabled clock generators of the clock manager that are still sourced from PLLC (source 5).
+ *
+ * GPCLK0, the generator of librpitx itself, is not listed.
+ *
+ * @param cm      Mapped clock manager.
+ * @param bcm2711 True on BCM2711 (adds the EMMC2 generator to the scan).
+ * @return Names of the generators fed by PLLC (empty when none).
+ */
+std::vector<std::string> cm_pllc_clients(volatile uint32_t *cm, bool bcm2711);
 
 /**
  * @brief Stops a clock generator and waits until it is idle.

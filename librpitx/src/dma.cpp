@@ -41,7 +41,7 @@ std::string hex(uint32_t v) {
 
 } // namespace
 
-dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const std::function<void(int, unsigned)> &Allocated) :
+dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const std::function<void(int, unsigned, unsigned, unsigned)> &Allocated) :
         allocationCallback(Allocated) {
     const bool bcm2711 = dma_reg.pi_is_2711;
     const int maxChannel = bcm2711 ? 10 : 14;
@@ -106,7 +106,7 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const s
     }
     if (allocationCallback) {
         try {
-            allocationCallback(channel, mbox.mem_ref);
+            allocationCallback(channel, mbox.mem_ref, mbox.bus_addr, (unsigned) NumPages * VC_PAGE_SIZE);
         } catch (...) {
             mem_unlock(mbox.handle, mbox.mem_ref);
             mem_free(mbox.handle, mbox.mem_ref);
@@ -119,7 +119,7 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const s
     if (mbox.virt_addr == nullptr) {
         if (allocationCallback) {
             try {
-                allocationCallback(-1, 0);
+                allocationCallback(-1, 0, 0, 0);
             } catch (...) {
             }
         }
@@ -162,7 +162,7 @@ dma::~dma() {
     // Nothing may leave the destructor: every exception is caught here.
     if (allocationCallback) {
         try {
-            allocationCallback(-1, 0);
+            allocationCallback(-1, 0, 0, 0);
         } catch (...) {
             dbg_printf(0, "DMA release record failed\n");
         }
@@ -266,7 +266,7 @@ bool dma::SetEasyCB(dma_cb_t *cbp, uint32_t index, dma_common_reg dst, uint32_t 
 // ************************************** BUFFER DMA **************************************
 
 bufferdma::bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force,
-                     const std::function<void(int, unsigned)> &Allocated) :
+                     const std::function<void(int, unsigned, unsigned, unsigned)> &Allocated) :
         dma(Channel, tbuffersize * tcbbysample, tbuffersize * tregisterbysample, Force, Allocated) {
     buffersize = tbuffersize;
     cbbysample = tcbbysample;

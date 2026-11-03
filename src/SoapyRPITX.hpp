@@ -174,6 +174,13 @@ public:
      */
     SoapyRPITX_IQ_dmaSync &transmitter();
 
+    /**
+     * @brief Starts closing: stops the transmitter and makes send() and readStatus() running in other threads return.
+     *
+     * Thread-safe; after this call readStatus() returns SOAPY_SDR_STREAM_ERROR.
+     */
+    void interrupt();
+
 private:
     rpitxStreamFormat format;                        ///< Host sample format.
     std::unique_ptr<SoapyRPITX_IQ_dmaSync> iqsender; ///< Transmitter.
@@ -181,6 +188,7 @@ private:
     std::atomic<bool> endBurstPending{false};        ///< The last write carried SOAPY_SDR_END_BURST.
     bool timeWarningShown = false;                   ///< SOAPY_SDR_HAS_TIME warning already logged (producer thread only).
     std::atomic<uint64_t> reportedEvents{0};         ///< Underflow, overrun and DMA error events already reported.
+    std::atomic<bool> closing{false};                ///< interrupt() was called: the stream is being closed.
 };
 
 /**
@@ -316,7 +324,9 @@ public:
      * @brief Stops and destroys a stream.
      *
      * The carrier is turned off immediately (queued samples are discarded), also while another thread waits in
-     * deactivateStream() for the end of a burst.
+     * deactivateStream() for the end of a burst. A writeStream() or readStreamStatus() running in another thread
+     * is woken up and returns (SOAPY_SDR_STREAM_ERROR / partial count) before the stream is destroyed; closeStream()
+     * waits for it.
      *
      * @param stream Stream handle.
      */
@@ -728,6 +738,52 @@ private:
     bool IsValidTxStreamHandle(SoapySDR::Stream *handle) const;
 
     /**
+     * @brief Registers a data-path call (writeStream() / readStreamStatus()) and validates the handle.
+     *
+     * The call counter is incremented before the handle is checked, so closeStream() (which clears the handle
+     * first and then waits for the counter to reach zero) can never free the stream under a registered call.
+     * Every successful call must be paired with LeaveStreamCall().
+     *
+     * @param handle Stream handle.
+     * @return The stream, or nullptr (nothing registered) when the handle is not the open TX stream.
+     */
+    tx_streamer *EnterStreamCall(SoapySDR::Stream *handle);
+
+    /** @brief Unregisters a call registered by EnterStreamCall(). */
+    void LeaveStreamCall();
+
+    /**
+     * @brief Stops and destroys the open TX stream, if any, after the data-path calls in flight have returned.
+     *
+     * The caller holds @ref device_mutex.
+     */
+    void ReleaseTxStreamLocked();
+
+    /** @brief Scope guard of a data-path call. */
+    class StreamCall {
+    public:
+        StreamCall(SoapyRPITX &dev, SoapySDR::Stream *handle) :
+                dev_(dev),
+                stream_(dev.EnterStreamCall(handle)) {
+        }
+        ~StreamCall() {
+            if (stream_ != nullptr)
+                dev_.LeaveStreamCall();
+        }
+        StreamCall(const StreamCall &) = delete;
+        StreamCall &operator=(const StreamCall &) = delete;
+
+        /** @brief The registered stream, nullptr when the handle was not valid. */
+        tx_streamer *get() const {
+            return stream_;
+        }
+
+    private:
+        SoapyRPITX &dev_;
+        tx_streamer *stream_;
+    };
+
+    /**
      * @brief Applies the tune parameters to the open stream, if any.
      * @param tune New parameters.
      * @throws std::runtime_error when the stream rejects them.
@@ -784,4 +840,5 @@ private:
 
     std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
     std::atomic<tx_streamer *> streamHandle{nullptr}; ///< Handle of the open stream, read by writeStream() without the mutex.
+    std::atomic<int> streamCalls{0};                  ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
 };

@@ -257,15 +257,52 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
     return reinterpret_cast<SoapySDR::Stream *>(tx_stream.get());
 }
 
+tx_streamer *SoapyRPITX::EnterStreamCall(SoapySDR::Stream *handle) {
+    // Register first, validate afterwards (both sequentially consistent): closeStream() clears the handle and
+    // then waits for the counter, so either this call sees the cleared handle, or closeStream() sees this call.
+    streamCalls.fetch_add(1);
+    tx_streamer *stream = streamHandle.load();
+    if (handle == nullptr || stream == nullptr || reinterpret_cast<tx_streamer *>(handle) != stream) {
+        streamCalls.fetch_sub(1);
+        return nullptr;
+    }
+    return stream;
+}
+
+void SoapyRPITX::LeaveStreamCall() {
+    streamCalls.fetch_sub(1);
+}
+
+void SoapyRPITX::ReleaseTxStreamLocked() {
+    // From here no new data-path call can obtain the stream.
+    streamHandle.store(nullptr);
+    if (!tx_stream)
+        return;
+
+    // Stopping also ends a drain in progress in deactivateStream(), which then releases its reference, and wakes
+    // a writer blocked on a full FIFO and a readStreamStatus() poll.
+    tx_stream->interrupt();
+
+    // The data-path calls do not take device_mutex and return promptly now; destroying the stream (its
+    // condition variable included) before they are gone would be undefined behaviour.
+    const auto start = std::chrono::steady_clock::now();
+    bool warned = false;
+    while (streamCalls.load() != 0) {
+        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) {
+            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: waiting for writeStream() / readStreamStatus() to return before closing the stream");
+            warned = true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    tx_stream.reset();
+}
+
 void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
     std::lock_guard<std::mutex> lock(device_mutex);
 
-    if (IsValidTxStreamHandle(handle)) {
-        streamHandle.store(nullptr);
-        // Stopping here also ends a drain in progress in deactivateStream(), which then releases its reference.
-        tx_stream->transmitter().Stop();
-        tx_stream.reset();
-    }
+    if (IsValidTxStreamHandle(handle))
+        ReleaseTxStreamLocked();
 }
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
@@ -317,19 +354,21 @@ int SoapyRPITX::readStream(SoapySDR::Stream *, void *const *, const size_t, int 
 
 int SoapyRPITX::writeStream(SoapySDR::Stream *handle, const void *const *buffs, const size_t numElems, int &flags, const long long timeNs,
                             const long timeoutUs) {
-    // Not serialised with device_mutex: blocking here must not stall the control API. The Soapy contract
-    // forbids closing a stream while another thread writes to it.
-    if (!IsValidTxStreamHandle(handle))
+    // Not serialised with device_mutex: blocking here must not stall the control API. The call is registered, so
+    // closeStream() / the destructor wait for it instead of destroying the stream under it.
+    StreamCall call(*this, handle);
+    if (call.get() == nullptr)
         return SOAPY_SDR_STREAM_ERROR;
 
-    return reinterpret_cast<tx_streamer *>(handle)->send(buffs, numElems, flags, timeNs, timeoutUs);
+    return call.get()->send(buffs, numElems, flags, timeNs, timeoutUs);
 }
 
 int SoapyRPITX::readStreamStatus(SoapySDR::Stream *handle, size_t &chanMask, int &flags, long long &timeNs, const long timeoutUs) {
-    if (!IsValidTxStreamHandle(handle))
+    StreamCall call(*this, handle);
+    if (call.get() == nullptr)
         return SOAPY_SDR_STREAM_ERROR;
 
-    return reinterpret_cast<tx_streamer *>(handle)->readStatus(chanMask, flags, timeNs, timeoutUs);
+    return call.get()->readStatus(chanMask, flags, timeNs, timeoutUs);
 }
 
 // ************************************** TX STREAMER **************************************
@@ -346,6 +385,11 @@ tx_streamer::~tx_streamer() {
 
 SoapyRPITX_IQ_dmaSync &tx_streamer::transmitter() {
     return *iqsender;
+}
+
+void tx_streamer::interrupt() {
+    closing.store(true);
+    iqsender->Stop();
 }
 
 size_t tx_streamer::mtu() const {
@@ -460,6 +504,8 @@ int tx_streamer::readStatus(size_t &chanMask, int &flags, long long &, long time
     const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
 
     for (;;) {
+        if (closing.load())
+            return SOAPY_SDR_STREAM_ERROR;
         SoapyRPITX_TxStats stats = iqsender->GetStats();
         uint64_t events = stats.underflows + stats.late + stats.dmaErrors;
         uint64_t reported = reportedEvents.load();
