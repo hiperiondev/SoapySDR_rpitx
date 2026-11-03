@@ -460,7 +460,10 @@ public:
 
     /**
      * @brief Stops the DMA and turns the carrier off; the feeder thread is asked to exit and given up to
-     *        50 ms to do so.
+     *        about 550 ms to do so (it checks the request every millisecond, but may be inside a retune).
+     *
+     * The DMA and the carrier are switched off first, so the transmitter is silent while waiting, and
+     * again after the wait, because a retune in progress may have re-enabled the clock.
      *
      * Used from the process exit handler. The object stays valid: Stop() and the destructor complete the
      * shutdown.
@@ -538,6 +541,18 @@ private:
 
     /** @brief Takes the published amplitude model and recomputes the delay split (feeder thread). */
     void RefreshModel();
+
+    /**
+     * @brief Applies a pending envelope advance (and the delay split that goes with it) when the ring is at a
+     *        burst boundary (feeder thread).
+     *
+     * Slots in the ring were written with the current advance, so it only changes when no data slot is
+     * waiting: the ring is idle (empty FIFO, no replay, every data slot completed) or the DMA is stopped
+     * with no data slot written yet.
+     *
+     * @return true when the advance changed.
+     */
+    bool ApplyPendingEnvAdvance();
 
     /** @brief Clears the amplitude processing state (start of a burst). */
     void ResetAmplitudeState();
@@ -663,6 +678,9 @@ private:
     std::shared_ptr<const SoapyRPITX_AmplitudeModel> model;     ///< Model in use (feeder thread only).
     int envAdvance = 0;                                         ///< Slots the envelope words are written ahead of their sample (feeder thread only).
     double envDelaySlots = 0;                                   ///< Software envelope delay in slots (feeder thread only).
+    bool envAdvancePending = false;                             ///< A new advance waits for a burst boundary (feeder thread only).
+    int pendingEnvAdvance = 0;                                  ///< Advance to apply at the boundary (feeder thread only).
+    double pendingEnvDelaySlots = 0;                            ///< Software delay that goes with @ref pendingEnvAdvance (feeder thread only).
     SoapyRPITX_AmplitudeQuantizer quantizer;                    ///< State selection (feeder thread only).
     SoapyRPITX_EnvelopeDelay envHistory;                        ///< Envelope history (feeder thread only).
     double appliedPhase = 0;                                    ///< AM/PM phase of the previous slot, in radians (feeder thread only).

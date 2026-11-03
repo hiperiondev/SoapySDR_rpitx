@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <istream>
@@ -139,11 +140,96 @@ inline bool SoapyRPITX_ParseProfile(std::istream &in, SoapyRPITX_Profile &out, s
 }
 
 /**
+ * @brief Tells whether files and directories of a user can be trusted by a process that may run as root.
+ * @param uid Owner.
+ * @return true for root and for the effective user of the process.
+ */
+inline bool SoapyRPITX_TrustedOwner(uid_t uid) {
+    return uid == 0 || uid == geteuid();
+}
+
+/**
+ * @brief Opens a profile file after walking its path from the root without following symbolic links.
+ *
+ * Every directory of the path must be owned by root or by the effective user and must not be writable by
+ * others (a directory with the sticky bit, such as /tmp, is accepted: only the owner of an entry can replace it,
+ * and the file's own owner is checked by the caller). The file is opened relative to the last directory, so the
+ * directories checked are the ones the file is read from. A relative path is resolved against the current
+ * directory, which is checked as well.
+ *
+ * @param path  File name.
+ * @param error Receives the description of the problem when the function fails.
+ * @return The file descriptor, or -1.
+ */
+inline int SoapyRPITX_OpenTrustedFile(const std::string &path, std::string &error) {
+    std::string full = path;
+    if (full.empty() || full[0] != '/') {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof(cwd)) == nullptr) {
+            error = "cannot open the file";
+            return -1;
+        }
+        full = std::string(cwd) + "/" + path;
+    }
+
+    std::vector<std::string> parts;
+    {
+        std::istringstream in(full);
+        std::string part;
+        while (std::getline(in, part, '/')) {
+            if (!part.empty() && part != ".")
+                parts.push_back(part);
+        }
+    }
+    if (parts.empty()) {
+        error = "cannot open the file";
+        return -1;
+    }
+
+    int dirfd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (size_t i = 0; dirfd >= 0; i++) {
+        struct stat ds;
+        if (fstat(dirfd, &ds) != 0) {
+            close(dirfd);
+            error = "cannot open the file";
+            return -1;
+        }
+        if (!SoapyRPITX_TrustedOwner(ds.st_uid)) {
+            close(dirfd);
+            error = "a directory of the path is owned by another user";
+            return -1;
+        }
+        if ((ds.st_mode & S_IWOTH) != 0 && (ds.st_mode & S_ISVTX) == 0) {
+            close(dirfd);
+            error = "a directory of the path is writable by others";
+            return -1;
+        }
+
+        if (i + 1 == parts.size()) {
+            int fd = openat(dirfd, parts[i].c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+            close(dirfd);
+            if (fd < 0)
+                error = "cannot open the file";
+            return fd;
+        }
+
+        int next = openat(dirfd, parts[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(dirfd);
+        dirfd = next;
+    }
+    error = "cannot open a directory of the path (missing, or a symbolic link)";
+    return -1;
+}
+
+/**
  * @brief Reads and parses a profile file.
  *
- * The file is opened without following symbolic links and without blocking, and is refused unless it is a
- * regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that group and others cannot write. Devices,
- * pipes and sockets are refused before anything is read from them.
+ * The driver can run as root, so the file is trusted only when nobody else can change it: it is opened without
+ * following symbolic links (in any component of the path) and without blocking, and is refused unless it is a
+ * regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that is owned by root or by the effective user and
+ * that group and others cannot write, in a path whose directories are owned by root or by the effective user and
+ * are not writable by others (see @ref SoapyRPITX_OpenTrustedFile()). Devices, pipes and sockets are refused
+ * before anything is read from them.
  *
  * @param path  File name.
  * @param out   Receives the entries.
@@ -152,11 +238,9 @@ inline bool SoapyRPITX_ParseProfile(std::istream &in, SoapyRPITX_Profile &out, s
  *         completely or holds a malformed line.
  */
 inline bool SoapyRPITX_LoadProfile(const std::string &path, SoapyRPITX_Profile &out, std::string &error) {
-    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
-    if (fd < 0) {
-        error = "cannot open the file";
+    int fd = SoapyRPITX_OpenTrustedFile(path, error);
+    if (fd < 0)
         return false;
-    }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         close(fd);
@@ -166,6 +250,11 @@ inline bool SoapyRPITX_LoadProfile(const std::string &path, SoapyRPITX_Profile &
     if (st.st_size > (off_t) RPITX_PROFILE_MAX_BYTES) {
         close(fd);
         error = "larger than " + std::to_string(RPITX_PROFILE_MAX_BYTES) + " bytes";
+        return false;
+    }
+    if (!SoapyRPITX_TrustedOwner(st.st_uid)) {
+        close(fd);
+        error = "owned by another user";
         return false;
     }
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {

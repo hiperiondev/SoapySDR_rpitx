@@ -732,6 +732,10 @@ public:
 private:
     /**
      * @brief Tells whether a handle is the open TX stream.
+     *
+     * Handles are generation tokens, not addresses, so a handle kept after closeStream() never matches a stream
+     * opened later (no ABA on a reused allocation).
+     *
      * @param handle Stream handle.
      * @return True when valid.
      */
@@ -885,6 +889,8 @@ private:
     SoapySDR::Kwargs profileStream;    ///< Default stream arguments of the loaded profile.
 
     std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
-    std::atomic<tx_streamer *> streamHandle{nullptr}; ///< Handle of the open stream, read by writeStream() without the mutex.
+    std::atomic<uintptr_t> streamHandle{0};           ///< Opaque generation token of the open stream (0: none), read by writeStream() without the mutex.
+    std::atomic<tx_streamer *> streamPtr{nullptr};    ///< Open stream the token was issued for; valid while a registered call holds the token.
+    uintptr_t streamGeneration = 0;                   ///< Last token issued; never reused, so a stale handle cannot match a new stream (device_mutex).
     std::atomic<int> streamCalls{0};                  ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
 };

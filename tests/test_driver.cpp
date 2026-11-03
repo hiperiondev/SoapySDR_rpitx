@@ -334,6 +334,31 @@ void testCloseDuringDrain() {
         dev.closeStream(again);
 }
 
+void testStaleHandle() {
+    // A handle kept after closeStream() must not be accepted by a stream opened later, whatever address the
+    // new stream gets (ABA).
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+    for (int round = 0; round < 5; round++) {
+        SoapySDR::Stream *old = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+        CHECK(old != nullptr);
+        dev.closeStream(old);
+        SoapySDR::Stream *fresh = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+        CHECK(fresh != nullptr && fresh != old);
+
+        std::vector<std::complex<float>> buf(16, std::complex<float>(0.5f, 0.0f));
+        const void *buffs[1] = {buf.data()};
+        int flags = 0;
+        CHECK(dev.writeStream(old, buffs, buf.size(), flags, 0, 1000) == SOAPY_SDR_STREAM_ERROR);
+        CHECK(dev.getStreamMTU(old) == 0);
+        CHECK(dev.activateStream(old) == SOAPY_SDR_STREAM_ERROR);
+        CHECK(dev.getStreamMTU(fresh) != 0);
+        dev.closeStream(old); // stale: must not close the new stream
+        CHECK(dev.getStreamMTU(fresh) != 0);
+        dev.closeStream(fresh);
+    }
+}
+
 void testCloseWhileWriting() {
     // closeStream() while other threads are blocked in writeStream() (full FIFO) and readStreamStatus(): both
     // return and the stream is destroyed only afterwards (run under ThreadSanitizer / AddressSanitizer).
@@ -549,6 +574,36 @@ void testProfileFileChecks() {
     CHECK(SoapyRPITX_LoadProfile(shared, p, err) && p.settings.size() == 1);
     std::remove(shared);
 
+    // A file owned by another user is refused (needs root to create).
+    if (geteuid() == 0) {
+        const char *foreign = "test_profile_foreign.rpitx";
+        writeFile(foreign, "ppm=1\n");
+        CHECK(chown(foreign, 12345, 12345) == 0);
+        CHECK(!SoapyRPITX_LoadProfile(foreign, p, err) && err.find("owned") != std::string::npos);
+        std::remove(foreign);
+    }
+
+    // A directory writable by others lets anyone swap the file: refused unless it is sticky.
+    const char *dir = "test_profile_dir";
+    const std::string inside = std::string(dir) + "/profile.rpitx";
+    rmdir(dir);
+    CHECK(mkdir(dir, 0700) == 0);
+    writeFile(inside.c_str(), "ppm=1\n");
+    chmod(dir, 0777);
+    CHECK(!SoapyRPITX_LoadProfile(inside, p, err) && err.find("writable by others") != std::string::npos);
+    chmod(dir, 01777);
+    CHECK(SoapyRPITX_LoadProfile(inside, p, err) && p.settings.size() == 1);
+    chmod(dir, 0755);
+    CHECK(SoapyRPITX_LoadProfile(inside, p, err) && p.settings.size() == 1);
+    // A symbolic link in a directory component is not followed either.
+    const char *dirLink = "test_profile_dirlink";
+    std::remove(dirLink);
+    CHECK(symlink(dir, dirLink) == 0);
+    CHECK(!SoapyRPITX_LoadProfile(std::string(dirLink) + "/profile.rpitx", p, err));
+    std::remove(dirLink);
+    std::remove(inside.c_str());
+    rmdir(dir);
+
     // A symbolic link is not followed.
     const char *target = "test_profile_target.rpitx";
     const char *link = "test_profile_link.rpitx";
@@ -569,6 +624,7 @@ int main() {
     testAmplitudeSettings();
     testEnvelopeStreamArguments();
     testCloseDuringDrain();
+    testStaleHandle();
     testCloseWhileWriting();
     testProfileParser();
     testProfileDevice();

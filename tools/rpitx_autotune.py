@@ -132,9 +132,23 @@ def next_pow2(n):
     return 1 << int(math.ceil(math.log2(max(int(n), 1))))
 
 
+def open_mode_644(path):
+    """Opens a text file for writing with mode 0644 whatever the umask (and whatever mode an old file had).
+
+    The driver refuses profile files that group or others can write, so the mode of the files this tool writes
+    must not depend on the umask (002 is common on Debian / Raspberry Pi OS and in some sudo setups)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        return os.fdopen(fd, "w")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def write_json_atomic(path, obj):
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open_mode_644(tmp) as f:
         json.dump(obj, f, indent=1, sort_keys=True, default=float)
     os.replace(tmp, path)
 
@@ -2867,7 +2881,7 @@ def write_outputs(ctx, results, status):
                           dict(profile=profile, board=rep["board"], freq=a.freq, rate=a.rate, tool_version=TOOL_VERSION,
                                date=time.strftime("%Y-%m-%d %H:%M:%S")))
         if a.profile_format in ("args", "both"):
-            with open(os.path.join(ctx.out, "profile_%s.args" % path), "w") as f:
+            with open_mode_644(os.path.join(ctx.out, "profile_%s.args" % path)) as f:
                 f.write("# device arguments\n%s\n" % dev)
                 f.write("# list settings: writeSetting(key, value) after opening the device, or keys of the device "
                         "argument dict in Python\n")
@@ -2876,7 +2890,7 @@ def write_outputs(ctx, results, status):
                 f.write("# stream arguments\n%s\n" % stream)
                 f.write("# gain: setGain(TX, 0, %d) for envelope modes, %d for constant-envelope modes\n" % (profile["gain_envelope"], profile["gain_constant"]))
         if a.profile_format in ("driver", "both"):
-            with open(os.path.join(ctx.out, "profile_%s.rpitx" % path), "w") as f:
+            with open_mode_644(os.path.join(ctx.out, "profile_%s.rpitx" % path)) as f:
                 f.write(driver_profile_text(profile, a))
         md += ["## Path `%s`: %s" % (path, pst), "",
                "Required modes: %s; HARDWARE_LIMIT allowed for: %s." % (", ".join(pol["required"]) or "none", ", ".join(pol["allow_hl"]) or "none"), "",
@@ -3032,7 +3046,7 @@ def run_path(ctx, path, results, start=None, skip=()):
     results[path] = (profile, verdict)
     if a.check_driver_profile:
         d = os.path.join(ctx.out, "profile_%s.rpitx" % path)
-        with open(d, "w") as f:
+        with open_mode_644(d) as f:
             f.write(driver_profile_text(profile, a))
         ctx.log("[VP] re-verification through profile=%s" % d)
         ctx.bench.use_driver_profile(d)
@@ -3339,8 +3353,16 @@ def self_test(quick, keep):
     gprof = good.results["non_eer"][0]
     text = driver_profile_text(gprof, good.a)
     pf = os.path.join(tmp, "roundtrip.rpitx")
-    with open(pf, "w") as f:
-        f.write(text)
+    old_umask = os.umask(0o002)
+    try:
+        with open_mode_644(pf) as f:
+            f.write(text)
+        jf = os.path.join(tmp, "umask.json")
+        write_json_atomic(jf, dict(a=1))
+        modes_ok = (os.stat(pf).st_mode & 0o777) == 0o644 and (os.stat(jf).st_mode & 0o777) == 0o644
+    finally:
+        os.umask(old_umask)
+    check("profile files are 0644 under umask 002", modes_ok)
     back = profile_from_driver_file(pf, good.a)
     pa_, pb_ = profile_params(gprof), profile_params(back)
     same = all(same_across([pa_[k], pb_[k]], 1e-9) for k in pa_ if k not in ("gain_constant", "rx_ppm"))

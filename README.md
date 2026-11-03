@@ -611,7 +611,7 @@ sudo hpsdr_rpitx_bridge.py --freq 144.8M            # fixed TX frequency
 sudo hpsdr_rpitx_bridge.py --freq-offset 116M       # transverter: host 28.8 MHz -> 144.8 MHz
 sudo hpsdr_rpitx_bridge.py --amplitude-mode constant --follow-drive
 sudo hpsdr_rpitx_bridge.py --key-dot-gpio 17 --key-dash-gpio 27 --ptt-gpio 22
-sudo hpsdr_rpitx_bridge.py --allow 192.168.1.20         # answer only this host
+sudo hpsdr_rpitx_bridge.py --bind 192.168.1.50 --allow 192.168.1.20   # reachable from the LAN: this interface, this host only
 hpsdr_rpitx_bridge.py --dry-run --verbose           # protocol only, no transmitter, no root
 ```
 
@@ -619,14 +619,21 @@ hpsdr_rpitx_bridge.py --dry-run --verbose           # protocol only, no transmit
 |------|----------------|
 | Discovery | UDP broadcast/directed on port 1024 and TCP; MAC, firmware, board id, receivers; Hermes-Lite 2 extra bytes |
 | Boards | `metis`, `hermes` (default), `hermes2`/`griffin`, `angelia`, `orion`, `orion2`, `hermeslite` |
-| Start / stop | EP6 I/Q and EP4 wideband, over UDP or TCP; another host takes over with a start; a stop from another host is ignored |
+| Start / stop | EP6 I/Q and EP4 wideband, over UDP or TCP; while a host streams, a start from another address is refused unless `--takeover` is given (the same address can restart); a stop from another host is ignored |
 | Host C&C (EP2) | Every address decoded (rate, receivers, duplex, TX/RX NCOs, drive, filters, attenuators, mic, PureSignal, CW keyer, HL2 extensions); `--verbose` logs changes |
 | Status (EP6) | PTT/dot/dash, IO inputs inactive, firmware, forward power (`--fwd-counts`), supply voltage, HL2 temperature, TX FIFO level and acknowledges |
 | Receive I/Q | Synthetic noise or zeros at 48/96/192/384 kHz, silent microphone; paced so the host TX stream runs at 48 kHz |
 | Transmit | Host TX I/Q while MOX is set, on the TX NCO (or RX1 when duplex is off) |
 | CW | Iambic A/B or straight keyer on GPIO paddles with host timing, HL2 CWX, GPIO PTT input |
 | Watchdog | Streaming stops and TX is released after `--host-timeout` s without host packets |
-| Access | Only hosts of `--allow` are answered: `private` (default: loopback, private and link-local addresses), `any`, or comma-separated addresses / CIDR networks; only the host that started the stream can key the transmitter; at most 4 TCP connections (the oldest idle one makes room) |
+| Access | Listens on loopback by default (`--bind`); only hosts of `--allow` are answered: `private` (default: loopback, private and link-local addresses), `any`, or comma-separated addresses / CIDR networks; only the host that started the stream can key the transmitter; at most 4 TCP connections (the oldest idle one makes room) |
+
+Security: Protocol 1 has no authentication and the bridge runs as root and drives RF, so access is decided by the
+source address only (on UDP, IP and port), which anyone on the same network segment can spoof. The bridge therefore
+listens on loopback unless `--bind` names an interface (`--bind 0.0.0.0` listens everywhere; a warning is printed
+whenever it is not loopback), keep `--allow` to the host that runs the SDR program, and put the Pi on a network you
+trust. A socket bound to one address does not receive broadcast discovery: enter the Pi's address in the host
+program instead of relying on automatic discovery (or bind `0.0.0.0` on a trusted network).
 
 Notes: in SSB with a silent microphone there is no carrier (in `envelope` mode magnitudes below 0.5 / (PAD + 1)
 of full scale switch the carrier off; the bridge prints a hint). With piHPSDR's *CW handled in Radio* the host does
@@ -970,7 +977,8 @@ hardware failure becomes a `std::runtime_error` that the application receives fr
 | Carrier stuck after a crash | `sudo rpitx_reset` (or open any stream): the session record is recovered |
 | "the PLLA peripheral channel is not running" | The firmware left PLLA off, so the VPU clock cannot leave PLLC; the board cannot transmit with this driver |
 | "the transmitter thread did not respond within 3 s" | The feeder thread was starved (another `SCHED_FIFO` task?); the change was not applied, retry it |
-| "not a regular file" / "writable by group or others" for a profile | Use a regular file with mode 0644 (or stricter) |
+| "not a regular file" / "writable by group or others" / "owned by another user" for a profile | Use a regular file with mode 0644 (or stricter), owned by root or by the user running the driver |
+| "a directory of the path is owned by another user" / "writable by others" / "symbolic link" for a profile | Every directory of the path must be owned by root or by that user, must not be writable by others (unless sticky) and must not be a symbolic link: pass the real path |
 | No carrier in SSB with the HPSDR bridge | Silent microphone; see the bridge notes above |
 
 ---

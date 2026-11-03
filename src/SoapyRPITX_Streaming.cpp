@@ -187,7 +187,9 @@ SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const s
 }
 
 bool SoapyRPITX::IsValidTxStreamHandle(SoapySDR::Stream *handle) const {
-    return handle != nullptr && reinterpret_cast<tx_streamer *>(handle) == streamHandle.load();
+    // The handle is an opaque generation token, never dereferenced: a stale handle of a closed stream cannot
+    // match a later stream, even if the new tx_streamer is allocated at the same address.
+    return handle != nullptr && reinterpret_cast<uintptr_t>(handle) == streamHandle.load();
 }
 
 void SoapyRPITX::ParseStreamArgs(const SoapySDR::Kwargs &sargs, SoapyRPITX_TxConfig &cfg, std::string &envOut) const {
@@ -260,20 +262,27 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
                   cfg.ringSize, cfg.slotsPerSample, cfg.fifoMs, cfg.prerollMs, envOut.c_str(), cfg.rfDac ? ", RF-DAC" : "");
 
     tx_stream = std::make_shared<tx_streamer>(streamFormat, cfg);
-    streamHandle.store(tx_stream.get());
-    return reinterpret_cast<SoapySDR::Stream *>(tx_stream.get());
+
+    // Every stream gets a new token (0 is reserved for "no stream"; the counter is only changed under device_mutex).
+    if (++streamGeneration == 0)
+        streamGeneration = 1;
+    streamPtr.store(tx_stream.get());
+    streamHandle.store(streamGeneration);
+    return reinterpret_cast<SoapySDR::Stream *>(streamGeneration);
 }
 
 tx_streamer *SoapyRPITX::EnterStreamCall(SoapySDR::Stream *handle) {
     // Register first, validate afterwards (both sequentially consistent): closeStream() clears the handle and
     // then waits for the counter, so either this call sees the cleared handle, or closeStream() sees this call.
     streamCalls.fetch_add(1);
-    tx_streamer *stream = streamHandle.load();
-    if (handle == nullptr || stream == nullptr || reinterpret_cast<tx_streamer *>(handle) != stream) {
+    const uintptr_t token = streamHandle.load();
+    if (handle == nullptr || token == 0 || reinterpret_cast<uintptr_t>(handle) != token) {
         streamCalls.fetch_sub(1);
         return nullptr;
     }
-    return stream;
+    // The token matched while this call is registered: closeStream() cannot finish (nor a new stream be set
+    // up) before LeaveStreamCall(), so streamPtr is the stream this token was issued for.
+    return streamPtr.load();
 }
 
 void SoapyRPITX::LeaveStreamCall() {
@@ -282,7 +291,7 @@ void SoapyRPITX::LeaveStreamCall() {
 
 void SoapyRPITX::ReleaseTxStreamLocked() {
     // From here no new data-path call can obtain the stream.
-    streamHandle.store(nullptr);
+    streamHandle.store(0);
     if (!tx_stream)
         return;
 
@@ -303,6 +312,7 @@ void SoapyRPITX::ReleaseTxStreamLocked() {
     }
 
     tx_stream.reset();
+    streamPtr.store(nullptr);
 }
 
 void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {

@@ -24,8 +24,11 @@
 #   - radio side CW: internal iambic/straight keyer fed by optional GPIO paddles, Hermes-Lite 2 CWX keying
 #     carried in the I sample LSB, and a PTT input;
 #   - host watchdog: streaming stops and the transmitter is released when the host goes silent;
-#   - access control: only hosts of the --allow networks are answered (default: loopback, private and link-local
-#     addresses), and only the host that started the stream can key the transmitter.
+#   - access control: the bridge listens on loopback by default (--bind), only hosts of the --allow networks are
+#     answered (default: loopback, private and link-local addresses), only the host that started the stream can key
+#     the transmitter, and while a stream is active a start from another address is refused unless --takeover is
+#     given. Protocol 1 has no authentication: access is decided by the source address only, which on a shared
+#     network can be spoofed; bind to the address of a trusted interface and keep --allow narrow.
 # Firmware programming, flash erase and IP address change requests are recognised and ignored.
 #
 # Protocol 1 hosts pace their TX stream on the receive stream of the radio (one microphone sample per receive
@@ -57,6 +60,10 @@ FRAME_LEN = 512
 SYNC = b"\x7f\x7f\x7f"
 TX_RATE = 48000  # Protocol 1 TX I/Q and microphone samples are always 48 kHz
 SAMPLES_PER_EP2_FRAME = 63
+# EP2 sequence tracking: packets that arrive up to this many sequence numbers late are reordered ones; EP2_RESYNC_LATE
+# of them in a row mean that the host restarted its sequence.
+EP2_REORDER_WINDOW = 256
+EP2_RESYNC_LATE = 8
 RX_RATES = (48000, 96000, 192000, 384000)
 EP4_SAMPLES = 512  # 16-bit wideband samples per EP4 packet
 EP4_PACKETS_PER_BLOCK = 32
@@ -132,6 +139,16 @@ def parse_allow(text):
         except ValueError:
             raise argparse.ArgumentTypeError("invalid address or network '%s' in --allow" % item)
     return out
+
+
+def bind_is_loopback(host):
+    """Tells whether a --bind value only accepts local connections."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def address_allowed(allow, host):
@@ -935,6 +952,7 @@ class Bridge:
             self.tcp_listen.listen(2)
         self.tcp_clients = {}  # socket -> (address, receive buffer, HostLink), oldest first
         self.refused_hosts = set()  # addresses already reported as refused by --allow
+        self.takeover_refused = set()  # addresses already reported as refused a start while another host streams
 
         self.link = None
         self.streaming = False
@@ -944,6 +962,8 @@ class Bridge:
         self.ep2_seq = None
         self.ep2_packets = 0
         self.ep2_lost = 0
+        self.ep2_late = 0
+        self.ep2_late_run = 0
 
         self.tx_lock = threading.Lock()
         self.tx_source = None
@@ -1062,6 +1082,18 @@ class Bridge:
         if release_link:
             self.link = None
 
+    def _takeover_refused(self, link):
+        """A host at another address cannot take the transmitter over while a stream is active (unless --takeover).
+
+        The same address may restart its stream (the program restarted with another source port); a stream whose
+        host went silent is released by the watchdog, after which anyone allowed can start."""
+        if self.args.takeover or not self.streaming or self.link is None or link.addr[0] == self.link.addr[0]:
+            return False
+        if link.addr[0] not in self.takeover_refused:
+            self.takeover_refused.add(link.addr[0])
+            print("start from %s refused: %s is streaming (use --takeover to let another host take over)" % (link.describe(), self.link.describe()))
+        return True
+
     def handle_command(self, data, link):
         cmd = data[2]
         if cmd == 0x02:
@@ -1069,6 +1101,8 @@ class Bridge:
             print("discovery from %s" % link.describe())
         elif cmd == 0x04 and len(data) >= 4:
             if data[3] & 0x03:
+                if self._takeover_refused(link):
+                    return
                 self._start(link, data[3])
             elif self.link is None or link.same(self.link):
                 self._stop_stream()
@@ -1137,11 +1171,38 @@ class Bridge:
         else:
             self.requests.append((address, c1, c2, c3, c4))
 
+    def _ep2_accept(self, seq):
+        """Tracks the EP2 sequence number; returns False for a late or duplicate packet (to be dropped).
+
+        A forward jump counts the missing packets as lost. A packet that arrives late (reordered) or twice is
+        counted in ep2_late and dropped: its samples are out of order or already sent, its C&C is stale, and the
+        sequence number is not moved back, so it is not counted as lost either. Sequence 0, a jump back of more
+        than EP2_REORDER_WINDOW packets, or EP2_RESYNC_LATE late packets in a row are a restarted stream."""
+        last = self.ep2_seq
+        if last is None or seq == 0:
+            self.ep2_seq = seq
+            self.ep2_late_run = 0
+            return True
+        d = (seq - last) & 0xFFFFFFFF
+        if 0 < d < 0x80000000:
+            self.ep2_lost += d - 1
+            self.ep2_seq = seq
+            self.ep2_late_run = 0
+            return True
+        back = (-d) & 0xFFFFFFFF  # 0 for a duplicate
+        if back <= EP2_REORDER_WINDOW:
+            self.ep2_late_run += 1
+            if self.ep2_late_run < EP2_RESYNC_LATE:
+                self.ep2_late += 1
+                return False
+        self.ep2_seq = seq
+        self.ep2_late_run = 0
+        return True
+
     def handle_ep2(self, data):
         seq = struct.unpack(">I", data[4:8])[0]
-        if self.ep2_seq is not None and seq != (self.ep2_seq + 1) & 0xFFFFFFFF and seq != 0:
-            self.ep2_lost += (seq - self.ep2_seq - 1) & 0xFFFFFFFF
-        self.ep2_seq = seq
+        if not self._ep2_accept(seq):
+            return
         self.ep2_packets += 1
 
         for base in (8, 8 + FRAME_LEN):
@@ -1394,7 +1455,7 @@ class Bridge:
         sensors = ""
         if self.tx.sdr is not None:
             sensors = " | fifo %.0f%% underflows %d late %d" % (self.tx.fifo_fill, self.tx.underflows, self.tx.late)
-        print("%s | rx %d kHz x%d | host TX %s%s | MOX %s | PTT %s | TX %s | ep2 %d lost %d | tx %d samples dropped %d%s" % (
+        print("%s | rx %d kHz x%d | host TX %s%s | MOX %s | PTT %s | TX %s | ep2 %d lost %d reordered %d | tx %d samples dropped %d%s" % (
             self.link.describe() if self.link else "no host",
             s["rx_rate"] // 1000,
             s["num_rx"],
@@ -1405,6 +1466,7 @@ class Bridge:
             self.tx_source or "idle",
             self.ep2_packets,
             self.ep2_lost,
+            self.ep2_late,
             self.tx.sent,
             self.tx.dropped,
             sensors,
@@ -1501,15 +1563,25 @@ def main():
     p.add_argument("--cw-ramp-ms", type=float, default=5.0, help="rise/fall time of the radio generated CW envelope")
     p.add_argument("--host-timeout", type=float, default=3.0, help="seconds without host packets before streaming stops (0 = never)")
     p.add_argument("--no-tcp", dest="tcp", action="store_false", help="do not accept Protocol 1 over TCP")
-    p.add_argument("--bind", default="0.0.0.0", help="local address to listen on")
+    p.add_argument("--bind", default="127.0.0.1",
+                   help="local address to listen on (default: loopback only). Hosts on the network need the address of the "
+                        "interface they reach, or 0.0.0.0; Protocol 1 has no authentication, so keep --allow narrow. A "
+                        "socket bound to a unicast address does not receive broadcast discovery: enter the address in the host")
     p.add_argument("--allow", type=parse_allow, default="private",
                    help="hosts answered: 'any', 'private' (loopback, private and link-local addresses) and/or "
                         "comma-separated addresses or CIDR networks, e.g. '192.168.1.0/24,10.0.0.5'")
+    p.add_argument("--takeover", action="store_true",
+                   help="let a start from another address take the stream (and the transmitter) over while a host is streaming")
     p.add_argument("--port", type=int, default=HPSDR_PORT, help="UDP and TCP port")
     p.add_argument("--report", type=float, default=2.0, help="status report period in seconds (0 = off)")
     p.add_argument("--verbose", action="store_true", help="print every change of the host C&C settings")
     p.add_argument("--dry-run", action="store_true", help="speak the protocol but do not open the transmitter")
     args = p.parse_args()
+
+    if not bind_is_loopback(args.bind):
+        print("warning: listening on %s: Protocol 1 has no authentication, any host allowed by --allow (%s) that can reach "
+              "this address can start the stream and key the transmitter; bind to loopback or narrow --allow" % (
+                  args.bind, "any address" if args.allow is None else "see --allow"), file=sys.stderr)
 
     if not args.dry_run and hasattr(os, "geteuid") and os.geteuid() != 0:
         print("warning: rpitx needs root; run with sudo", file=sys.stderr)

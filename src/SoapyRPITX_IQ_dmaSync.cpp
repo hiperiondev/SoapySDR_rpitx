@@ -362,6 +362,7 @@ SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
             throw std::runtime_error("rpitx: the requested frequency or the envelope DAC rate cannot be produced");
 
         ResetRing();
+        ApplyPendingEnvAdvance();
     } catch (...) {
         RestoreGpio();
         RestoreEnvelopePins();
@@ -570,9 +571,23 @@ void SoapyRPITX_IQ_dmaSync::RefreshModel() {
         return;
     model = m;
 
-    envDelaySlots = SoapyRPITX_SplitEnvelopeDelay(m->config.envelopeDelay * slotsPerSample, envelopeLatencyFor(envelopeOutput), envAdvance);
-    envAdvance = std::min<int>(envAdvance, (int) maxAdvanceFor(tracker.size()));
-    envDelaySlots = std::min(envDelaySlots, (double) (SoapyRPITX_EnvelopeDelay::kLength - 2));
+    int advance = 0;
+    double delaySlots = SoapyRPITX_SplitEnvelopeDelay(m->config.envelopeDelay * slotsPerSample, envelopeLatencyFor(envelopeOutput), advance);
+    advance = std::min<int>(advance, (int) maxAdvanceFor(tracker.size()));
+    delaySlots = std::min(delaySlots, (double) (SoapyRPITX_EnvelopeDelay::kLength - 2));
+
+    if (advance == envAdvance) {
+        // Only the fractional software delay changes: nothing in the ring depends on it.
+        envDelaySlots = delaySlots;
+        envAdvancePending = false;
+    } else {
+        // The slots in the ring were written with the current advance: the new one (and the delay split that
+        // goes with it, so that the total delay stays right) waits for a burst boundary.
+        pendingEnvAdvance = advance;
+        pendingEnvDelaySlots = delaySlots;
+        envAdvancePending = true;
+        ApplyPendingEnvAdvance();
+    }
 
     double idle = std::min(std::max(m->config.eerIdle, 0.0), 1.0);
     if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
@@ -583,6 +598,29 @@ void SoapyRPITX_IQ_dmaSync::RefreshModel() {
     } else {
         idleEnv = 0;
     }
+}
+
+bool SoapyRPITX_IQ_dmaSync::ApplyPendingEnvAdvance() {
+    if (!envAdvancePending)
+        return false;
+
+    const bool stopped = !dmaRunning.load();
+    if (stopped) {
+        // Pre-roll: a data slot already written carries envelope words placed with the old advance.
+        if (lastDataPos != 0)
+            return false;
+    } else if (fifo.size() != 0 || replayLeft.load() != 0 || tracker.readPos() < lastDataPos) {
+        return false;
+    }
+
+    envAdvance = pendingEnvAdvance;
+    envDelaySlots = pendingEnvDelaySlots;
+    envAdvancePending = false;
+
+    // The idle prefix in front of the first data slot was sized with the old advance.
+    if (stopped && idlePrefix != 0)
+        ResetRing();
+    return true;
 }
 
 void SoapyRPITX_IQ_dmaSync::ResetAmplitudeState() {
@@ -836,6 +874,7 @@ void SoapyRPITX_IQ_dmaSync::Start() {
     RefreshModel();
     ResetAmplitudeState();
     ResetRing();
+    ApplyPendingEnvAdvance();
 
     running.store(true);
     feederExited.store(false);
@@ -1040,8 +1079,24 @@ void SoapyRPITX_IQ_dmaSync::SignalSafeStop() {
 void SoapyRPITX_IQ_dmaSync::EmergencyStop() {
     // "active" stays set so that Stop() still joins the thread and completes the shutdown.
     running.store(false);
+
+    // Silence the carrier first (register writes only, safe at any time): the wait below can be long.
+    SignalSafeStop();
+
+    // The feeder checks "running" every millisecond, but may be inside FeederRetune() (PLL lock wait,
+    // sleeps, NTP) or preempted. exit() destroys the logger and the registry after this handler, so the
+    // feeder must be gone before returning.
     for (int i = 0; i < 50 && !feederExited.load(); i++)
         usleep(1000);
+    if (!feederExited.load()) {
+        SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: the feeder thread did not stop within 50 ms at exit; waiting longer");
+        for (int i = 0; i < 500 && !feederExited.load(); i++)
+            usleep(1000);
+        if (!feederExited.load())
+            SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the feeder thread is still running at exit");
+    }
+
+    // Again: a retune that was in progress may have re-enabled the clock or the pins.
     SignalSafeStop();
     StopDma();
     CarrierOff();
@@ -1257,6 +1312,9 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
             tuneCv.notify_all();
         }
 
+        // A new envelope advance takes effect only at a burst boundary.
+        bool advanceChanged = ApplyPendingEnvAdvance();
+
         const auto now = clock::now();
         const uint32_t n = tracker.size();
         const uint32_t rate = slotRate;
@@ -1313,6 +1371,11 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
                 }
 
                 ScrubCompleted();
+                if (advanceChanged) {
+                    // The envelope words of the first samples need room ahead of the writer for the new advance.
+                    PadIdle(low);
+                    advanceChanged = false;
+                }
                 if (PumpData(target) > 0)
                     inBurst = true;
 
