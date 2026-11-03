@@ -1,0 +1,730 @@
+/**
+ * @file SoapyRPITX.hpp
+ * @brief SoapySDR device driver for the librpitx GPIO transmitter (TX only, one channel).
+ *
+ * @copyright Copyright 2023 Emiliano Augusto Gonzalez (egonzalez . hiperion @ gmail . com)
+ *
+ * Project Site: https://github.com/hiperiondev/SoapySDR_rpitx
+ *
+ * This is based on other projects:
+ * - librpitx (https://github.com/F5OEO/librpitx), Copyright (C) 2018 Evariste COURJAUD F5OEO
+ * - SoapyPlutoSDR (https://github.com/pothosware/SoapyPlutoSDR)
+ *
+ * please contact their authors for more information.
+ *
+ * This is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3, or (at your option)
+ * any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this software; see the file COPYING. If not, write to
+ * the Free Software Foundation, Inc., 51 Franklin Street,
+ * Boston, MA 02110-1301, USA.
+ */
+
+#pragma once
+
+#include <atomic>
+#include <complex>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <SoapySDR/Device.hpp>
+#include <SoapySDR/Formats.hpp>
+#include <SoapySDR/Logger.hpp>
+#include <SoapySDR/Types.hpp>
+
+#include "SoapyRPITX_IQ_dmaSync.hpp"
+
+/** @brief Name of the only antenna (the RF output pin). */
+#define RPITX_ANTENNA_NAME "GPIO4"
+/** @brief Name of the only gain element (pad drive strength). */
+#define RPITX_GAIN_NAME "PAD"
+
+/**
+ * @brief Identification of the running board.
+ */
+struct SoapyRPITX_BoardInfo {
+    std::string model;      ///< Device-tree model string (empty when unavailable).
+    std::string serial;     ///< Device-tree serial number (empty when unavailable).
+    bool supported = false; ///< True on a Raspberry Pi supported by librpitx (BCM2835/6/7, BCM2711).
+    bool pi4 = false;       ///< True on BCM2711 (Pi 4, Pi 400, CM4).
+    std::string reason;     ///< Why the board is not supported.
+};
+
+/**
+ * @brief Identifies the running board from the device tree.
+ *
+ * Raspberry Pi 5 / 500 / CM5 (BCM2712 with RP1) are reported as unsupported: their GPIO, clock and DMA
+ * blocks are not compatible with librpitx.
+ *
+ * @return Board information.
+ */
+SoapyRPITX_BoardInfo SoapyRPITX_DetectBoard();
+
+/** @brief Memory device used to map the peripherals (overridable at build time for the host-side tests). */
+#ifndef RPITX_DEV_MEM
+#define RPITX_DEV_MEM "/dev/mem"
+#endif
+
+/** @brief VideoCore mailbox device (overridable at build time for the host-side tests). */
+#ifndef RPITX_DEV_VCIO
+#define RPITX_DEV_VCIO "/dev/vcio"
+#endif
+
+/**
+ * @brief Tells whether the process can open /dev/mem and the VideoCore mailbox for reading and writing.
+ *
+ * The check uses the effective user and group IDs, so setuid programs are accepted.
+ *
+ * @return True when both @ref RPITX_DEV_MEM and @ref RPITX_DEV_VCIO are readable and writable.
+ */
+bool SoapyRPITX_HasHardwareAccess();
+
+/** @brief Host-side sample formats accepted by writeStream(). */
+typedef enum rpitxStreamFormat {
+    RPITX_SDR_CF32, ///< Complex float32, full scale 1.0.
+    RPITX_SDR_CS16, ///< Complex int16, full scale 32768.
+    RPITX_SDR_CS8,  ///< Complex int8, full scale 128.
+} rpitxStreamFormat_t;
+
+/**
+ * @brief Transmit stream: converts host samples and feeds the transmitter.
+ */
+class tx_streamer {
+public:
+    /**
+     * @brief Creates the stream and the transmitter hardware object.
+     * @param format Host sample format.
+     * @param cfg    Transmitter configuration.
+     * @throws std::runtime_error when the hardware cannot be initialised.
+     */
+    tx_streamer(rpitxStreamFormat format, const SoapyRPITX_TxConfig &cfg);
+
+    /** @brief Stops transmission and releases the hardware. */
+    ~tx_streamer();
+
+    tx_streamer(const tx_streamer &) = delete;
+    tx_streamer &operator=(const tx_streamer &) = delete;
+
+    /**
+     * @brief Queues samples for transmission.
+     *
+     * Blocks while the FIFO is full, up to @p timeoutUs. Partial writes are reported through the return value.
+     *
+     * @param buffs     One buffer (channel 0) in the stream format.
+     * @param numElems  Number of complex samples in the buffer.
+     * @param flags     SOAPY_SDR_END_BURST marks the end of a burst; SOAPY_SDR_HAS_TIME is not supported.
+     * @param timeNs    Ignored.
+     * @param timeoutUs Maximum blocking time in microseconds.
+     * @return Number of samples accepted, SOAPY_SDR_TIMEOUT when none could be queued in time,
+     *         SOAPY_SDR_STREAM_ERROR when the stream is not active, or SOAPY_SDR_NOT_SUPPORTED for timed writes.
+     */
+    int send(const void *const *buffs, size_t numElems, int &flags, long long timeNs, long timeoutUs);
+
+    /**
+     * @brief Reports asynchronous stream events.
+     * @param chanMask  Receives the channel mask of the event (bit 0).
+     * @param flags     Receives the event flags.
+     * @param timeNs    Unchanged (no timestamps).
+     * @param timeoutUs Maximum waiting time in microseconds.
+     * @return SOAPY_SDR_UNDERFLOW when the FIFO ran empty during a burst, the DMA overran the feeder or the DMA
+     *         engine had to be restarted since the last call, otherwise SOAPY_SDR_TIMEOUT.
+     */
+    int readStatus(size_t &chanMask, int &flags, long long &timeNs, long timeoutUs);
+
+    /**
+     * @brief Starts the transmitter.
+     * @return 0.
+     */
+    int activate();
+
+    /**
+     * @brief Returns how long deactivation should wait for the last burst.
+     * @return FIFO + ring duration plus 200 ms in microseconds when the last write carried SOAPY_SDR_END_BURST,
+     *         otherwise 0.
+     */
+    long drainTimeoutUs();
+
+    /**
+     * @brief Stops the transmitter (samples still queued are discarded).
+     * @return 0.
+     */
+    int deactivate();
+
+    /**
+     * @brief Returns the preferred number of samples per writeStream() call.
+     * @return MTU in samples.
+     */
+    size_t mtu() const;
+
+    /**
+     * @brief Returns the transmitter.
+     * @return Transmitter object owned by the stream.
+     */
+    SoapyRPITX_IQ_dmaSync &transmitter();
+
+private:
+    rpitxStreamFormat format;                        ///< Host sample format.
+    std::unique_ptr<SoapyRPITX_IQ_dmaSync> iqsender; ///< Transmitter.
+    std::vector<std::complex<float>> scratch;        ///< Conversion buffer.
+    std::atomic<bool> endBurstPending{false};        ///< The last write carried SOAPY_SDR_END_BURST.
+    bool timeWarningShown = false;                   ///< SOAPY_SDR_HAS_TIME warning already logged (producer thread only).
+    std::atomic<uint64_t> reportedEvents{0};         ///< Underflow, overrun and DMA error events already reported.
+};
+
+/**
+ * @brief SoapySDR device for the Raspberry Pi GPIO transmitter.
+ *
+ * Device arguments (also accepted as settings, see getSettingInfo()): ppm, ppm_ntp, harmonic, amplitude_mode,
+ * iq_scale, debug_level. Other device arguments are reported with a warning, except the identification keys
+ * produced by enumeration (driver, label, product, serial, manufacturer, tuner) and keys containing ':'.
+ * Stream arguments: see getStreamArgsInfo().
+ */
+class SoapyRPITX : public SoapySDR::Device {
+public:
+    /**
+     * @brief Opens the device.
+     * @param args Device arguments; known setting keys are applied with writeSetting().
+     * @throws std::runtime_error when the board is not supported or /dev/mem is not accessible.
+     */
+    SoapyRPITX(const SoapySDR::Kwargs &args);
+
+    /** @brief Closes the stream, if any, and releases the hardware. */
+    ~SoapyRPITX();
+
+    /*******************************************************************
+     * Identification API
+     ******************************************************************/
+
+    /**
+     * @brief Returns the driver key.
+     * @return "rpitx".
+     */
+    std::string getDriverKey(void) const;
+
+    /**
+     * @brief Returns the hardware key.
+     * @return Board model string.
+     */
+    std::string getHardwareKey(void) const;
+
+    /**
+     * @brief Returns hardware information.
+     * @return Driver version, board model, serial and origin.
+     */
+    SoapySDR::Kwargs getHardwareInfo(void) const;
+
+    /*******************************************************************
+     * Channels API
+     ******************************************************************/
+
+    /**
+     * @brief Returns the number of channels.
+     * @param direction SOAPY_SDR_TX or SOAPY_SDR_RX.
+     * @return 1 for TX, 0 for RX.
+     */
+    size_t getNumChannels(const int direction) const;
+
+    /**
+     * @brief Tells whether TX and RX can run at the same time.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False (TX only).
+     */
+    bool getFullDuplex(const int direction, const size_t channel) const;
+
+    /*******************************************************************
+     * Stream API
+     ******************************************************************/
+
+    /**
+     * @brief Lists the supported host formats.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return CF32, CS16 and CS8 for TX; empty for RX.
+     */
+    std::vector<std::string> getStreamFormats(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the native format.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param fullScale Receives 1.0.
+     * @return CF32.
+     */
+    std::string getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const;
+
+    /**
+     * @brief Describes the stream arguments.
+     *
+     * - ring_size: DMA ring size in samples (default: 85 ms at the current sample rate, at least 4096; at least
+     *   10 ms of samples).
+     * - fifo_ms: software FIFO capacity in milliseconds (follows sample-rate changes).
+     * - preroll_ms: signal queued before the DMA starts, in milliseconds.
+     * - dma_channel: DMA channel (-1 for the first free channel of the board).
+     * - dma_force: reset an explicitly selected DMA channel even when it is active.
+     * - rt_priority: SCHED_FIFO priority of the feeder thread (0 = normal scheduling).
+     * - cpu: CPU the feeder thread is pinned to (-1 = no affinity).
+     * - signal_cleanup: turn the carrier off when the process is killed by a signal with the default action.
+     *
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Argument descriptions (empty for RX).
+     */
+    SoapySDR::ArgInfoList getStreamArgsInfo(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Creates the TX stream.
+     * @param direction Must be SOAPY_SDR_TX.
+     * @param format    CF32, CS16 or CS8.
+     * @param channels  Empty or {0}.
+     * @param args      Stream arguments (see getStreamArgsInfo()).
+     * @return Stream handle.
+     * @throws std::runtime_error for RX, an unsupported format or channel, invalid arguments, an already open
+     *         stream, or a hardware initialisation failure.
+     */
+    SoapySDR::Stream *setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels = std::vector<size_t>(),
+                                  const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
+
+    /**
+     * @brief Stops and destroys a stream.
+     * @param stream Stream handle.
+     */
+    void closeStream(SoapySDR::Stream *stream);
+
+    /**
+     * @brief Returns the preferred number of samples per writeStream() call.
+     * @param stream Stream handle.
+     * @return MTU in samples, 0 for an invalid handle.
+     */
+    size_t getStreamMTU(SoapySDR::Stream *stream) const;
+
+    /**
+     * @brief Starts transmission.
+     * @param stream   Stream handle.
+     * @param flags    SOAPY_SDR_HAS_TIME is not supported.
+     * @param timeNs   Ignored.
+     * @param numElems Ignored.
+     * @return 0, SOAPY_SDR_NOT_SUPPORTED for timed activation, or SOAPY_SDR_STREAM_ERROR for an invalid handle.
+     */
+    int activateStream(SoapySDR::Stream *stream, const int flags = 0, const long long timeNs = 0, const size_t numElems = 0);
+
+    /**
+     * @brief Stops transmission and turns the carrier off.
+     * @param stream Stream handle.
+     * @param flags  Ignored.
+     * @param timeNs Ignored.
+     * @return 0, or SOAPY_SDR_STREAM_ERROR for an invalid handle.
+     */
+    int deactivateStream(SoapySDR::Stream *stream, const int flags = 0, const long long timeNs = 0);
+
+    /**
+     * @brief Receiving is not supported.
+     * @return SOAPY_SDR_NOT_SUPPORTED.
+     */
+    int readStream(SoapySDR::Stream *stream, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long timeoutUs = 100000);
+
+    /**
+     * @brief Queues samples for transmission (see tx_streamer::send()).
+     * @param stream    Stream handle.
+     * @param buffs     One buffer.
+     * @param numElems  Number of samples.
+     * @param flags     Burst flags.
+     * @param timeNs    Ignored.
+     * @param timeoutUs Maximum blocking time in microseconds.
+     * @return Number of samples accepted or a SOAPY_SDR_* error code.
+     */
+    int writeStream(SoapySDR::Stream *stream, const void *const *buffs, const size_t numElems, int &flags, const long long timeNs = 0,
+                    const long timeoutUs = 100000);
+
+    /**
+     * @brief Reports underflow events (see tx_streamer::readStatus()).
+     * @param stream    Stream handle.
+     * @param chanMask  Receives the channel mask.
+     * @param flags     Receives the flags.
+     * @param timeNs    Unchanged.
+     * @param timeoutUs Maximum waiting time in microseconds.
+     * @return SOAPY_SDR_UNDERFLOW, SOAPY_SDR_TIMEOUT or SOAPY_SDR_STREAM_ERROR.
+     */
+    int readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int &flags, long long &timeNs, const long timeoutUs);
+
+    /*******************************************************************
+     * Sensor API
+     ******************************************************************/
+
+    /**
+     * @brief Lists the sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors, sample_rate.
+     * @return Sensor keys.
+     */
+    std::vector<std::string> listSensors(void) const;
+
+    /**
+     * @brief Describes a sensor.
+     * @param key Sensor key.
+     * @return Sensor description.
+     * @throws std::runtime_error for an unknown key.
+     */
+    SoapySDR::ArgInfo getSensorInfo(const std::string &key) const;
+
+    /**
+     * @brief Reads a sensor.
+     * @param key Sensor key.
+     * @return Value as a string ("false"/"0" while no stream exists).
+     * @throws std::runtime_error for an unknown key.
+     */
+    std::string readSensor(const std::string &key) const;
+
+    /*******************************************************************
+     * Settings API
+     ******************************************************************/
+
+    /**
+     * @brief Describes the settings.
+     *
+     * - ppm: manual crystal correction in ppm (positive when the crystal runs slow).
+     * - ppm_ntp: add the kernel NTP frequency estimate to the correction.
+     * - harmonic: transmit on this harmonic of the PLL output.
+     * - amplitude_mode: "envelope" (follow |IQ|) or "constant" (carrier at full drive).
+     * - iq_scale: gain applied to |IQ| before amplitude quantisation.
+     * - debug_level: librpitx diagnostic level (0-2).
+     *
+     * @return Setting descriptions.
+     */
+    SoapySDR::ArgInfoList getSettingInfo(void) const;
+
+    /**
+     * @brief Changes a setting.
+     * @param key   Setting key.
+     * @param value New value.
+     * @throws std::runtime_error for an unknown key, an invalid value, or a frequency that cannot be produced.
+     */
+    void writeSetting(const std::string &key, const std::string &value);
+
+    /**
+     * @brief Reads a setting.
+     * @param key Setting key.
+     * @return Value as a string.
+     * @throws std::runtime_error for an unknown key.
+     */
+    std::string readSetting(const std::string &key) const;
+
+    /*******************************************************************
+     * Antenna API
+     ******************************************************************/
+
+    /**
+     * @brief Lists the antennas.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return {"GPIO4"} for TX, empty for RX.
+     */
+    std::vector<std::string> listAntennas(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Selects the antenna.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Must be "GPIO4".
+     * @throws std::runtime_error for any other name or for RX.
+     */
+    void setAntenna(const int direction, const size_t channel, const std::string &name);
+
+    /**
+     * @brief Returns the antenna.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return "GPIO4" for TX, empty for RX.
+     */
+    std::string getAntenna(const int direction, const size_t channel) const;
+
+    /*******************************************************************
+     * Frontend corrections API
+     ******************************************************************/
+
+    /**
+     * @brief Tells whether automatic DC offset correction is available.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False.
+     */
+    bool hasDCOffsetMode(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Tells whether a frequency correction is available.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return True for TX.
+     */
+    bool hasFrequencyCorrection(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Sets the crystal correction (same as the ppm setting).
+     * @param direction Must be SOAPY_SDR_TX.
+     * @param channel   Channel.
+     * @param value     Correction in ppm, -200 to 200 (positive when the crystal runs slow, i.e. when the board
+     *                  transmits below the requested frequency).
+     * @throws std::runtime_error for RX, a value out of range, or a stream that rejects it.
+     */
+    void setFrequencyCorrection(const int direction, const size_t channel, const double value);
+
+    /**
+     * @brief Returns the crystal correction.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Correction in ppm (0 for RX).
+     */
+    double getFrequencyCorrection(const int direction, const size_t channel) const;
+
+    /*******************************************************************
+     * Gain API
+     ******************************************************************/
+
+    /**
+     * @brief Lists the gain elements.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return {"PAD"} for TX (pad drive strength 0-7, 2 mA to 16 mA).
+     */
+    std::vector<std::string> listGains(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Tells whether automatic gain is available.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False.
+     */
+    bool hasGainMode(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Automatic gain is not available; a request to enable it is ignored with a warning.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param automatic Requested mode.
+     */
+    void setGainMode(const int direction, const size_t channel, const bool automatic);
+
+    /**
+     * @brief Returns the automatic gain state.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False.
+     */
+    bool getGainMode(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Sets the overall gain (pad drive level 0-7, rounded and clamped).
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param value     Gain.
+     */
+    void setGain(const int direction, const size_t channel, const double value);
+
+    /**
+     * @brief Sets the gain of an element.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Must be "PAD".
+     * @param value     Gain.
+     * @throws std::runtime_error for an unknown element.
+     */
+    void setGain(const int direction, const size_t channel, const std::string &name, const double value);
+
+    /**
+     * @brief Returns the overall gain.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Pad drive level.
+     */
+    double getGain(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the gain of an element.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Element name.
+     * @return Pad drive level.
+     */
+    double getGain(const int direction, const size_t channel, const std::string &name) const;
+
+    /**
+     * @brief Returns the overall gain range.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return 0 to 7, step 1.
+     */
+    SoapySDR::Range getGainRange(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the gain range of an element.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Element name.
+     * @return 0 to 7, step 1.
+     */
+    SoapySDR::Range getGainRange(const int direction, const size_t channel, const std::string &name) const;
+
+    /*******************************************************************
+     * Frequency API
+     ******************************************************************/
+
+    /**
+     * @brief Sets the output frequency.
+     *
+     * Applied immediately to an existing stream (the DMA restarts from the queued samples).
+     *
+     * @param direction Must be SOAPY_SDR_TX.
+     * @param channel   Channel.
+     * @param name      "RF".
+     * @param frequency Frequency in Hz.
+     * @param args      Ignored.
+     * @throws std::runtime_error when the frequency is out of range or cannot be produced.
+     */
+    void setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency,
+                      const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
+
+    /**
+     * @brief Returns the output frequency.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Element name.
+     * @return Frequency in Hz (0 for RX).
+     */
+    double getFrequency(const int direction, const size_t channel, const std::string &name) const;
+
+    /**
+     * @brief Describes the tuning arguments.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Empty list.
+     */
+    SoapySDR::ArgInfoList getFrequencyArgsInfo(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Lists the tunable elements.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return {"RF"} for TX.
+     */
+    std::vector<std::string> listFrequencies(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the tuning range.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      Element name.
+     * @return Range of the board (multiplied by the harmonic setting).
+     */
+    SoapySDR::RangeList getFrequencyRange(const int direction, const size_t channel, const std::string &name) const;
+
+    /*******************************************************************
+     * Sample Rate API
+     ******************************************************************/
+
+    /**
+     * @brief Sets the IQ sample rate.
+     * @param direction Must be SOAPY_SDR_TX.
+     * @param channel   Channel.
+     * @param rate      Rate in Hz, within getSampleRateRange().
+     * @throws std::runtime_error for an unsupported rate, or a rate for which the DMA ring of the open stream is
+     *         shorter than 10 ms.
+     */
+    void setSampleRate(const int direction, const size_t channel, const double rate);
+
+    /**
+     * @brief Returns the IQ sample rate.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Nominal rate in Hz (0 for RX); the sample_rate sensor reports the rate produced by the PCM clock.
+     */
+    double getSampleRate(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Lists common sample rates.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Rates in Hz.
+     */
+    std::vector<double> listSampleRates(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the supported sample-rate range.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Continuous range in Hz.
+     */
+    SoapySDR::RangeList getSampleRateRange(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Sets the analog bandwidth; the bandwidth always equals the sample rate, so this has no effect.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param bw        Requested bandwidth in Hz.
+     */
+    void setBandwidth(const int direction, const size_t channel, const double bw);
+
+    /**
+     * @brief Returns the bandwidth.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Sample rate in Hz.
+     */
+    double getBandwidth(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Lists bandwidths.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Empty list (not adjustable).
+     */
+    std::vector<double> listBandwidths(const int direction, const size_t channel) const;
+
+private:
+    /**
+     * @brief Tells whether a handle is the open TX stream.
+     * @param handle Stream handle.
+     * @return True when valid.
+     */
+    bool IsValidTxStreamHandle(SoapySDR::Stream *handle) const;
+
+    /**
+     * @brief Applies the tune parameters to the open stream, if any.
+     * @param tune New parameters.
+     * @throws std::runtime_error when the stream rejects them.
+     */
+    void ApplyTune(const SoapyRPITX_TuneConfig &tune);
+
+    /**
+     * @brief Returns the board tuning range of the PLL output (before the harmonic factor).
+     * @return Range in Hz.
+     */
+    SoapySDR::Range PllRange() const;
+
+    /**
+     * @brief Validates and applies a manual crystal correction (device_mutex held).
+     * @param ppm Correction in ppm.
+     * @throws std::runtime_error when out of range or rejected by the stream.
+     */
+    void SetPpmLocked(double ppm);
+
+    mutable std::mutex device_mutex; ///< Serialises the control API.
+    SoapyRPITX_TuneConfig tune;      ///< Frequency-related parameters.
+    int driveLevel = 7;              ///< Pad drive level 0-7.
+    float iqScale = 1.0f;            ///< IQ magnitude gain.
+    bool constantEnvelope = false;   ///< Constant-envelope amplitude mode.
+    int debugLevel = 0;              ///< librpitx diagnostic level.
+    std::string model;               ///< Board model string.
+    std::string serial;              ///< Board serial number.
+    bool pi4 = false;                ///< BCM2711 board.
+
+    std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
+    std::atomic<tx_streamer *> streamHandle{nullptr}; ///< Handle of the open stream, read by writeStream() without the mutex.
+};
