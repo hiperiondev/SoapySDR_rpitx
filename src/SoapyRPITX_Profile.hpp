@@ -11,6 +11,9 @@
  * Spaces around the key and the value are removed; the value may contain '=' and ','. A later line with the
  * same key replaces the earlier one.
  *
+ * A profile file must be a regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that is not writable by
+ * group or others; symbolic links are not followed.
+ *
  * @copyright Copyright 2023 Emiliano Augusto Gonzalez (egonzalez . hiperion @ gmail . com)
  *
  * Project Site: https://github.com/hiperiondev/SoapySDR_rpitx
@@ -33,9 +36,14 @@
 
 #pragma once
 
-#include <fstream>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <istream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -45,6 +53,9 @@
 
 /** @brief Key of the initial gain in a profile file. */
 #define RPITX_PROFILE_GAIN_KEY "gain"
+
+/** @brief Largest profile file accepted, in bytes. */
+#define RPITX_PROFILE_MAX_BYTES 65536
 
 /**
  * @brief Contents of a profile file.
@@ -129,16 +140,63 @@ inline bool SoapyRPITX_ParseProfile(std::istream &in, SoapyRPITX_Profile &out, s
 
 /**
  * @brief Reads and parses a profile file.
+ *
+ * The file is opened without following symbolic links and without blocking, and is refused unless it is a
+ * regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that group and others cannot write. Devices,
+ * pipes and sockets are refused before anything is read from them.
+ *
  * @param path  File name.
  * @param out   Receives the entries.
  * @param error Receives the description of the problem when the function fails.
- * @return true on success, false when the file cannot be opened or a line is malformed.
+ * @return true on success, false when the file cannot be opened, is not an acceptable file, cannot be read
+ *         completely or holds a malformed line.
  */
 inline bool SoapyRPITX_LoadProfile(const std::string &path, SoapyRPITX_Profile &out, std::string &error) {
-    std::ifstream f(path);
-    if (!f) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+    if (fd < 0) {
         error = "cannot open the file";
         return false;
     }
-    return SoapyRPITX_ParseProfile(f, out, error);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        error = "not a regular file";
+        return false;
+    }
+    if (st.st_size > (off_t) RPITX_PROFILE_MAX_BYTES) {
+        close(fd);
+        error = "larger than " + std::to_string(RPITX_PROFILE_MAX_BYTES) + " bytes";
+        return false;
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        close(fd);
+        error = "writable by group or others";
+        return false;
+    }
+
+    // One byte more than the limit detects a file that grew after fstat().
+    std::string text((size_t) RPITX_PROFILE_MAX_BYTES + 1, '\0');
+    size_t used = 0;
+    while (used < text.size()) {
+        ssize_t n = pread(fd, &text[used], text.size() - used, (off_t) used);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) {
+            close(fd);
+            error = "read error";
+            return false;
+        }
+        if (n == 0)
+            break;
+        used += (size_t) n;
+    }
+    close(fd);
+    if (used > (size_t) RPITX_PROFILE_MAX_BYTES) {
+        error = "larger than " + std::to_string(RPITX_PROFILE_MAX_BYTES) + " bytes";
+        return false;
+    }
+    text.resize(used);
+
+    std::istringstream in(text);
+    return SoapyRPITX_ParseProfile(in, out, error);
 }

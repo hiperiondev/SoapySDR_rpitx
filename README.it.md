@@ -99,7 +99,7 @@ d'inviluppo esterno).
 - **Privilegi di root.** Il driver mappa i registri delle periferiche tramite `/dev/mem` e alloca memoria DMA tramite
   la mailbox VideoCore `/dev/vcio`. Senza accesso segnala un errore chiaro; non termina mai l'applicazione ospite.
 - **Clock del core fisso.** PLLC viene modulato, quindi il clock del core VPU viene spostato su PLLA finché esiste uno
-  stream. Come fa l'installer di rpitx, mantenere fissa la frequenza del core:
+  stream (lo stream viene rifiutato quando il canale periferico di PLLA non è in funzione). Come fa l'installer di rpitx, mantenere fissa la frequenza del core:
 
   ```ini
   # /boot/firmware/config.txt (o /boot/config.txt nelle versioni precedenti)
@@ -121,7 +121,8 @@ d'inviluppo esterno).
   `dtparam=audio=off`.
 - **La maschera dei canali DMA del kernel deve essere leggibile** dal device tree (`soc/dma@…` o
   `soc/dma-controller@…`, proprietà `dma-channel-mask` o `brcm,dma-channel-mask`) per la scelta automatica del canale;
-  altrimenti indicare `dma_channel` esplicitamente.
+  altrimenti indicare `dma_channel` esplicitamente. Il registro dei crash annota che la maschera non era leggibile,
+  così il ripristino resetta comunque quel canale.
 - **Un solo trasmettitore per sistema**, garantito da un `flock()` su `/run/soapy_rpitx/soapy_rpitx.lock`. La
   directory viene creata con modo 0700 e deve appartenere all'utente che esegue il driver; un file di lock che non sia
   un file regolare di quell'utente (per esempio un collegamento simbolico) viene rifiutato.
@@ -341,6 +342,8 @@ sdr.closeStream(st)
 
 ### Semantica dello stream
 
+- I timeout (`timeoutUs` di `writeStream()` e `readStreamStatus()`) sono limitati a un giorno, quindi `LONG_MAX`
+  può essere usato per "attendere indefinitamente".
 - `writeStream()` si blocca finché la FIFO è piena, rispetta `timeoutUs`, può accettare meno campioni di quelli offerti
   (il valore restituito è il numero consumato) e restituisce `SOAPY_SDR_TIMEOUT` quando non è riuscito ad accodare nulla
   in tempo. `SOAPY_SDR_HAS_TIME` non è supportato (`SOAPY_SDR_NOT_SUPPORTED`). L'MTU è `min(4096, max(FIFO/4, 256))`.
@@ -388,7 +391,7 @@ posizioni a 48 kHz). Un'applicazione che scrive più veloce del tempo reale mant
 | Chiave | Predefinito | Descrizione |
 |--------|-------------|-------------|
 | `ppm` | 0 | Correzione manuale del quarzo, −200 … 200 ppm. **Positiva quando il quarzo è lento**, cioè quando la scheda trasmette sotto la frequenza richiesta (stesso segno della stima NTP del kernel) |
-| `ppm_ntp` | true | Usa la stima di frequenza NTP del kernel come correzione di base (sommata a `ppm`) |
+| `ppm_ntp` | true | Usa la stima di frequenza NTP del kernel come correzione di base (sommata a `ppm`); la stima viene usata in ogni stato del clock tranne un clock non sincronizzato (resta valida intorno ai secondi intercalari) |
 | `harmonic` | 1 | Trasmette su questa armonica dell'onda quadra: il PLL lavora a frequenza / armonica (1 – 15) |
 | `amplitude_mode` | envelope | `envelope` o `constant` |
 | `iq_scale` | 1.0 | Guadagno applicato a \|I/Q\| prima della quantizzazione dell'ampiezza (modo envelope), 0 – 100 |
@@ -437,6 +440,10 @@ gain=7
   ignorate, una riga senza `=` è un errore, e una riga successiva sostituisce una precedente con la stessa chiave.
 - `readSetting("profile")` restituisce l'ultimo file caricato; `writeSetting("profile", "")` dimentica i suoi valori
   predefiniti dello stream (le impostazioni restano).
+- Il file deve essere un file regolare di al massimo 64 KiB non scrivibile da gruppo e altri (modo 0644 o più
+  restrittivo); i collegamenti simbolici non vengono seguiti, e dispositivi, pipe e socket vengono rifiutati senza
+  leggerli. Il driver gira come root e l'impostazione può arrivare da un client remoto (SoapyRemote), quindi non
+  viene aperto nient'altro.
 
 ### Sensori
 
@@ -612,6 +619,7 @@ sudo hpsdr_rpitx_bridge.py --freq 144.8M            # frequenza TX fissa
 sudo hpsdr_rpitx_bridge.py --freq-offset 116M       # transverter: host 28,8 MHz -> 144,8 MHz
 sudo hpsdr_rpitx_bridge.py --amplitude-mode constant --follow-drive
 sudo hpsdr_rpitx_bridge.py --key-dot-gpio 17 --key-dash-gpio 27 --ptt-gpio 22
+sudo hpsdr_rpitx_bridge.py --allow 192.168.1.20         # risponde solo a questo host
 hpsdr_rpitx_bridge.py --dry-run --verbose           # solo protocollo, senza trasmettitore, senza root
 ```
 
@@ -626,6 +634,7 @@ hpsdr_rpitx_bridge.py --dry-run --verbose           # solo protocollo, senza tra
 | Trasmissione | I/Q TX dell'host finché MOX è attivo, sull'NCO TX (o RX1 quando il duplex è disattivato) |
 | CW | Keyer iambico A/B o tasto verticale con palette su GPIO e temporizzazione dell'host, CWX di HL2, ingresso PTT su GPIO |
 | Watchdog | Lo streaming si ferma e il TX viene rilasciato dopo `--host-timeout` s senza pacchetti dall'host |
+| Accesso | Si risponde solo agli host di `--allow`: `private` (predefinito: indirizzi di loopback, privati e link-local), `any`, oppure indirizzi / reti CIDR separati da virgole; solo l'host che ha avviato lo stream può attivare il trasmettitore; al massimo 4 connessioni TCP (la più vecchia inattiva lascia il posto) |
 
 Note: in SSB con il microfono muto non c'è portante (in modo `envelope` le ampiezze sotto 0,5 / (PAD + 1) del fondo
 scala spengono la portante; il bridge mostra un suggerimento). Con l'opzione *CW handled in Radio* di piHPSDR l'host non
@@ -912,14 +921,20 @@ viene risvegliato dall'alimentatore quando libera spazio.
 Finché esiste un trasmettitore, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, non sopravvive mai a un riavvio;
 directory privata) è tenuto con un `flock()` esclusivo e contiene un registro `chiave=valore` di tutto ciò che il
 processo possiede: PID, canale DMA e handle della memoria VideoCore (scritti appena la memoria è allocata e cancellati prima che sia
-rilasciata), valore
+rilasciata, insieme all'informazione se la maschera dei canali DMA del kernel era leggibile), valore
 originale dei pad e funzioni di GPIO4 e degli altri pin usati, clock PCM originale o stato del PWM, e l'albero dei clock
-(salvato e registrato prima della sua prima modifica). Il kernel rilascia il lock quando il processo muore, anche con `kill -9`. Il processo successivo che ottiene
+(salvato e registrato prima della sua prima modifica). Il registro termina con una riga `end=1`: ciò che segue
+(lasciato da un aggiornamento interrotto tra la scrittura di un registro più corto e il taglio del file) viene
+ignorato. Il kernel rilascia il lock quando il processo muore, anche con `kill -9`. Il processo successivo che ottiene
 il lock e trova un registro non vuoto sa che il proprietario è morto senza ripulire ed esegue il ripristino: reset del
 canale DMA, GPIO4 e pad ripristinati, GPCLK0 fermo, PCM disattivato e il suo clock ripristinato, albero dei clock
 ripristinato, PWM ripristinato e memoria GPU del processo morto liberata (gli handle VideoCore sono globali per il
 firmware). Prima il registro viene verificato: un canale DMA che non sia un canale classico del SoC o che appartenga
 al kernel, pin fuori da GPIO 0–27 o valori di clock non validi lo fanno **scartare** (segnalato, non si applica nulla).
+Quando la maschera DMA del kernel non è leggibile, il canale viene accettato solo se il registro indica che non era
+leggibile nemmeno quando il canale è stato allocato. Un registro senza il marcatore finale (scrittura interrotta, o
+registro di una versione precedente del driver) viene ripristinato, ma il suo handle di memoria VideoCore non viene
+liberato.
 `rpitx_reset` fa lo stesso su richiesta. Un processo creato con `fork()` senza `exec()` condivide il lock: finché quel
 figlio è vivo, il processo successivo viene informato che il lock è tenuto da un figlio del processo terminato.
 
@@ -927,9 +942,10 @@ figlio è vivo, il processo successivo viene informato che il lock è tenuto da 
 
 - un altro processo detiene il lock → "the transmitter is in use by process N";
 - GPIO4 (e GPIO20, i pin PCM 18/19/21 o il pin PWM quando usati) reclamato da un qualsiasi utilizzatore sul chip GPIO
-  del SoC (`pinctrl-bcm2…`, tramite le informazioni di linea del dispositivo a caratteri GPIO);
+  del SoC (`pinctrl-bcm2…`, tramite le informazioni di linea del dispositivo a caratteri GPIO, richiesta v2 con
+  ripiego v1; viene registrato un avviso quando nessuna risponde);
 - `soc/i2s@7e203000` abilitato nel device tree (salvo con `envelope_output=pwm`); con `envelope_output=pwm`,
-  `soc/pwm@7e20c000` o il nodo dell'audio analogico abilitati;
+  `soc/pwm@7e20c000` o il nodo dell'audio analogico abilitati (un nodo senza proprietà `status` conta come abilitato);
 - la directory o il file di lock non privati dell'utente che esegue il driver;
 - il canale DMA richiesto appartiene al kernel, oppure è attivo senza `dma_force`;
 - un avviso quando GPCLK0 è già in funzione (un altro programma potrebbe usarlo).
@@ -966,6 +982,9 @@ chiama mai `exit()`; ogni guasto hardware diventa una `std::runtime_error` che l
 | "PLLC did not report lock" | Frequenze molto alte possono non agganciare su tutti i chip; abbassare la frequenza o usare `harmonic` |
 | Console seriale / I2C / SPI disturbate durante la trasmissione | Previsto: il clock della VPU è su PLLA mentre lo stream è aperto (`gpu_freq=250` lo rende prevedibile) |
 | Portante bloccata dopo un crash | `sudo rpitx_reset` (o aprire qualsiasi stream): il registro di sessione viene ripristinato |
+| "the PLLA peripheral channel is not running" | Il firmware ha lasciato PLLA spento, quindi il clock della VPU non può lasciare PLLC; la scheda non può trasmettere con questo driver |
+| "the transmitter thread did not respond within 3 s" | Il thread alimentatore non ha avuto CPU (un altro task `SCHED_FIFO`?); la modifica non è stata applicata, ripeterla |
+| "not a regular file" / "writable by group or others" per un profilo | Usare un file regolare con modo 0644 (o più restrittivo) |
 | Nessuna portante in SSB con il bridge HPSDR | Microfono muto; vedere le note del bridge sopra |
 
 ---
@@ -985,8 +1004,8 @@ che esce dalla FIFO).
 |------|-------|
 | `rpitx_unit_tests` | Ordine della FIFO con concorrenza e limite di capacità; contabilità dell'anello contro un motore simulato (regime stabile, brevi blocchi, giri persi, doppio blocco, mancanza di dati dall'host, motore fermo senza giri attribuiti); stima di frequenza del DSP, soglia e continuità di fase attraverso lo zero; modello di ampiezza, tabelle, medie del sigma-delta, ritardo dell'inviluppo e allineamento inviluppo/fase, corrispondenza del codice EER |
 | `rpitx_devicetree_tests` | Base delle periferiche, limite dei canali DMA classici e maschera DMA del kernel con la nomenclatura vecchia e attuale del device tree |
-| `rpitx_transmitter_tests` | Alimentatore, pre-roll, svuotamento, retune con portante spenta e ripetizione dell'anello, arresto di emergenza seguito da distruzione, riavvio del DMA, isteresi dei pad, capacità della FIFO rispetto alla frequenza, errori del costruttore (frequenza irraggiungibile, allocazione rifiutata, anello corto), selezione del canale DMA (e nessuna ipotesi senza la maschera del kernel), lock di sessione e ripristino dopo i crash (pin, PWM), directory di lock privata, collegamento simbolico e registri non plausibili, registrazione anticipata dell'allocazione, gestori di segnale, avvio cadenzato del DMA, ritardo dell'inviluppo, sigma-delta, correzione AM/PM, RF-DAC, posizioni per campione, uscita d'inviluppo PCM e PWM con allineamento inviluppo/fase, fine del burst prima di un burst breve, ripetizione delle sole posizioni di dati (retune prima dell'avvio del DMA e dopo un intervallo inattivo), svuotamento durante un retune concorrente, rilascio registrato prima di liberare la memoria VideoCore |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: impostazioni e intervalli, analisi rigorosa dei numeri, impostazioni di ampiezza, correzione di frequenza, argomenti dello stream (compresa l'uscita d'inviluppo), scalatura CF32/CS16/CS8, svuotamento con `END_BURST`, `closeStream()` durante uno svuotamento, `activateStream()` su uno stream attivo, stato dello stream, sensori, file di profilo e `profile=` |
+| `rpitx_transmitter_tests` | Alimentatore, pre-roll, svuotamento, retune con portante spenta e ripetizione dell'anello, arresto di emergenza seguito da distruzione, riavvio del DMA, isteresi dei pad, capacità della FIFO rispetto alla frequenza, errori del costruttore (frequenza irraggiungibile, allocazione rifiutata, anello corto), selezione del canale DMA (e nessuna ipotesi senza la maschera del kernel), lock di sessione e ripristino dopo i crash (pin, PWM, maschera del kernel illeggibile, marcatore finale del registro, registro incompleto), directory di lock privata, collegamento simbolico e registri non plausibili, registrazione anticipata dell'allocazione, nodi del device tree senza `status`, gestori di segnale, avvio cadenzato del DMA, ritardo dell'inviluppo, sigma-delta, correzione AM/PM, RF-DAC, posizioni per campione, uscita d'inviluppo PCM e PWM con allineamento inviluppo/fase, fine del burst prima di un burst breve, ripetizione delle sole posizioni di dati (retune prima dell'avvio del DMA e dopo un intervallo inattivo), svuotamento durante un retune concorrente, rilascio registrato prima di liberare la memoria VideoCore |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: impostazioni e intervalli, analisi rigorosa dei numeri, impostazioni di ampiezza, correzione di frequenza, argomenti dello stream (compresa l'uscita d'inviluppo), scalatura CF32/CS16/CS8, svuotamento con `END_BURST`, `closeStream()` durante uno svuotamento, `activateStream()` su uno stream attivo, stato dello stream, sensori, file di profilo e `profile=`, controlli dei file di profilo (dispositivi, pipe, dimensione, permessi, collegamenti simbolici), interi e guadagni fuori intervallo, limiti dei timeout |
 
 La CI (`.github/workflows/ci.yml`) esegue i test in una compilazione normale, con AddressSanitizer +
 UndefinedBehaviorSanitizer e con ThreadSanitizer (`tests/tsan.supp` sopprime solo gli accessi ai registri simulati), e

@@ -32,6 +32,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 #include "SoapyRPITX_Session.hpp"
 #include "mailbox.hpp"
@@ -63,6 +64,7 @@ std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r) {
     std::ostringstream out;
     out << "pid=" << r.pid << '\n';
     out << "dma_channel=" << r.dmaChannel << '\n';
+    put(out, "dma_mask_known", r.dmaMaskKnown ? 1 : 0);
     put(out, "mem_handle", r.memHandle);
     put(out, "pads", r.pads);
     put(out, "gpio_function", r.gpioFunction);
@@ -97,11 +99,13 @@ std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r) {
         for (int i = 0; i < 4; i++)
             put(out, ("pllc_ana" + std::to_string(i)).c_str(), t.pllcAna[i]);
     }
+    out << "end=1\n";
     return out.str();
 }
 
 bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r) {
     r = SoapyRPITX_SessionRecord();
+    r.complete = false;
     bool havePid = false;
     int treeFields = 0;
     int pcmFields = 0;
@@ -114,6 +118,10 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
         if (eq == std::string::npos)
             continue;
         std::string key = line.substr(0, eq);
+        if (key == "end") {
+            r.complete = true;
+            break;
+        }
         char *end = nullptr;
         long long v = std::strtoll(line.c_str() + eq + 1, &end, 10);
         if (end == line.c_str() + eq + 1)
@@ -126,6 +134,8 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
             havePid = true;
         } else if (key == "dma_channel") {
             r.dmaChannel = (int) v;
+        } else if (key == "dma_mask_known") {
+            r.dmaMaskKnown = v != 0;
         } else if (key == "mem_handle") {
             r.memHandle = u;
         } else if (key == "pads") {
@@ -218,8 +228,14 @@ bool SoapyRPITX_RecordPlausible(const SoapyRPITX_SessionRecord &r, std::string &
         }
         bool known = false;
         uint32_t mask = bcm_host_get_kernel_dma_mask(&known);
-        if (!known || ((mask >> r.dmaChannel) & 1u) != 0) {
-            why = "DMA channel " + std::to_string(r.dmaChannel) + (known ? " is reserved for the kernel" : " cannot be checked against the kernel mask");
+        if (known && ((mask >> r.dmaChannel) & 1u) != 0) {
+            why = "DMA channel " + std::to_string(r.dmaChannel) + " is reserved for the kernel";
+            return false;
+        }
+        // A channel allocated while the mask was readable must still be checked against it; one allocated
+        // without a readable mask was selected explicitly under the same condition.
+        if (!known && r.dmaMaskKnown) {
+            why = "DMA channel " + std::to_string(r.dmaChannel) + " cannot be checked against the kernel mask";
             return false;
         }
     }
@@ -328,7 +344,9 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
         log << " clock restore failed (" << e.what() << ");";
     }
 
-    if (r.memHandle != 0) {
+    if (r.memHandle != 0 && !r.complete) {
+        log << " incomplete record, VideoCore memory handle " << r.memHandle << " not released;";
+    } else if (r.memHandle != 0) {
         int mb = mbox_open();
         if (mb >= 0) {
             mem_unlock(mb, r.memHandle);
@@ -344,7 +362,8 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
     return log.str();
 }
 
-bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer) {
+bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer, bool &checked) {
+    checked = false;
     for (int chip = 0; chip < 16; chip++) {
         std::string path = "/dev/gpiochip" + std::to_string(chip);
         int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -359,13 +378,30 @@ bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer) {
             continue;
         }
 
-        struct gpioline_info li;
-        memset(&li, 0, sizeof li);
-        li.line_offset = line;
         bool claimed = false;
-        if (ioctl(fd, GPIO_GET_LINEINFO_IOCTL, &li) == 0 && (li.flags & GPIOLINE_FLAG_KERNEL) != 0) {
-            claimed = true;
-            consumer.assign(li.consumer, strnlen(li.consumer, sizeof li.consumer));
+#ifdef GPIO_V2_GET_LINEINFO_IOCTL
+        struct gpio_v2_line_info li2;
+        memset(&li2, 0, sizeof li2);
+        li2.offset = line;
+        if (ioctl(fd, GPIO_V2_GET_LINEINFO_IOCTL, &li2) == 0) {
+            checked = true;
+            if ((li2.flags & GPIO_V2_LINE_FLAG_USED) != 0) {
+                claimed = true;
+                consumer.assign(li2.consumer, strnlen(li2.consumer, sizeof li2.consumer));
+            }
+        }
+#endif
+        if (!checked) {
+            struct gpioline_info li;
+            memset(&li, 0, sizeof li);
+            li.line_offset = line;
+            if (ioctl(fd, GPIO_GET_LINEINFO_IOCTL, &li) == 0) {
+                checked = true;
+                if ((li.flags & GPIOLINE_FLAG_KERNEL) != 0) {
+                    claimed = true;
+                    consumer.assign(li.consumer, strnlen(li.consumer, sizeof li.consumer));
+                }
+            }
         }
         close(fd);
         return claimed;
@@ -373,12 +409,20 @@ bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer) {
     return false;
 }
 
+std::string SoapyRPITX_ErrnoText(int err) {
+    return std::generic_category().message(err);
+}
+
 namespace {
 
-bool nodeEnabled(const char *path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
+// A device-tree node without a status property is enabled.
+bool nodeEnabled(const char *node) {
+    struct stat st;
+    if (stat(node, &st) != 0 || !S_ISDIR(st.st_mode))
         return false;
+    std::ifstream in(std::string(node) + "/status", std::ios::binary);
+    if (!in)
+        return true;
     std::string status;
     std::getline(in, status, '\0');
     return status == "okay" || status == "ok";
@@ -397,10 +441,10 @@ std::string lockOwner(int fd) {
 
 void checkPrivateDirectory(const std::string &dir) {
     if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST)
-        throw std::runtime_error("rpitx: cannot create the lock directory " + dir + ": " + strerror(errno));
+        throw std::runtime_error("rpitx: cannot create the lock directory " + dir + ": " + SoapyRPITX_ErrnoText(errno));
     struct stat st;
     if (lstat(dir.c_str(), &st) != 0)
-        throw std::runtime_error("rpitx: cannot access the lock directory " + dir + ": " + strerror(errno));
+        throw std::runtime_error("rpitx: cannot access the lock directory " + dir + ": " + SoapyRPITX_ErrnoText(errno));
     if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) != 0)
         throw std::runtime_error("rpitx: the lock directory " + dir + " must be a directory owned by the user running the driver, with mode 0700");
 }
@@ -408,12 +452,11 @@ void checkPrivateDirectory(const std::string &dir) {
 } // namespace
 
 bool SoapyRPITX_I2sEnabled() {
-    return nodeEnabled(RPITX_DT_ROOT "/soc/i2s@7e203000/status");
+    return nodeEnabled(RPITX_DT_ROOT "/soc/i2s@7e203000");
 }
 
 bool SoapyRPITX_PwmEnabled() {
-    return nodeEnabled(RPITX_DT_ROOT "/soc/pwm@7e20c000/status") || nodeEnabled(RPITX_DT_ROOT "/soc/audio/status") ||
-           nodeEnabled(RPITX_DT_ROOT "/audio/status");
+    return nodeEnabled(RPITX_DT_ROOT "/soc/pwm@7e20c000") || nodeEnabled(RPITX_DT_ROOT "/soc/audio") || nodeEnabled(RPITX_DT_ROOT "/audio");
 }
 
 SoapyRPITX_Session::SoapyRPITX_Session(unsigned gpioLine) {
@@ -421,7 +464,7 @@ SoapyRPITX_Session::SoapyRPITX_Session(unsigned gpioLine) {
     std::string path = LockPath();
     fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0)
-        throw std::runtime_error("rpitx: cannot open the lock file " + path + ": " + strerror(errno));
+        throw std::runtime_error("rpitx: cannot open the lock file " + path + ": " + SoapyRPITX_ErrnoText(errno));
 
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1) {
@@ -437,21 +480,28 @@ SoapyRPITX_Session::SoapyRPITX_Session(unsigned gpioLine) {
         fd = -1;
         if (err == EWOULDBLOCK)
             throw std::runtime_error("rpitx: the transmitter is in use" + owner + " (" + path + ")");
-        throw std::runtime_error("rpitx: cannot lock " + path + ": " + strerror(err));
+        throw std::runtime_error("rpitx: cannot lock " + path + ": " + SoapyRPITX_ErrnoText(err));
     }
 
-    SoapyRPITX_SessionRecord stale;
-    if (SoapyRPITX_ParseRecord(readAll(fd), stale)) {
-        std::string why;
-        if (SoapyRPITX_RecordPlausible(stale, why)) {
-            report = SoapyRPITX_RecoverHardware(stale, gpioLine);
-            recovered = true;
-        } else {
-            report = "process " + std::to_string(stale.pid) + ": " + why;
-            discarded = true;
+    try {
+        SoapyRPITX_SessionRecord stale;
+        if (SoapyRPITX_ParseRecord(readAll(fd), stale)) {
+            std::string why;
+            if (SoapyRPITX_RecordPlausible(stale, why)) {
+                report = SoapyRPITX_RecoverHardware(stale, gpioLine);
+                recovered = true;
+            } else {
+                report = "process " + std::to_string(stale.pid) + ": " + why;
+                discarded = true;
+            }
         }
+        Clear();
+    } catch (...) {
+        // The destructor does not run for a partly constructed object: closing the file releases the lock.
+        close(fd);
+        fd = -1;
+        throw;
     }
-    Clear();
 }
 
 SoapyRPITX_Session::~SoapyRPITX_Session() {
@@ -481,17 +531,17 @@ void SoapyRPITX_Session::Write(const SoapyRPITX_SessionRecord &r) {
     // empty record while the transmitter owns hardware.
     ssize_t n = pwrite(fd, text.data(), text.size(), 0);
     if (n < 0)
-        std::fprintf(stderr, "rpitx: cannot write %s: %s\n", LockPath().c_str(), strerror(errno));
+        std::fprintf(stderr, "rpitx: cannot write %s: %s\n", LockPath().c_str(), SoapyRPITX_ErrnoText(errno).c_str());
     else if ((size_t) n != text.size())
         std::fprintf(stderr, "rpitx: cannot write %s: short write (%zd of %zu bytes)\n", LockPath().c_str(), n, text.size());
     else if (ftruncate(fd, (off_t) text.size()) != 0)
-        std::fprintf(stderr, "rpitx: cannot truncate %s: %s\n", LockPath().c_str(), strerror(errno));
+        std::fprintf(stderr, "rpitx: cannot truncate %s: %s\n", LockPath().c_str(), SoapyRPITX_ErrnoText(errno).c_str());
     fdatasync(fd);
 }
 
 void SoapyRPITX_Session::Clear() {
     if (ftruncate(fd, 0) != 0)
-        std::fprintf(stderr, "rpitx: cannot clear %s: %s\n", LockPath().c_str(), strerror(errno));
+        std::fprintf(stderr, "rpitx: cannot clear %s: %s\n", LockPath().c_str(), SoapyRPITX_ErrnoText(errno).c_str());
 }
 
 std::string SoapyRPITX_Session::LockPath() {

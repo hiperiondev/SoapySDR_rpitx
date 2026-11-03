@@ -151,12 +151,12 @@ void testStreaming() {
     // Retune while streaming.
     SoapyRPITX_TuneConfig t = tx.GetTune();
     t.frequency = 145.5e6;
-    CHECK(tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
     CHECK(tx.GetTune().frequency == 145.5e6);
 
     // An unreachable frequency is rejected and the previous one stays.
     t.frequency = 5e9;
-    CHECK(!tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
     CHECK(tx.GetTune().frequency == 145.5e6);
 
     tx.Stop();
@@ -228,7 +228,7 @@ void testRetuneCarrierOffAndReplay() {
     });
     SoapyRPITX_TuneConfig t = tx.GetTune();
     t.frequency = 50.0e6;
-    CHECK(tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
     stop.store(true);
     monitor.join();
     CHECK(unsafe.load() == 0);
@@ -411,7 +411,7 @@ void testDmaRestartAndPads() {
     size_t before = tx.FifoCapacity();
     SoapyRPITX_TuneConfig t = tx.GetTune();
     t.sampleRate = 2 * kRate;
-    CHECK(tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
     CHECK(tx.FifoCapacity() == 2 * before);
     CHECK(std::fabs(tx.GetActualSampleRate() - 2 * kRate) < 2 * kRate * 1e-4);
     tx.Stop();
@@ -866,7 +866,7 @@ void testRetuneBeforeDmaStartKeepsData() {
     CHECK(!tx.GetStats().dmaRunning);
     SoapyRPITX_TuneConfig t = tx.GetTune();
     t.frequency = 145.0e6;
-    CHECK(tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
     tx.EndBurst();
     CHECK(tx.WaitDrained(3000000));
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -887,7 +887,7 @@ void testRetuneAfterGapKeepsData() {
     CHECK(tx.Write(second.data(), second.size(), 1000000) == second.size());
     SoapyRPITX_TuneConfig t = tx.GetTune();
     t.frequency = 145.0e6;
-    CHECK(tx.Retune(t));
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
     tx.EndBurst();
     CHECK(tx.WaitDrained(3000000));
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -911,7 +911,7 @@ void testDrainDuringRetune() {
             std::this_thread::sleep_for(std::chrono::milliseconds(60 + 20 * round));
             SoapyRPITX_TuneConfig t = tx.GetTune();
             t.frequency = round % 2 ? 144.8e6 : 145.0e6;
-            CHECK(tx.Retune(t));
+            CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
         });
         CHECK(tx.WaitDrained(3000000));
         size_t onAtDrain = carrierOn(engine.Take());
@@ -937,6 +937,116 @@ void testReleaseRecordedBeforeFree() {
     });
     { SoapyRPITX_IQ_dmaSync tx(baseConfig()); }
     CHECK(checked && clear);
+}
+
+void testRecordFormat() {
+    SoapyRPITX_SessionRecord r;
+    r.pid = 77;
+    r.dmaChannel = 7;
+    r.dmaMaskKnown = false;
+    r.memHandle = 5;
+    const std::string text = SoapyRPITX_FormatRecord(r);
+    SoapyRPITX_SessionRecord parsed;
+    CHECK(SoapyRPITX_ParseRecord(text, parsed) && parsed.complete && !parsed.dmaMaskKnown && parsed.dmaChannel == 7);
+
+    // Text after the end marker (the tail of a longer record) is ignored.
+    CHECK(SoapyRPITX_ParseRecord(text + "dma_channel=3\nmem_handle=99\n", parsed) && parsed.complete && parsed.dmaChannel == 7 && parsed.memHandle == 5);
+
+    // A record without the end marker is reported as incomplete; one without the mask flag keeps the default.
+    CHECK(SoapyRPITX_ParseRecord("pid=1\ndma_channel=7\n", parsed) && !parsed.complete && parsed.dmaMaskKnown);
+
+    // With an unreadable kernel mask, only a channel allocated under the same condition is accepted.
+    std::string why;
+    MockSetKernelDmaMask(0, false);
+    r.dmaMaskKnown = true;
+    CHECK(!SoapyRPITX_RecordPlausible(r, why));
+    r.dmaMaskKnown = false;
+    CHECK(SoapyRPITX_RecordPlausible(r, why));
+    MockSetKernelDmaMask(0, true);
+}
+
+void testUnknownMaskRecovery() {
+    MockSetKernelDmaMask(0, false);
+
+    // A transmitter on an explicit channel records that the mask could not be read.
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.dmaChannel = 7;
+    {
+        SoapyRPITX_IQ_dmaSync tx(cfg);
+        std::ifstream in(SoapyRPITX_Session::LockPath());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        SoapyRPITX_SessionRecord own;
+        CHECK(SoapyRPITX_ParseRecord(text, own) && own.dmaChannel == 7 && !own.dmaMaskKnown);
+    }
+
+    // The record of such a transmitter left by a terminated process is recovered.
+    volatile uint32_t *dmaRegs = MockRegisters(DMA_BASE);
+    dmaRegs[DMA_CS + 7 * DMA_CHANNEL_WORDS] = DMA_CS_ACTIVE;
+    unsigned leaked = MockAllocate(4096);
+    SoapyRPITX_SessionRecord r;
+    r.pid = 999998;
+    r.dmaChannel = 7;
+    r.dmaMaskKnown = false;
+    r.memHandle = leaked;
+    r.pads = kDefaultPads;
+    {
+        std::ofstream out(SoapyRPITX_Session::LockPath(), std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.Recovered() && !s.Discarded());
+        CHECK((dmaRegs[DMA_CS + 7 * DMA_CHANNEL_WORDS] & DMA_CS_ACTIVE) == 0);
+        CHECK(!MockAllocated(leaked));
+    }
+    MockSetKernelDmaMask(0, true);
+}
+
+void testIncompleteRecordKeepsMemory() {
+    unsigned handle = MockAllocate(4096);
+    SoapyRPITX_SessionRecord r;
+    r.pid = 999997;
+    r.memHandle = handle;
+    r.pads = kDefaultPads;
+    std::string text = SoapyRPITX_FormatRecord(r);
+    text.erase(text.find("end=1"));
+    {
+        std::ofstream out(SoapyRPITX_Session::LockPath(), std::ios::trunc);
+        out << text;
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.Recovered());
+        CHECK(s.RecoveryReport().find("not released") != std::string::npos);
+        CHECK(MockAllocated(handle));
+    }
+    mem_free(0, handle);
+}
+
+void testDeviceTreeStatus() {
+    const std::string soc = std::string(RPITX_DT_ROOT) + "/soc";
+    const std::string node = soc + "/i2s@7e203000";
+    bool createdSoc = mkdir(soc.c_str(), 0755) == 0;
+    CHECK(mkdir(node.c_str(), 0755) == 0);
+
+    // A node without a status property is enabled.
+    CHECK(SoapyRPITX_I2sEnabled());
+    {
+        std::ofstream st(node + "/status", std::ios::binary);
+        st << "disabled" << '\0';
+    }
+    CHECK(!SoapyRPITX_I2sEnabled());
+    {
+        std::ofstream st(node + "/status", std::ios::binary);
+        st << "okay" << '\0';
+    }
+    CHECK(SoapyRPITX_I2sEnabled());
+
+    unlink((node + "/status").c_str());
+    rmdir(node.c_str());
+    if (createdSoc)
+        rmdir(soc.c_str());
+    CHECK(!SoapyRPITX_I2sEnabled());
 }
 
 } // namespace
@@ -967,6 +1077,10 @@ int main() {
     testRetuneAfterGapKeepsData();
     testDrainDuringRetune();
     testReleaseRecordedBeforeFree();
+    testRecordFormat();
+    testUnknownMaskRecovery();
+    testIncompleteRecordKeepsMemory();
+    testDeviceTreeStatus();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

@@ -23,7 +23,9 @@
 #     frequency when the host clears the duplex bit);
 #   - radio side CW: internal iambic/straight keyer fed by optional GPIO paddles, Hermes-Lite 2 CWX keying
 #     carried in the I sample LSB, and a PTT input;
-#   - host watchdog: streaming stops and the transmitter is released when the host goes silent.
+#   - host watchdog: streaming stops and the transmitter is released when the host goes silent;
+#   - access control: only hosts of the --allow networks are answered (default: loopback, private and link-local
+#     addresses), and only the host that started the stream can key the transmitter.
 # Firmware programming, flash erase and IP address change requests are recognised and ignored.
 #
 # Protocol 1 hosts pace their TX stream on the receive stream of the radio (one microphone sample per receive
@@ -34,6 +36,7 @@
 
 import argparse
 import collections
+import ipaddress
 import math
 import os
 import queue
@@ -57,6 +60,7 @@ SAMPLES_PER_EP2_FRAME = 63
 RX_RATES = (48000, 96000, 192000, 384000)
 EP4_SAMPLES = 512  # 16-bit wideband samples per EP4 packet
 EP4_PACKETS_PER_BLOCK = 32
+MAX_TCP_CLIENTS = 4  # simultaneous Protocol 1 TCP connections
 
 
 class Board:
@@ -106,6 +110,45 @@ def parse_kwargs(text, option):
             raise SystemExit("%s: invalid item '%s' (expected key=value)" % (option, item))
         out[key.strip()] = value.strip()
     return out
+
+
+def parse_allow(text):
+    """Parses the --allow list: 'any', 'private', or comma-separated addresses / networks (CIDR).
+
+    Returns None for 'any', otherwise a list whose items are ip_network objects or the string 'private'.
+    """
+    items = [t.strip() for t in text.split(",") if t.strip()]
+    if not items:
+        raise argparse.ArgumentTypeError("empty --allow list")
+    if "any" in items:
+        return None
+    out = []
+    for item in items:
+        if item == "private":
+            out.append(item)
+            continue
+        try:
+            out.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            raise argparse.ArgumentTypeError("invalid address or network '%s' in --allow" % item)
+    return out
+
+
+def address_allowed(allow, host):
+    """Tells whether @host (an IP address string) belongs to the parsed --allow list @allow."""
+    if allow is None:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    for item in allow:
+        if item == "private":
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return True
+        elif ip.version == item.version and ip in item:
+            return True
+    return False
 
 
 def parse_mac(text):
@@ -890,7 +933,8 @@ class Bridge:
             self.tcp_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.tcp_listen.bind((args.bind, args.port))
             self.tcp_listen.listen(2)
-        self.tcp_clients = {}  # socket -> (address, receive buffer, HostLink)
+        self.tcp_clients = {}  # socket -> (address, receive buffer, HostLink), oldest first
+        self.refused_hosts = set()  # addresses already reported as refused by --allow
 
         self.link = None
         self.streaming = False
@@ -1037,7 +1081,8 @@ class Bridge:
             elif len(data) >= 4 and data[3] in (0x01, 0x02):
                 print("firmware %s request from %s ignored" % ("programming" if data[3] == 0x01 else "erase", link.describe()))
         elif cmd == 0x01 and len(data) == PACKET_LEN and data[3] == 0x02:
-            if self.link is None or link.same(self.link):
+            # Only the host that started the stream drives the transmitter.
+            if self.link is not None and link.same(self.link):
                 self.last_host_packet = time.monotonic()
                 self.handle_ep2(data)
 
@@ -1271,8 +1316,33 @@ class Bridge:
 
     # ---- TCP ----
 
+    def _allowed(self, addr):
+        if address_allowed(self.args.allow, addr[0]):
+            return True
+        if addr[0] not in self.refused_hosts:
+            self.refused_hosts.add(addr[0])
+            print("ignoring %s: not in the --allow networks" % addr[0])
+        return False
+
     def _accept_tcp(self):
-        sock, addr = self.tcp_listen.accept()
+        try:
+            sock, addr = self.tcp_listen.accept()
+        except OSError as e:  # for example EMFILE, or a connection reset before it was accepted
+            print("TCP accept failed: %s" % e, file=sys.stderr)
+            return
+        if not self._allowed(addr):
+            sock.close()
+            return
+        if len(self.tcp_clients) >= MAX_TCP_CLIENTS:
+            # The oldest connection that is not streaming makes room for the new one.
+            for old in list(self.tcp_clients):
+                if self.link is None or self.link.tcp_sock is not old:
+                    print("TCP connection from %s:%d closed: too many connections" % self.tcp_clients[old][0])
+                    self._close_tcp(old)
+                    break
+        if len(self.tcp_clients) >= MAX_TCP_CLIENTS:
+            sock.close()
+            return
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.tcp_clients[sock] = (addr, bytearray(), HostLink(tcp_sock=sock, addr=addr))
         print("TCP connection from %s:%d" % addr)
@@ -1358,7 +1428,7 @@ class Bridge:
                 for sock in ready:
                     if sock is self.udp:
                         data, addr = self.udp.recvfrom(2048)
-                        if len(data) >= 3 and data[0] == 0xEF and data[1] == 0xFE:
+                        if len(data) >= 3 and data[0] == 0xEF and data[1] == 0xFE and self._allowed(addr):
                             link = self.link if self.link is not None and not self.link.is_tcp and self.link.addr == addr else None
                             self.handle_command(data, link or HostLink(udp_sock=self.udp, addr=addr))
                     elif sock is self.tcp_listen:
@@ -1432,6 +1502,9 @@ def main():
     p.add_argument("--host-timeout", type=float, default=3.0, help="seconds without host packets before streaming stops (0 = never)")
     p.add_argument("--no-tcp", dest="tcp", action="store_false", help="do not accept Protocol 1 over TCP")
     p.add_argument("--bind", default="0.0.0.0", help="local address to listen on")
+    p.add_argument("--allow", type=parse_allow, default="private",
+                   help="hosts answered: 'any', 'private' (loopback, private and link-local addresses) and/or "
+                        "comma-separated addresses or CIDR networks, e.g. '192.168.1.0/24,10.0.0.5'")
     p.add_argument("--port", type=int, default=HPSDR_PORT, help="UDP and TCP port")
     p.add_argument("--report", type=float, default=2.0, help="status report period in seconds (0 = off)")
     p.add_argument("--verbose", action="store_true", help="print every change of the host C&C settings")

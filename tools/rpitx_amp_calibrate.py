@@ -265,9 +265,12 @@ class Transmitter:
             done += max(sr.ret, 0)
 
     def close(self):
-        self.dev.writeStream(self.stream, [np.zeros(0, np.complex64)], 0, self.SoapySDR.SOAPY_SDR_END_BURST)
-        self.dev.deactivateStream(self.stream)
-        self.dev.closeStream(self.stream)
+        # The stream is closed even when the burst end cannot be written.
+        try:
+            self.dev.writeStream(self.stream, [np.zeros(0, np.complex64)], 0, self.SoapySDR.SOAPY_SDR_END_BURST)
+            self.dev.deactivateStream(self.stream)
+        finally:
+            self.dev.closeStream(self.stream)
 
 
 def measure(a, SoapySDR, dev_args, stream_args, states, apply_state):
@@ -280,9 +283,9 @@ def measure(a, SoapySDR, dev_args, stream_args, states, apply_state):
     for s in states:
         sequence += ["ref", s]
     sequence.append("ref")
-    rx.start()
-    time.sleep(0.3)
     try:
+        rx.start()
+        time.sleep(0.3)
         for s in sequence:
             mag = apply_state(tx, s)
             tx.send(np.full(n, mag, np.complex64))

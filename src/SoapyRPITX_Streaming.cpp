@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <complex>
 #include <initializer_list>
 #include <stdexcept>
@@ -402,7 +403,7 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
         return 0;
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;
 
     // The return value is an int: larger requests are accepted partially.
@@ -433,7 +434,7 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
         long remainingUs = 0;
         if (timeoutUs > 0) {
             auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-            remainingUs = left > 0 ? (long) left : 0;
+            remainingUs = left > 0 ? (long) std::min<long long>((long long) left, (long long) LONG_MAX) : 0;
         }
 
         size_t w = iqsender->Write(scratch.data(), n, remainingUs);
@@ -456,7 +457,7 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
 }
 
 int tx_streamer::readStatus(size_t &chanMask, int &flags, long long &, long timeoutUs) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
 
     for (;;) {
         SoapyRPITX_TxStats stats = iqsender->GetStats();

@@ -58,6 +58,7 @@
 struct SoapyRPITX_SessionRecord {
     long pid = 0;                                            ///< Process that owned the transmitter.
     int dmaChannel = -1;                                     ///< DMA channel in use (-1 when none was allocated).
+    bool dmaMaskKnown = true;                                ///< The kernel DMA channel mask was readable when @ref dmaChannel was allocated.
     unsigned memHandle = 0;                                  ///< VideoCore memory handle (0 when none was allocated).
     uint32_t pads = 0x1B;                                    ///< PADS_GPIO_0 value (drive, hysteresis, slew) to restore.
     uint32_t gpioFunction = 0;                               ///< Function-select code to restore on the RF output GPIO.
@@ -72,6 +73,7 @@ struct SoapyRPITX_SessionRecord {
     uint32_t pwmCtl = 0;                                     ///< Original PWM_CTL.
     uint32_t pwmRng = 0;                                     ///< Original PWM_RNG1.
     uint32_t pwmDmac = 0;                                    ///< Original PWM_DMAC.
+    bool complete = true;                                    ///< The record text ended with its end marker (set by SoapyRPITX_ParseRecord()).
 };
 
 /**
@@ -91,7 +93,9 @@ uint32_t SoapyRPITX_RestoredFunction(unsigned pin, uint32_t function);
  *
  * The DMA channel must be a legacy channel of the SoC not reserved for the kernel, the GPIOs must be in
  * 0-27, the pad value must only hold drive, hysteresis and slew, and the saved clock generators must use a
- * valid source.
+ * valid source. When the kernel DMA channel mask cannot be read, a channel is accepted only when the record
+ * states that the mask could not be read when the channel was allocated either (a channel selected
+ * explicitly by the application under the same condition).
  *
  * @param r   Record.
  * @param why Receives the reason when the record is refused.
@@ -102,12 +106,16 @@ bool SoapyRPITX_RecordPlausible(const SoapyRPITX_SessionRecord &r, std::string &
 /**
  * @brief Formats a record as the text stored in the lock file.
  * @param r Record.
- * @return "key=value" lines.
+ * @return "key=value" lines, the last one being the end marker "end=1".
  */
 std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r);
 
 /**
  * @brief Parses the text stored in the lock file.
+ *
+ * Parsing stops at the end marker: text after it (left by an interrupted update of a longer record) is
+ * ignored. A record without the end marker is returned with @ref SoapyRPITX_SessionRecord::complete false.
+ *
  * @param text Lock-file contents.
  * @param r    Receives the record.
  * @return True when the text holds a record (at least the pid).
@@ -120,8 +128,9 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
  * Resets the DMA channel, switches the RF output GPIO and the other recorded GPIOs to their recorded function
  * (input instead of a clock output, see SoapyRPITX_RestoredFunction()), restores the pads, stops GPCLK0,
  * disables the PCM block and restores its clock (when it was used), stops the PWM block and restores it (when it
- * was used), restores the clock tree
- * and releases the VideoCore memory. Every step is attempted even when an earlier one fails.
+ * was used), restores the clock tree and releases the VideoCore memory. The VideoCore memory is released only
+ * for a complete record: freeing a handle that may belong to another VideoCore client is never attempted.
+ * Every step is attempted even when an earlier one fails.
  *
  * @param r   Record left by the terminated process.
  * @param gpioLine RF output GPIO.
@@ -132,25 +141,36 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
 /**
  * @brief Tells whether a GPIO line of the SoC GPIO controller is claimed by a driver or a program.
  *
- * Uses the GPIO character device (/dev/gpiochipN whose label starts with "pinctrl-bcm2").
+ * Uses the GPIO character device (/dev/gpiochipN whose label starts with "pinctrl-bcm2"), with the v2 line
+ * information request and, when the kernel does not provide it, the v1 request.
  *
  * @param line     GPIO number.
  * @param consumer Receives the consumer name (may be empty) when the line is claimed.
+ * @param checked  Receives true when the line state could be queried, false when no SoC GPIO controller was
+ *                 found or both requests failed.
  * @return True when the line is claimed; false when it is free or cannot be queried.
  */
-bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer);
+bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer, bool &checked);
 
 /**
  * @brief Tells whether the device tree enables the PCM/I2S controller for a sound card or another driver.
- * @return True when the i2s node status is "okay".
+ * @return True when the i2s node exists and its status is "okay" or "ok", or it has no status property.
  */
 bool SoapyRPITX_I2sEnabled();
 
 /**
  * @brief Tells whether the device tree enables a user of the PWM block (PWM driver or analogue audio).
- * @return True when the pwm node or the audio node has status "okay".
+ * @return True when the pwm node or the audio node exists and has status "okay" or "ok", or no status
+ *         property.
  */
 bool SoapyRPITX_PwmEnabled();
+
+/**
+ * @brief Returns the text of an error number (thread safe).
+ * @param err errno value.
+ * @return Description of the error.
+ */
+std::string SoapyRPITX_ErrnoText(int err);
 
 /**
  * @brief Exclusive, system-wide claim of the transmitter hardware.
@@ -168,6 +188,9 @@ class SoapyRPITX_Session {
 public:
     /**
      * @brief Acquires the lock and recovers a stale record.
+     *
+     * When an exception leaves the constructor the lock file is closed, which releases the lock.
+     *
      * @param gpioLine RF output GPIO (used by the recovery).
      * @throws std::runtime_error when the lock directory or file is not private to the effective user, the
      *         lock file cannot be opened, or another running process holds it.

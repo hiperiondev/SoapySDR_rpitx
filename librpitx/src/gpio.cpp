@@ -494,6 +494,14 @@ void clkgpio::SaveClockTree() {
 }
 
 void clkgpio::SetAdvancedPllMode(bool Advanced) {
+    if (Advanced) {
+        // The VPU clock is moved to the PLLA peripheral channel: it must be running, or the VPU would stop.
+        const bool plladisabled = (gpioreg[PLLA_PER] & A2W_PLL_CHANNEL_DISABLE) != 0;
+        if (plladisabled || cm_pll_frequency(gpioreg, clk_plla, XOSC_FREQUENCY, pi_is_2711, 0) == 0)
+            throw std::runtime_error("librpitx: the PLLA peripheral channel is not running; the VPU clock cannot be moved off PLLC");
+        if ((gpioreg[CM_LOCK] & CM_LOCK_FLOCKA) == 0)
+            dbg_printf(0, "Warning: PLLA does not report lock\n");
+    }
     ModulateFromMasterPLL = Advanced;
     if (ModulateFromMasterPLL) {
         SaveClockTree();
@@ -569,8 +577,10 @@ void clkgpio::SetppmFromNTP() {
     ntx.modes = 0; // read only
     int status = ntp_adjtime(&ntx);
 
-    if (status != TIME_OK) {
-        dbg_printf(1, "Warning: NTP calibrate failed\n");
+    // The frequency estimate is valid in every clock state except an unsynchronised clock (TIME_ERROR or
+    // STA_UNSYNC); the leap-second states (TIME_INS, TIME_DEL, TIME_OOP, TIME_WAIT) keep it.
+    if (status < 0 || status == TIME_ERROR || (ntx.status & STA_UNSYNC) != 0) {
+        dbg_printf(1, "Warning: NTP frequency estimate not available\n");
     } else {
         double ntp_ppm = (double) ntx.freq / (double) (1 << 16);
         dbg_printf(1, "Info:NTP find offset %ld freq %ld pps=%ld ppm=%f\n", (long) ntx.offset, (long) ntx.freq, (long) ntx.ppsfreq, ntp_ppm);

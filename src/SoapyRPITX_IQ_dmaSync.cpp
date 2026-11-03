@@ -38,6 +38,7 @@
 
 #include <SoapySDR/Logger.hpp>
 
+#include "rpi.hpp"
 #include "util.hpp"
 #include "SoapyRPITX_IQ_dmaSync.hpp"
 
@@ -223,9 +224,12 @@ SoapyRPITX_HardwareClaim::SoapyRPITX_HardwareClaim(const SoapyRPITX_TxConfig &cf
         checked.insert(checked.begin(), RPITX_TX_GPIO);
         for (unsigned pin : checked) {
             std::string consumer;
-            if (SoapyRPITX_GpioLineClaimed(pin, consumer))
+            bool queried = false;
+            if (SoapyRPITX_GpioLineClaimed(pin, consumer, queried))
                 throw std::runtime_error("rpitx: GPIO" + std::to_string(pin) + " is claimed by '" + consumer +
                                          "'; disable the overlay or program that uses it (for example w1-gpio)");
+            if (!queried)
+                SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: cannot check whether GPIO%u is used by a driver (no GPIO character device answered)", pin);
         }
         if (cfg.envelopeOutput != SoapyRPITX_EnvelopeOutput::Pwm && SoapyRPITX_I2sEnabled())
             throw std::runtime_error("rpitx: the PCM/I2S controller is enabled in the device tree (sound card overlay or dtparam=i2s=on); "
@@ -258,7 +262,11 @@ SoapyRPITX_HardwareClaim::~SoapyRPITX_HardwareClaim() {
 }
 
 void SoapyRPITX_HardwareClaim::RecordDmaAllocation(int channel, unsigned memHandle) {
+    bool known = false;
+    if (channel >= 0)
+        bcm_host_get_kernel_dma_mask(&known);
     record.dmaChannel = channel;
+    record.dmaMaskKnown = channel < 0 || known;
     record.memHandle = memHandle;
     PublishRecord();
 }
@@ -476,8 +484,16 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
         pacingError = pcmgpio::SetFrequency(rate);
     if (pacingError != 0) {
         // Checked above with the same clock source and correction: only reached when the hardware changed.
-        SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA pacing clock cannot run at %u Hz; the carrier PLL is already reprogrammed", rate);
-        return rollback();
+        // The carrier PLL goes back to the configuration still in effect, so that the hardware matches it.
+        SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA pacing clock cannot run at %u Hz; the previous carrier frequency is restored", rate);
+        rollback();
+        if (slotRate > 0) {
+            const int previousBandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) slotRate);
+            const uint64_t previousPll = (uint64_t) std::llround(tuneCfg.frequency / tuneCfg.harmonic);
+            if (clkgpio::SetCenterFrequency(previousPll, previousBandwidth) != 0)
+                SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the previous carrier frequency %.0f Hz cannot be restored", tuneCfg.frequency);
+        }
+        return false;
     }
 
     slotRate = rate;
@@ -829,7 +845,7 @@ size_t SoapyRPITX_IQ_dmaSync::Write(const std::complex<float> *samples, size_t n
     // A new burst starts: the previous burst end no longer applies to the samples queued from now on.
     endBurst.store(false);
 
-    const auto deadline = clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;
 
     while (done < n) {
@@ -858,7 +874,7 @@ void SoapyRPITX_IQ_dmaSync::EndBurst() {
 }
 
 bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
-    const auto deadline = clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     while (active.load()) {
         // The feeder publishes the push count up to which everything has been played; samples pushed later
         // make the counts differ.
@@ -871,13 +887,13 @@ bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
     return false;
 }
 
-bool SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
+SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
     if (!running.load()) {
         // Feeder not running: the DMA is stopped and the hardware can be reprogrammed directly.
-        bool ok = ApplyTune(tune);
-        if (ok)
-            ResetRing();
-        return ok;
+        if (!ApplyTune(tune))
+            return SoapyRPITX_RetuneResult::Refused;
+        ResetRing();
+        return SoapyRPITX_RetuneResult::Ok;
     }
 
     std::unique_lock<std::mutex> lock(tuneMutex);
@@ -889,10 +905,10 @@ bool SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
     if (tuneTakenSeq < seq) {
         // Not taken in time: withdraw the request, nothing was changed.
         tunePending = false;
-        return false;
+        return SoapyRPITX_RetuneResult::Timeout;
     }
     tuneCv.wait(lock, [&] { return tuneDoneSeq >= seq || feederExited.load(); });
-    return tuneDoneSeq >= seq && tuneResult;
+    return tuneDoneSeq >= seq && tuneResult ? SoapyRPITX_RetuneResult::Ok : SoapyRPITX_RetuneResult::Refused;
 }
 
 void SoapyRPITX_IQ_dmaSync::SetDriveLevel(int level) {

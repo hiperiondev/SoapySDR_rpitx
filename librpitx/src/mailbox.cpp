@@ -31,6 +31,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <system_error>
+
 #include "mailbox.hpp"
 #include "util.hpp"
 
@@ -49,14 +51,15 @@ void *mapmem(unsigned base, unsigned size) {
     unsigned offset = base % system_page_size();
     base = base - offset;
     if ((mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC)) < 0) {
-        dbg_printf(0, "can't open /dev/mem: %s\n", strerror(errno));
+        dbg_printf(0, "can't open /dev/mem: %s\n", std::generic_category().message(errno).c_str());
         return NULL;
     }
     void *mem = mmap(0, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, base);
+    int mmapErr = errno;
     close(mem_fd);
     dbg_printf(2, "base=0x%x, mem=%p\n", base, mem);
     if (mem == MAP_FAILED) {
-        dbg_printf(0, "mmap error at 0x%x (size %u): %s\n", base, size, strerror(errno));
+        dbg_printf(0, "mmap error at 0x%x (size %u): %s\n", base, size, std::generic_category().message(mmapErr).c_str());
         return NULL;
     }
     return (char *) mem + offset;
@@ -68,7 +71,7 @@ void *unmapmem(void *addr, unsigned size) {
 
     unsigned offset = (unsigned) ((uintptr_t) addr % system_page_size());
     if (munmap((char *) addr - offset, size + offset) != 0)
-        dbg_printf(0, "munmap error: %s\n", strerror(errno));
+        dbg_printf(0, "munmap error: %s\n", std::generic_category().message(errno).c_str());
 
     return NULL;
 }
@@ -77,7 +80,7 @@ void *unmapmem(void *addr, unsigned size) {
 // accepted the buffer and the (single) tag carries a response.
 static int mbox_property(int file_desc, unsigned *p) {
     if (ioctl(file_desc, IOCTL_MBOX_PROPERTY, p) < 0) {
-        dbg_printf(0, "mailbox ioctl failed: %s\n", strerror(errno));
+        dbg_printf(0, "mailbox ioctl failed: %s\n", std::generic_category().message(errno).c_str());
         return -1;
     }
 
@@ -148,7 +151,7 @@ int mbox_open() {
     int file_desc = open(VCIO_DEVICE_FILE_NAME, O_RDWR | O_CLOEXEC);
     if (file_desc < 0) {
         int err = errno;
-        dbg_printf(0, "can't open " VCIO_DEVICE_FILE_NAME ": %s\n", strerror(err));
+        dbg_printf(0, "can't open " VCIO_DEVICE_FILE_NAME ": %s\n", std::generic_category().message(err).c_str());
         errno = err;
         return -1;
     }

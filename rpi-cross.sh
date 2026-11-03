@@ -58,6 +58,7 @@ SYSROOT=${RPI_SYSROOT:-}          # "none" = use the toolchain's own sysroot
 RPI_HOST=${RPI_HOST:-}            # user@host of a running Pi (for "sysroot")
 PI_PACKAGES=${RPI_PI_PACKAGES:-}  # extra apt packages to install on the Pi before syncing
 PI_PASSWORD=${RPI_PI_PASSWORD:-}  # password of the Pi user (used for sudo on the Pi, and for ssh login if sshpass exists)
+unset RPI_PI_PASSWORD             # the build tools started by this script do not inherit the password
 ASK_PASS=0                        # 1 = prompt for the Pi password
 PREFIX=${RPI_PREFIX:-}            # toolchain prefix, e.g. aarch64-linux-gnu-
 TOOLCHAIN_DIR=${RPI_TOOLCHAIN_DIR:-}
@@ -527,9 +528,12 @@ setup_ssh() {      # one multiplexed connection: the login is asked at most once
   SSH_RSH="ssh -o ControlMaster=auto -o ControlPersist=300 -o ControlPath=$SSH_CTL_DIR/cm-%C"
   read -r -a SSH <<<"$SSH_RSH"
   if [[ -n $PI_PASSWORD ]] && have sshpass; then
-    export SSHPASS=$PI_PASSWORD            # sshpass -e reads it from the environment
-    SSH=(sshpass -e "${SSH[@]}")
+    SSH=(ssh_with_password "${SSH[@]}")
   fi
+}
+
+ssh_with_password() {    # sshpass -e reads SSHPASS, which is set for this one command only (not exported, not in argv)
+  SSHPASS=$PI_PASSWORD sshpass -e "$@"
 }
 
 make_remote_askpass() {   # temporary SUDO_ASKPASS helper on the Pi (mode 700, in RAM, removed on exit)

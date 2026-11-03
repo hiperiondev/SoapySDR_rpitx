@@ -73,6 +73,25 @@
 /** @brief Duration of the default DMA ring in milliseconds (the default ring has at least 4096 slots). */
 #define RPITX_DEFAULT_RING_MS 85u
 
+/** @brief Longest blocking time honoured by the stream calls, in microseconds (one day). */
+#define RPITX_MAX_TIMEOUT_US (86400LL * 1000000LL)
+
+/**
+ * @brief Returns the deadline of a blocking call.
+ *
+ * The timeout is limited to [0, @ref RPITX_MAX_TIMEOUT_US], so any value of a SoapySDR timeout argument (for
+ * example LONG_MAX for "wait forever") gives a valid time point.
+ *
+ * @param timeoutUs Timeout in microseconds; zero or negative values give the current time.
+ * @return Current steady-clock time plus the limited timeout.
+ */
+inline std::chrono::steady_clock::time_point SoapyRPITX_DeadlineAfter(long timeoutUs) {
+    long long us = timeoutUs > 0 ? (long long) timeoutUs : 0;
+    if (us > RPITX_MAX_TIMEOUT_US)
+        us = RPITX_MAX_TIMEOUT_US;
+    return std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+}
+
 /**
  * @brief Returns the default DMA ring size for a slot rate.
  * @param slotRate Slot rate in Hz (IQ sample rate times slots per sample).
@@ -105,6 +124,13 @@ enum class SoapyRPITX_EnvelopeOutput {
     None, ///< The envelope drives the pad strength (and the second clock pin) of the RF output.
     Pcm,  ///< The envelope is a 16-bit I2S stream on GPIO18 (BCLK), GPIO19 (LRCLK) and GPIO21 (DOUT).
     Pwm,  ///< The envelope is the duty of PWM channel 1 on GPIO18 (ALT5) or GPIO12 (ALT0).
+};
+
+/** @brief Outcome of SoapyRPITX_IQ_dmaSync::Retune(). */
+enum class SoapyRPITX_RetuneResult {
+    Ok,      ///< The new parameters are in effect.
+    Refused, ///< The frequency or the DAC rate cannot be produced, the slot rate is out of range or the ring is too short.
+    Timeout, ///< The feeder thread did not take the request within 3 s; nothing was changed.
 };
 
 /**
@@ -184,6 +210,10 @@ protected:
     /**
      * @brief Records the DMA channel and the VideoCore memory as soon as they are allocated, and clears them
      *        (channel -1, handle 0) before they are released.
+     *
+     * Whether the kernel DMA channel mask is readable is recorded with the channel, so that the crash recovery
+     * applies the same channel policy as the allocation.
+     *
      * @param channel   DMA channel, or -1 when none is owned.
      * @param memHandle VideoCore memory handle, or 0 when none is owned.
      */
@@ -339,11 +369,12 @@ public:
      * A request not taken by the feeder within 3 s is withdrawn; once taken, the call waits for its result.
      *
      * @param tune New parameters.
-     * @return True on success; false when the frequency or the DAC rate cannot be produced, the slot rate is out
-     *         of range, the ring is too short for the slot rate, or the request was withdrawn (the previous
-     *         configuration stays in effect).
+     * @return SoapyRPITX_RetuneResult::Ok on success; SoapyRPITX_RetuneResult::Refused when the frequency or the
+     *         DAC rate cannot be produced, the slot rate is out of range or the ring is too short for the slot
+     *         rate; SoapyRPITX_RetuneResult::Timeout when the request was withdrawn. The previous configuration
+     *         stays in effect unless the result is SoapyRPITX_RetuneResult::Ok.
      */
-    bool Retune(const SoapyRPITX_TuneConfig &tune);
+    SoapyRPITX_RetuneResult Retune(const SoapyRPITX_TuneConfig &tune);
 
     /**
      * @brief Sets the maximum pad drive level.
@@ -459,7 +490,8 @@ private:
      *
      * The PLL divider, the pacing clock and the envelope DAC clock are checked before anything is
      * reprogrammed; on such a refusal the crystal corrections of the carrier, PCM and PWM clocks are restored
-     * and the previous configuration stays in effect.
+     * and the previous configuration stays in effect. When the pacing clock refuses its rate after the carrier
+     * PLL was reprogrammed, the carrier PLL is programmed again for the previous configuration.
      *
      * @param tune Configuration to apply.
      * @return True on success.

@@ -252,12 +252,13 @@ public:
 #define CM_EMMCCTL 0x1c0      ///< EMMC clock control (byte offset).
 #define CM_EMMCDIV 0x1c4      ///< EMMC clock divider (byte offset).
 
-#define CM_LOCK (0x114 / 4)      ///< PLL lock status (word index).
-#define CM_LOCK_FLOCKH (1 << 12) ///< PLLH locked.
-#define CM_LOCK_FLOCKD (1 << 11) ///< PLLD locked.
-#define CM_LOCK_FLOCKC (1 << 10) ///< PLLC locked.
-#define CM_LOCK_FLOCKB (1 << 9)  ///< PLLB locked.
-#define CM_LOCK_FLOCKA (1 << 8)  ///< PLLA locked.
+#define CM_LOCK (0x114 / 4)               ///< PLL lock status (word index).
+#define CM_LOCK_FLOCKH (1 << 12)          ///< PLLH locked.
+#define CM_LOCK_FLOCKD (1 << 11)          ///< PLLD locked.
+#define CM_LOCK_FLOCKC (1 << 10)          ///< PLLC locked.
+#define CM_LOCK_FLOCKB (1 << 9)           ///< PLLB locked.
+#define CM_LOCK_FLOCKA (1 << 8)           ///< PLLA locked.
+#define A2W_PLL_CHANNEL_DISABLE (1u << 8) ///< PLL channel divider register: channel output disabled.
 
 #define CM_PLLA (0x104 / 4) ///< PLLA control (word index).
 #define CM_PLLC (0x108 / 4) ///< PLLC control (word index).
@@ -471,9 +472,12 @@ public:
      * @brief Enables or disables advanced (master PLL) mode.
      *
      * Enabling it saves the clock tree, moves the VPU clock to PLLA and the EMMC clock to PLLD so that PLLC
-     * can be modulated.
+     * can be modulated. The VPU clock feeds the mini UART, SPI and I2C controllers, so their rates change
+     * while advanced mode is in effect.
      *
      * @param Advanced True to enable.
+     * @throws std::runtime_error when enabling it while the PLLA peripheral channel is not running (nothing is
+     *         changed).
      */
     void SetAdvancedPllMode(bool Advanced);
 

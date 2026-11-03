@@ -9,10 +9,15 @@
 // Test of the SoapySDR device layer (SoapyRPITX) on simulated hardware: settings parsing and ranges,
 // frequency correction, stream argument validation, CS16/CS8/CF32 scaling, END_BURST draining,
 // readStreamStatus and sensors. The build points the device tree, /dev/mem and /dev/vcio paths to files
-// generated in the build directory (see CMakeLists.txt). Also covers the profile file format and the
-// profile=<file> device argument / setting.
+// generated in the build directory (see CMakeLists.txt). Also covers the profile file format, the checks of
+// profile files, the profile=<file> device argument / setting and the limits of numeric inputs and timeouts.
 
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -414,6 +419,69 @@ void testProfileDevice() {
     std::remove(name);
 }
 
+void testInputLimits() {
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+
+    // Values beyond the range of int are refused, not truncated.
+    CHECK(throws([&] { dev.writeSetting("sigma_delta_order", "4294967297"); }));
+    CHECK(throws([&] { dev.writeSetting("eer_drive", "4294967303"); }));
+    CHECK(dev.readSetting("sigma_delta_order") == "2" && dev.readSetting("eer_drive") == "7");
+
+    // Any finite gain maps to the nearest level of the range.
+    dev.setGain(SOAPY_SDR_TX, 0, 1e300);
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0) == 7);
+    dev.setGain(SOAPY_SDR_TX, 0, -1e300);
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0) == 0);
+
+    // Deadlines stay valid for any timeout.
+    const auto now = std::chrono::steady_clock::now();
+    const long long longest = std::min<long long>((long long) LONG_MAX, RPITX_MAX_TIMEOUT_US);
+    CHECK(SoapyRPITX_DeadlineAfter(LONG_MAX) > now + std::chrono::microseconds(longest / 2));
+    const auto immediate = SoapyRPITX_DeadlineAfter(-5);
+    CHECK(immediate <= std::chrono::steady_clock::now());
+}
+
+void testProfileFileChecks() {
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    SoapyRPITX_Profile p;
+    std::string err;
+
+    // Devices are refused without reading them.
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(throws([&] { dev.writeSetting("profile", "/dev/zero"); }));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
+
+    // A named pipe is refused without blocking.
+    const char *fifoName = "test_profile.fifo";
+    std::remove(fifoName);
+    CHECK(mkfifo(fifoName, 0600) == 0);
+    CHECK(!SoapyRPITX_LoadProfile(fifoName, p, err) && err == "not a regular file");
+    std::remove(fifoName);
+
+    // Oversized and group-writable files are refused.
+    const char *big = "test_profile_big.rpitx";
+    writeFile(big, std::string(RPITX_PROFILE_MAX_BYTES + 1, '#'));
+    CHECK(!SoapyRPITX_LoadProfile(big, p, err) && err.find("larger") != std::string::npos);
+    std::remove(big);
+    const char *shared = "test_profile_shared.rpitx";
+    writeFile(shared, "ppm=1\n");
+    chmod(shared, 0664);
+    CHECK(!SoapyRPITX_LoadProfile(shared, p, err) && err.find("writable") != std::string::npos);
+    chmod(shared, 0644);
+    CHECK(SoapyRPITX_LoadProfile(shared, p, err) && p.settings.size() == 1);
+    std::remove(shared);
+
+    // A symbolic link is not followed.
+    const char *target = "test_profile_target.rpitx";
+    const char *link = "test_profile_link.rpitx";
+    writeFile(target, "ppm=1\n");
+    std::remove(link);
+    CHECK(symlink(target, link) == 0);
+    CHECK(!SoapyRPITX_LoadProfile(link, p, err));
+    std::remove(link);
+    std::remove(target);
+}
+
 int main() {
     testSettings();
     testStreamArguments();
@@ -425,6 +493,8 @@ int main() {
     testCloseDuringDrain();
     testProfileParser();
     testProfileDevice();
+    testInputLimits();
+    testProfileFileChecks();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

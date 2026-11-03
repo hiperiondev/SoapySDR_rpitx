@@ -200,7 +200,7 @@ def main():
     stream_args = parse_kwargs(a.args, "--args")
 
     import SoapySDR
-    from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_END_BURST, SOAPY_SDR_TIMEOUT, SOAPY_SDR_TX
+    from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_TX
 
     sdr = SoapySDR.Device(dict(driver="rpitx", amplitude_mode=mode))
     sdr.setSampleRate(SOAPY_SDR_TX, 0, a.rate)
@@ -208,13 +208,20 @@ def main():
     sdr.setGain(SOAPY_SDR_TX, 0, a.gain)
 
     st = sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], stream_args)
-    sdr.activateStream(st)
-
-    if a.seconds <= 0:
-        sdr.deactivateStream(st)
+    try:
+        sdr.activateStream(st)
+        if a.seconds <= 0:
+            sdr.deactivateStream(st)
+            print("transmitter reset")
+            return 0
+        return transmit(sdr, st, a, mode, baseband)
+    finally:
         sdr.closeStream(st)
-        print("transmitter reset")
-        return 0
+
+
+def transmit(sdr, st, a, mode, baseband):
+    """Sends the tone or the file until the duration elapses or the program is interrupted; returns the exit code."""
+    from SoapySDR import SOAPY_SDR_END_BURST, SOAPY_SDR_TIMEOUT
 
     def terminate(signum, frame):
         raise KeyboardInterrupt
@@ -267,11 +274,13 @@ def main():
                     sdr.readSensor("pll_locked")))
     except KeyboardInterrupt:
         pass
-
-    # END_BURST lets the queued samples finish before the carrier is turned off.
-    sdr.writeStream(st, [np.zeros(0, np.complex64)], 0, SOAPY_SDR_END_BURST)
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+    finally:
+        # END_BURST lets the queued samples finish before the carrier is turned off; the caller closes the
+        # stream whatever happens here.
+        try:
+            sdr.writeStream(st, [np.zeros(0, np.complex64)], 0, SOAPY_SDR_END_BURST)
+        finally:
+            sdr.deactivateStream(st)
     return 1 if failed else 0
 
 

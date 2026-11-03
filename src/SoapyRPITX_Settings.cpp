@@ -476,7 +476,10 @@ void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) 
             else
                 throw std::runtime_error("rpitx: amplitude_quantizer must be 'nearest' or 'sigma_delta'");
         } else if (key == "sigma_delta_order") {
-            a.sigmaDeltaOrder = (int) parseInt(key, value);
+            long v = parseInt(key, value);
+            if (v < 1 || v > 2)
+                throw std::runtime_error("rpitx: sigma_delta_order must be 1 or 2");
+            a.sigmaDeltaOrder = (int) v;
         } else if (key == "envelope_delay") {
             a.envelopeDelay = parseDouble(key, value);
         } else if (key == "envelope_floor") {
@@ -494,7 +497,10 @@ void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) 
         } else if (key == "eer_idle") {
             a.eerIdle = parseDouble(key, value);
         } else if (key == "eer_drive") {
-            a.eerDrive = (int) parseInt(key, value);
+            long v = parseInt(key, value);
+            if (v < 0 || v > 7)
+                throw std::runtime_error("rpitx: eer_drive out of range [0, 7]");
+            a.eerDrive = (int) v;
         } else {
             throw std::runtime_error("rpitx: unknown setting '" + key + "'");
         }
@@ -567,8 +573,13 @@ void SoapyRPITX::SetPpmLocked(double ppm) {
 }
 
 void SoapyRPITX::ApplyTune(const SoapyRPITX_TuneConfig &t) {
-    if (tx_stream && !tx_stream->transmitter().Retune(t))
-        throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) + " Hz with the requested parameters");
+    if (tx_stream) {
+        SoapyRPITX_RetuneResult r = tx_stream->transmitter().Retune(t);
+        if (r == SoapyRPITX_RetuneResult::Timeout)
+            throw std::runtime_error("rpitx: the transmitter thread did not respond within 3 s; the change was not applied");
+        if (r != SoapyRPITX_RetuneResult::Ok)
+            throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) + " Hz with the requested parameters");
+    }
     tune = t;
 }
 
@@ -641,8 +652,9 @@ void SoapyRPITX::setGain(const int direction, const size_t, const double value) 
         return;
 
     std::lock_guard<std::mutex> lock(device_mutex);
-    double v = std::isfinite(value) ? value : 0.0;
-    driveLevel = (int) std::min(std::max(std::lround(v), 0L), 7L);
+    // Clamped before rounding, so that any finite value maps to the nearest level of the range.
+    double v = std::isfinite(value) ? std::min(std::max(value, 0.0), 7.0) : 0.0;
+    driveLevel = (int) std::lround(v);
     if (tx_stream)
         tx_stream->transmitter().SetDriveLevel(driveLevel);
 }

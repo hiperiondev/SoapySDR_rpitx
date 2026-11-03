@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include "util.hpp"
 #include "rpi.hpp"
 #include "mailbox.hpp"
@@ -83,7 +84,8 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const s
 
     mbox.handle = mbox_open();
     if (mbox.handle < 0)
-        throw std::runtime_error(std::string("librpitx: cannot open the VideoCore mailbox (" VCIO_DEVICE_FILE_NAME "): ") + strerror(errno));
+        throw std::runtime_error(std::string("librpitx: cannot open the VideoCore mailbox (" VCIO_DEVICE_FILE_NAME "): ") +
+                                 std::generic_category().message(errno));
 
     // Control blocks come first: they need 32-byte alignment, which the page alignment of the block provides.
     uint32_t MemoryRequired = (uint32_t) (CBSize * sizeof(dma_cb_t) + UserMemSize * sizeof(uint32_t));

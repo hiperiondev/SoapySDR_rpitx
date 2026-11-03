@@ -74,7 +74,9 @@ void initClockBlock(volatile uint32_t *clk) {
     clk[PLLD_PER] = 1;
     clk[PLLC_CTRL] = (1u << 12) | 52u;
     clk[PLLC_PER] = 1;
-    clk[CM_LOCK] = CM_LOCK_FLOCKC | CM_LOCK_FLOCKD;
+    clk[PLLA_CTRL] = (1u << 12) | 104u; // PDIV 1, NDIV 104 -> 1996.8 MHz
+    clk[PLLA_PER] = 1;
+    clk[CM_LOCK] = CM_LOCK_FLOCKA | CM_LOCK_FLOCKC | CM_LOCK_FLOCKD;
 }
 
 } // namespace
