@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "SoapyRPITX_Amplitude.hpp"
 #include "SoapyRPITX_Buffers.hpp"
 #include "dsp.hpp"
 
@@ -361,6 +362,182 @@ void testDsp() {
     CHECK(std::isfinite(d.frequency));
 }
 
+// The nearest state of the uncalibrated model reproduces level = round(a * (drive + 1)) - 1, off when negative.
+void testAmplitudeModelLinear() {
+    SoapyRPITX_AmplitudeConfig cfg;
+    for (int drive = 0; drive <= 7; drive++) {
+        SoapyRPITX_AmplitudeModel m(cfg, drive, false);
+        CHECK(m.size() == (size_t) drive + 2);
+        CHECK(std::fabs(m.state(m.top()).amplitude - 1.0) < 1e-12);
+        for (int i = 0; i <= 1200; i++) {
+            double a = i / 1000.0;
+            double x = std::min(a, 1.0) * (drive + 1);
+            if (std::fabs(x - std::floor(x) - 0.5) < 1e-9)
+                continue; // exactly on a decision threshold
+            long level = std::lround(x) - 1;
+            const SoapyRPITX_AmpState &st = m.state(m.nearest(a));
+            CHECK((st.pins != 0) == (level >= 0));
+            if (level >= 0)
+                CHECK(st.level == (int) level);
+        }
+    }
+}
+
+void testAmplitudeModelTables() {
+    SoapyRPITX_AmplitudeConfig cfg;
+    cfg.amplitudeLut = {0.05, 0.2, 0.45, 0.6, 0.75, 0.85, 0.95, 1.0};
+    cfg.ampmLut = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.0};
+    CHECK(SoapyRPITX_CheckAmplitudeConfig(cfg).empty());
+    SoapyRPITX_AmplitudeModel m(cfg, 7, false);
+    CHECK(m.state(m.nearest(0.44)).level == 2);
+    CHECK(std::fabs(m.state(m.nearest(0.44)).phase - 0.3) < 1e-12);
+    CHECK(m.state(m.nearest(0.02)).pins == 0);
+    CHECK(m.state(m.nearest(0.03)).level == 0);
+
+    // Lower drive: the strongest available level becomes full scale.
+    SoapyRPITX_AmplitudeModel m3(cfg, 3, false);
+    CHECK(m3.state(m3.top()).level == 3);
+    CHECK(std::fabs(m3.state(m3.nearest(0.75)).amplitude - 0.75) < 1e-12);
+
+    // Two clock pins: GPIO20 alone is the weakest weight.
+    SoapyRPITX_AmplitudeConfig plain;
+    SoapyRPITX_AmplitudeModel dual(plain, 7, true);
+    CHECK(dual.size() == 1 + 8 * 3);
+    CHECK(dual.state(dual.top()).pins == 3);
+    const SoapyRPITX_AmpState &weak = dual.state(dual.nearest(1.0 / 24.0));
+    CHECK(weak.pins == 2 && weak.level == 0);
+
+    // Invalid tables.
+    SoapyRPITX_AmplitudeConfig bad;
+    bad.amplitudeLut = {1, 2, 3};
+    CHECK(!SoapyRPITX_CheckAmplitudeConfig(bad).empty());
+    bad = SoapyRPITX_AmplitudeConfig();
+    bad.amplitudeLut = {0.1, 0.2, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8};
+    CHECK(!SoapyRPITX_CheckAmplitudeConfig(bad).empty());
+    bad = SoapyRPITX_AmplitudeConfig();
+    bad.eerLut = {0.5, 0.4};
+    CHECK(!SoapyRPITX_CheckAmplitudeConfig(bad).empty());
+    bad = SoapyRPITX_AmplitudeConfig();
+    bad.envelopeDelay = 40;
+    CHECK(!SoapyRPITX_CheckAmplitudeConfig(bad).empty());
+    bad = SoapyRPITX_AmplitudeConfig();
+    bad.sigmaDeltaOrder = 3;
+    CHECK(!SoapyRPITX_CheckAmplitudeConfig(bad).empty());
+}
+
+void testSigmaDelta() {
+    SoapyRPITX_AmplitudeConfig cfg;
+    SoapyRPITX_AmplitudeModel m(cfg, 7, false);
+    for (int order = 1; order <= 2; order++) {
+        for (double target : {0.0, 0.03, 0.3, 0.71, 1.0, 1.5}) {
+            SoapyRPITX_AmplitudeQuantizer q;
+            double sum = 0;
+            const int n = 20000;
+            for (int i = 0; i < n; i++)
+                sum += m.state(q.quantize(m, target, true, order)).amplitude;
+            double mean = sum / n;
+            CHECK(std::fabs(mean - std::min(target, 1.0)) < 0.002);
+        }
+    }
+    // Nearest selection keeps the quantisation error.
+    SoapyRPITX_AmplitudeQuantizer q;
+    CHECK(std::fabs(m.state(q.quantize(m, 0.3, false, 2)).amplitude - 0.25) < 1e-12);
+}
+
+void testEnvelopeDelay() {
+    SoapyRPITX_EnvelopeDelay d;
+    d.reset();
+    for (int i = 1; i <= 10; i++)
+        d.push(i);
+    CHECK(d.at(0) == 10);
+    CHECK(d.at(1) == 9);
+    CHECK(std::fabs(d.at(0.5) - 9.5) < 1e-12);
+    CHECK(std::fabs(d.at(2.25) - 7.75) < 1e-12);
+    CHECK(d.at(50) == 0);
+
+    int advance = -1;
+    CHECK(std::fabs(SoapyRPITX_SplitEnvelopeDelay(0.5, 0, advance) - 0.5) < 1e-12 && advance == 0);
+    CHECK(std::fabs(SoapyRPITX_SplitEnvelopeDelay(0.5, 17, advance) - 0.5) < 1e-12 && advance == 17);
+    CHECK(std::fabs(SoapyRPITX_SplitEnvelopeDelay(-2.3, 0, advance) - 0.7) < 1e-9 && advance == 3);
+    CHECK(std::fabs(SoapyRPITX_SplitEnvelopeDelay(-2, 0, advance)) < 1e-12 && advance == 2);
+}
+
+void testEerCode() {
+    SoapyRPITX_AmplitudeConfig cfg;
+    bool clipped = false;
+    SoapyRPITX_AmplitudeModel linear(cfg, 7, false);
+    CHECK(std::fabs(linear.eerCode(0.4, clipped) - 0.4) < 1e-12 && !clipped);
+    CHECK(linear.eerCode(1.2, clipped) == 1.0 && clipped);
+
+    cfg.eerLut = {0.0, 0.5, 0.8, 1.0};
+    cfg.eerAmpmLut = {0.0, 0.3, 0.6, 0.9};
+    SoapyRPITX_AmplitudeModel m(cfg, 7, false);
+    CHECK(std::fabs(m.eerCode(0.5, clipped) - 1.0 / 3.0) < 1e-12);
+    CHECK(std::fabs(m.eerCode(0.9, clipped) - (2.0 / 3.0 + 0.5 / 3.0)) < 1e-12);
+    CHECK(std::fabs(m.eerPhase(0.5) - 0.45) < 1e-12);
+
+    cfg = SoapyRPITX_AmplitudeConfig();
+    cfg.eerGain = 0.5;
+    cfg.eerOffset = 0.1;
+    SoapyRPITX_AmplitudeModel g(cfg, 7, false);
+    CHECK(std::fabs(g.eerCode(0.8, clipped) - 0.5) < 1e-12 && !clipped);
+}
+
+// Delay (in samples) that best maps the reference curve onto the measured values taken at slot centres.
+double fitDelay(const std::vector<double> &measured, const std::vector<double> &reference) {
+    double best = 0, bestErr = 1e300;
+    for (double D = 0; D <= 2.0; D += 0.005) {
+        double err = 0;
+        for (size_t k = 40; k + 40 < measured.size(); k++) {
+            double t = (double) k + 0.5 - D;
+            size_t i = (size_t) std::floor(t);
+            double f = t - (double) i;
+            double r = reference[i] + f * (reference[i + 1] - reference[i]);
+            err += (measured[k] - r) * (measured[k] - r);
+        }
+        if (err < bestErr) {
+            bestErr = err;
+            best = D;
+        }
+    }
+    return best;
+}
+
+// The held envelope of slot k and the phase ramped by the frequency of slot k reach the antenna with the same
+// delay when the envelope is delayed by half a sample.
+void testEnvelopePhaseAlignment() {
+    const uint32_t fs = 48000;
+    const int n = 200;
+    std::vector<double> amp(n + 2), ph(n + 2);
+    for (int i = 0; i < n + 2; i++) {
+        double x = std::min(std::max((i - 80) / 40.0, 0.0), 1.0);
+        double c = 0.5 - 0.5 * std::cos(M_PI * x);
+        amp[i] = 0.2 + 0.8 * c;
+        ph[i] = 1.2 * c;
+    }
+    for (double d : {0.0, 0.5}) {
+        dsp p(fs);
+        SoapyRPITX_EnvelopeDelay delay;
+        delay.reset();
+        std::vector<double> env(n), phase(n);
+        double carrier = 0;
+        for (int k = 0; k < n; k++) {
+            p.pushsample(std::complex<float>((float) (amp[k] * std::cos(ph[k])), (float) (amp[k] * std::sin(ph[k]))));
+            delay.push(p.amplitude);
+            env[k] = delay.at(d);
+            double start = carrier;
+            carrier += 2 * M_PI * p.frequency / fs;
+            phase[k] = 0.5 * (start + carrier); // phase at the centre of the slot
+        }
+        double de = fitDelay(env, amp);
+        double dp = fitDelay(phase, ph);
+        if (d == 0.5)
+            CHECK(std::fabs(de - dp) < 0.05);
+        else
+            CHECK(std::fabs((dp - de) - 0.5) < 0.05);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -373,6 +550,12 @@ int main() {
     testRingDoubleStall();
     testRingHostStarvation();
     testDsp();
+    testAmplitudeModelLinear();
+    testAmplitudeModelTables();
+    testSigmaDelta();
+    testEnvelopeDelay();
+    testEerCode();
+    testEnvelopePhaseAlignment();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

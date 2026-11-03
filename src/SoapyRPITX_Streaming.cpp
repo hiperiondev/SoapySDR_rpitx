@@ -30,6 +30,7 @@
 #include <cctype>
 #include <chrono>
 #include <complex>
+#include <initializer_list>
 #include <stdexcept>
 #include <thread>
 
@@ -55,7 +56,7 @@ long streamArg(const SoapySDR::Kwargs &args, const char *key, long def, long lo,
     long v;
     try {
         size_t used = 0;
-        v = std::stol(it->second, &used, 0);
+        v = std::stol(it->second, &used, 10);
         if (used != it->second.size())
             throw std::invalid_argument(it->second);
     } catch (const std::exception &) {
@@ -77,6 +78,19 @@ bool streamBoolArg(const SoapySDR::Kwargs &args, const char *key, bool def) {
     if (v == "false" || v == "0" || v == "no" || v == "off")
         return false;
     throw std::runtime_error(std::string("rpitx: invalid boolean '") + it->second + "' for stream argument " + key);
+}
+
+std::string streamStringArg(const SoapySDR::Kwargs &args, const char *key, const char *def, std::initializer_list<const char *> options) {
+    auto it = args.find(key);
+    if (it == args.end())
+        return def;
+    for (const char *o : options)
+        if (it->second == o)
+            return it->second;
+    std::string list;
+    for (const char *o : options)
+        list += std::string(list.empty() ? "" : ", ") + o;
+    throw std::runtime_error(std::string("rpitx: invalid value '") + it->second + "' for stream argument " + key + " (" + list + ")");
 }
 
 SoapySDR::ArgInfo boolArg(const char *key, const char *name, const char *description) {
@@ -132,7 +146,7 @@ SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const s
     }
 
     streamArgs.push_back(intArg("ring_size", SoapyRPITX_DefaultRingSize(rate), "DMA ring size",
-                                "Number of samples in the circular DMA buffer (default: 85 ms at the sample rate, at least 4096; at least 10 ms).", "samples",
+                                "Number of slots in the circular DMA buffer (default: 85 ms at the slot rate, at least 4096; at least 10 ms).", "slots",
                                 RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE));
     streamArgs.push_back(intArg("fifo_ms", kDefaultFifoMs, "FIFO length",
                                 "Capacity of the software FIFO between writeStream() and the DMA ring (follows the sample rate).", "ms", 20, 5000));
@@ -147,6 +161,25 @@ SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const s
     streamArgs.push_back(intArg("cpu", kDefaultCpu, "Feeder CPU", "CPU the feeder thread is pinned to; -1 for no affinity.", "", -1, 63));
     streamArgs.push_back(
             boolArg("signal_cleanup", "Signal cleanup", "Turn the carrier off when the process is killed by a signal whose action is the default one."));
+    streamArgs.push_back(intArg("slots_per_sample", 1, "Slots per sample",
+                                "DMA slots per IQ sample; the IQ signal is interpolated and the amplitude quantised at the slot rate (at most 200 kHz).", "", 1,
+                                RPITX_MAX_SLOTS_PER_SAMPLE));
+    SoapySDR::ArgInfo env;
+    env.key = "envelope_output";
+    env.value = "none";
+    env.name = "Envelope output";
+    env.description = "none: envelope on the pad drive of GPIO4; pcm: 16-bit I2S DAC on GPIO18 (BCLK), GPIO19 (LRCLK), GPIO21 (DOUT); "
+                      "pwm: PWM duty on pwm_gpio. With pcm or pwm GPIO4 carries the constant-envelope phase signal (EER).";
+    env.type = SoapySDR::ArgInfo::STRING;
+    env.options = {"none", "pcm", "pwm"};
+    env.optionNames = {"None", "PCM / I2S DAC", "PWM"};
+    streamArgs.push_back(env);
+    SoapySDR::ArgInfo pin = intArg("pwm_gpio", 18, "PWM envelope pin", "GPIO of the PWM envelope output: 18 (ALT5) or 12 (ALT0).", "", 12, 18);
+    pin.options = {"12", "18"};
+    pin.optionNames = {"GPIO12", "GPIO18"};
+    streamArgs.push_back(pin);
+    streamArgs.push_back(intArg("pwm_bits", 8, "PWM envelope resolution", "Bits of the PWM envelope (period of 2^bits PWM clocks).", "bits", 6, 12));
+    streamArgs.push_back(boolArg("rf_dac", "RF-DAC", "Use GPIO20 as a second clock output, summed with GPIO4 by an external weighted network."));
 
     return streamArgs;
 }
@@ -180,10 +213,23 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
 
     SoapyRPITX_TxConfig cfg;
     cfg.tune = tune;
-    cfg.ringSize = (uint32_t) streamArg(args, "ring_size", SoapyRPITX_DefaultRingSize(tune.sampleRate), RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE);
-    if (!SoapyRPITX_RingFitsRate(cfg.ringSize, tune.sampleRate))
+    cfg.slotsPerSample = (uint32_t) streamArg(args, "slots_per_sample", 1, 1, RPITX_MAX_SLOTS_PER_SAMPLE);
+    const uint64_t slotRate = (uint64_t) tune.sampleRate * cfg.slotsPerSample;
+    if (slotRate > RPITX_MAX_SAMPLE_RATE)
+        throw std::runtime_error("rpitx: sample rate x slots_per_sample (" + std::to_string(slotRate) + " Hz) exceeds " +
+                                 std::to_string(RPITX_MAX_SAMPLE_RATE) + " Hz");
+    cfg.ringSize = (uint32_t) streamArg(args, "ring_size", SoapyRPITX_DefaultRingSize((uint32_t) slotRate), RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE);
+    if (!SoapyRPITX_RingFitsRate(cfg.ringSize, (uint32_t) slotRate))
         throw std::runtime_error("rpitx: ring_size " + std::to_string(cfg.ringSize) + " is shorter than " + std::to_string(RPITX_MIN_RING_MS) + " ms at " +
-                                 std::to_string(tune.sampleRate) + " Hz");
+                                 std::to_string(slotRate) + " slots/s");
+    std::string envOut = streamStringArg(args, "envelope_output", "none", {"none", "pcm", "pwm"});
+    cfg.envelopeOutput = envOut == "pcm" ? SoapyRPITX_EnvelopeOutput::Pcm : envOut == "pwm" ? SoapyRPITX_EnvelopeOutput::Pwm : SoapyRPITX_EnvelopeOutput::None;
+    cfg.pwmGpio = (int) streamArg(args, "pwm_gpio", 18, 12, 18);
+    if (cfg.pwmGpio != 12 && cfg.pwmGpio != 18)
+        throw std::runtime_error("rpitx: stream argument pwm_gpio must be 12 or 18");
+    cfg.pwmBits = (int) streamArg(args, "pwm_bits", 8, 6, 12);
+    cfg.rfDac = streamBoolArg(args, "rf_dac", false);
+    cfg.amplitude = ampCfg;
     cfg.fifoMs = (uint32_t) streamArg(args, "fifo_ms", kDefaultFifoMs, 20, 5000);
     cfg.prerollMs = (uint32_t) streamArg(args, "preroll_ms", kDefaultPrerollMs, 0, 5000);
     cfg.dmaChannel = (int) streamArg(args, "dma_channel", kDefaultDmaChannel, -1, 14);
@@ -195,7 +241,8 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
     cfg.iqScale = iqScale;
     cfg.constantEnvelope = constantEnvelope;
 
-    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: TX stream %s, ring %u samples, FIFO %u ms, pre-roll %u ms", format.c_str(), cfg.ringSize, cfg.fifoMs, cfg.prerollMs);
+    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: TX stream %s, ring %u slots, %u slot(s) per sample, FIFO %u ms, pre-roll %u ms, envelope output %s%s", format.c_str(),
+                  cfg.ringSize, cfg.slotsPerSample, cfg.fifoMs, cfg.prerollMs, envOut.c_str(), cfg.rfDac ? ", RF-DAC" : "");
 
     tx_stream = std::make_shared<tx_streamer>(streamFormat, cfg);
     streamHandle.store(tx_stream.get());
@@ -207,6 +254,8 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
     if (IsValidTxStreamHandle(handle)) {
         streamHandle.store(nullptr);
+        // Stopping here also ends a drain in progress in deactivateStream(), which then releases its reference.
+        tx_stream->transmitter().Stop();
         tx_stream.reset();
     }
 }

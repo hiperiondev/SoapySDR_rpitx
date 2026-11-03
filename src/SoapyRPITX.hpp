@@ -185,7 +185,9 @@ private:
  * @brief SoapySDR device for the Raspberry Pi GPIO transmitter.
  *
  * Device arguments (also accepted as settings, see getSettingInfo()): ppm, ppm_ntp, harmonic, amplitude_mode,
- * iq_scale, debug_level. Other device arguments are reported with a warning, except the identification keys
+ * iq_scale, debug_level, and the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
+ * sigma_delta_order, envelope_delay, envelope_floor, rfdac_lut, eer_lut, eer_ampm_lut, eer_gain, eer_offset,
+ * eer_idle, eer_drive). Other device arguments are reported with a warning, except the identification keys
  * produced by enumeration (driver, label, product, serial, manufacturer, tuner) and keys containing ':'.
  * Stream arguments: see getStreamArgsInfo().
  */
@@ -198,7 +200,7 @@ public:
      */
     SoapyRPITX(const SoapySDR::Kwargs &args);
 
-    /** @brief Closes the stream, if any, and releases the hardware. */
+    /** @brief Stops and closes the stream, if any, and releases the hardware. */
     ~SoapyRPITX();
 
     /*******************************************************************
@@ -266,8 +268,8 @@ public:
     /**
      * @brief Describes the stream arguments.
      *
-     * - ring_size: DMA ring size in samples (default: 85 ms at the current sample rate, at least 4096; at least
-     *   10 ms of samples).
+     * - ring_size: DMA ring size in slots (default: 85 ms at the slot rate, at least 4096; at least 10 ms of
+     *   slots).
      * - fifo_ms: software FIFO capacity in milliseconds (follows sample-rate changes).
      * - preroll_ms: signal queued before the DMA starts, in milliseconds.
      * - dma_channel: DMA channel (-1 for the first free channel of the board).
@@ -275,6 +277,12 @@ public:
      * - rt_priority: SCHED_FIFO priority of the feeder thread (0 = normal scheduling).
      * - cpu: CPU the feeder thread is pinned to (-1 = no affinity).
      * - signal_cleanup: turn the carrier off when the process is killed by a signal with the default action.
+     * - slots_per_sample: DMA slots per IQ sample (1-4); the slot rate (sample rate x slots) is at most 200 kHz.
+     * - envelope_output: "none" (envelope on the pad drive), "pcm" (16-bit I2S DAC on GPIO18/19/21) or "pwm"
+     *   (PWM duty on pwm_gpio) for Envelope Elimination and Restoration.
+     * - pwm_gpio: PWM envelope pin, 18 or 12.
+     * - pwm_bits: PWM envelope resolution, 6-12 bits.
+     * - rf_dac: GPIO20 as a second clock output summed with GPIO4 by an external weighted network.
      *
      * @param direction Direction.
      * @param channel   Channel.
@@ -297,6 +305,10 @@ public:
 
     /**
      * @brief Stops and destroys a stream.
+     *
+     * The carrier is turned off immediately (queued samples are discarded), also while another thread waits in
+     * deactivateStream() for the end of a burst.
+     *
      * @param stream Stream handle.
      */
     void closeStream(SoapySDR::Stream *stream);
@@ -362,7 +374,8 @@ public:
      ******************************************************************/
 
     /**
-     * @brief Lists the sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors, sample_rate.
+     * @brief Lists the sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors, sample_rate,
+     *        envelope_clip, envelope_late.
      * @return Sensor keys.
      */
     std::vector<std::string> listSensors(void) const;
@@ -396,6 +409,11 @@ public:
      * - amplitude_mode: "envelope" (follow |IQ|) or "constant" (carrier at full drive).
      * - iq_scale: gain applied to |IQ| before amplitude quantisation.
      * - debug_level: librpitx diagnostic level (0-2).
+     * - amplitude_lut, ampm_lut: measured amplitude and phase (degrees) of the 8 pad drive levels.
+     * - amplitude_quantizer: "nearest" or "sigma_delta"; sigma_delta_order: 1 or 2.
+     * - envelope_delay: envelope delay relative to the phase path, in samples; envelope_floor: carrier-off level.
+     * - rfdac_lut: amplitude with GPIO4 only, GPIO20 only and both (rf_dac stream argument).
+     * - eer_lut, eer_ampm_lut, eer_gain, eer_offset, eer_idle, eer_drive: envelope DAC calibration (envelope_output).
      *
      * @return Setting descriptions.
      */
@@ -634,8 +652,8 @@ public:
      * @param direction Must be SOAPY_SDR_TX.
      * @param channel   Channel.
      * @param rate      Rate in Hz, within getSampleRateRange().
-     * @throws std::runtime_error for an unsupported rate, or a rate for which the DMA ring of the open stream is
-     *         shorter than 10 ms.
+     * @throws std::runtime_error for an unsupported rate, or a rate for which the slot rate of the open stream
+     *         exceeds 200 kHz or its DMA ring is shorter than 10 ms.
      */
     void setSampleRate(const int direction, const size_t channel, const double rate);
 
@@ -643,7 +661,7 @@ public:
      * @brief Returns the IQ sample rate.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Nominal rate in Hz (0 for RX); the sample_rate sensor reports the rate produced by the PCM clock.
+     * @return Nominal rate in Hz (0 for RX); the sample_rate sensor reports the rate produced by the pacing clock.
      */
     double getSampleRate(const int direction, const size_t channel) const;
 
@@ -709,21 +727,29 @@ private:
     SoapySDR::Range PllRange() const;
 
     /**
+     * @brief Validates and applies amplitude parameters to the device and the open stream (device_mutex held).
+     * @param amplitude New parameters.
+     * @throws std::runtime_error when invalid or refused by the stream.
+     */
+    void ApplyAmplitude(const SoapyRPITX_AmplitudeConfig &amplitude);
+
+    /**
      * @brief Validates and applies a manual crystal correction (device_mutex held).
      * @param ppm Correction in ppm.
      * @throws std::runtime_error when out of range or rejected by the stream.
      */
     void SetPpmLocked(double ppm);
 
-    mutable std::mutex device_mutex; ///< Serialises the control API.
-    SoapyRPITX_TuneConfig tune;      ///< Frequency-related parameters.
-    int driveLevel = 7;              ///< Pad drive level 0-7.
-    float iqScale = 1.0f;            ///< IQ magnitude gain.
-    bool constantEnvelope = false;   ///< Constant-envelope amplitude mode.
-    int debugLevel = 0;              ///< librpitx diagnostic level.
-    std::string model;               ///< Board model string.
-    std::string serial;              ///< Board serial number.
-    bool pi4 = false;                ///< BCM2711 board.
+    mutable std::mutex device_mutex;   ///< Serialises the control API.
+    SoapyRPITX_TuneConfig tune;        ///< Frequency-related parameters.
+    int driveLevel = 7;                ///< Pad drive level 0-7.
+    float iqScale = 1.0f;              ///< IQ magnitude gain.
+    bool constantEnvelope = false;     ///< Constant-envelope amplitude mode.
+    int debugLevel = 0;                ///< librpitx diagnostic level.
+    SoapyRPITX_AmplitudeConfig ampCfg; ///< Amplitude calibration and processing.
+    std::string model;                 ///< Board model string.
+    std::string serial;                ///< Board serial number.
+    bool pi4 = false;                  ///< BCM2711 board.
 
     std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
     std::atomic<tx_streamer *> streamHandle{nullptr}; ///< Handle of the open stream, read by writeStream() without the mutex.

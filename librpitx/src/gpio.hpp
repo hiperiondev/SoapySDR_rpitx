@@ -477,6 +477,14 @@ public:
      */
     void SetAdvancedPllMode(bool Advanced);
 
+    /**
+     * @brief Saves the clock tree modified by advanced mode, without changing anything.
+     *
+     * SetAdvancedPllMode() saves it as well when no snapshot exists; calling this first lets the caller record
+     * the snapshot (for crash recovery) before the first clock-manager write.
+     */
+    void SaveClockTree();
+
     /** @brief Restores the clock tree saved by SetAdvancedPllMode() (no effect when none was saved). */
     void RestoreClockTree();
 
@@ -601,12 +609,30 @@ private:
 
 #define PCMCLK_CNTL (38) ///< PCM clock control (clock manager word index).
 #define PCMCLK_DIV (39)  ///< PCM clock divider (clock manager word index).
+
+#define PCM_CS_EN (1u << 0)      ///< CS: PCM block enabled.
+#define PCM_CS_TXON (1u << 2)    ///< CS: transmitter running.
+#define PCM_CS_TXCLR (1u << 3)   ///< CS: clear the TX FIFO.
+#define PCM_CS_DMAEN (1u << 9)   ///< CS: DMA requests enabled.
+#define PCM_CS_STBY (1u << 25)   ///< CS: FIFO RAM released from standby.
+#define PCM_MODE_FTXP (1u << 24) ///< MODE: one TX FIFO word carries both 16-bit channels.
+#define PCM_MODE_CLKI (1u << 22) ///< MODE: bit clock inverted.
+#define PCM_MODE_FSI (1u << 20)  ///< MODE: frame sync inverted.
+
+#define PCM_FIFO_DEPTH 64       ///< TX FIFO depth in words.
+#define PCM_TX_DREQ_LEVEL 16    ///< TX DREQ and panic threshold in words: the FIFO is kept at this level.
+#define PCM_DAC_FRAME_LENGTH 64 ///< Bit clocks per frame in DAC (I2S) mode: two 32-bit channel slots.
 /** @} */
 
 /**
- * @brief PCM block used as the DMA pacing source: one FIFO word is consumed per sample period.
+ * @brief PCM block used as the DMA pacing source (one FIFO word is consumed per sample period) and, optionally,
+ *        as a 16-bit I2S output carrying the word of each slot.
  *
- * The constructor saves the PCM clock generator; the destructor disables the PCM block and restores it.
+ * The constructor only maps the registers and saves the PCM clock generator; the block is first changed by
+ * SetFrequency() or SetDacFrequency(). The destructor then disables the block and restores the clock.
+ *
+ * The TX FIFO is kept at @ref PCM_TX_DREQ_LEVEL words, so the word written by a slot leaves the block
+ * @ref PCM_TX_DREQ_LEVEL frames after the registers written by the same slot take effect.
  */
 class pcmgpio : public gpio {
 protected:
@@ -620,6 +646,14 @@ protected:
     uint32_t savedDiv = 0;     ///< PCMCLK_DIV at construction.
     uint32_t divInt = 0;       ///< Programmed integer divider.
     uint32_t divFrac = 0;      ///< Programmed fractional divider.
+    bool used = false;         ///< The block has been configured (and must be restored).
+
+    /**
+     * @brief Computes and programs the PCM clock divider for a bit-clock rate.
+     * @param bitRate Bit clock in Hz.
+     * @return False when the divider is outside 2..4095 (nothing is programmed).
+     */
+    bool ProgramClock(double bitRate);
 
     /**
      * @brief Sets the frame length and starts PCM transmission with DMA requests.
@@ -632,7 +666,7 @@ public:
     /** @brief Maps the PCM block and saves the PCM clock generator. */
     pcmgpio();
 
-    /** @brief Disables the PCM block and restores the PCM clock generator. */
+    /** @brief Disables the PCM block and restores the PCM clock generator when the block was configured. */
     ~pcmgpio();
 
     /**
@@ -657,11 +691,36 @@ public:
     void Setppm(double ppm);
 
     /**
-     * @brief Sets the frame (sample) rate and starts the PCM block.
+     * @brief Sets the frame (sample) rate and starts the PCM block as a one-channel, 8-bit pacing source.
      * @param Frequency Frame rate in Hz.
      * @return Always 0.
      */
     int SetFrequency(uint64_t Frequency);
+
+    /**
+     * @brief Sets the frame rate and starts the PCM block as a 16-bit stereo I2S master transmitter.
+     *
+     * The frame is @ref PCM_DAC_FRAME_LENGTH bit clocks long (frame sync high for half of it), both channels
+     * are 16 bits with a one-bit delay, and one FIFO word carries both channels (packed mode). The pins are
+     * not switched by this call.
+     *
+     * @param Frequency Frame rate in Hz.
+     * @return 0, or -1 when the clock divider is out of range for this rate (nothing is changed).
+     */
+    int SetDacFrequency(uint64_t Frequency);
+
+    /**
+     * @brief Tells whether SetDacFrequency() can produce a frame rate with the current source and correction.
+     * @param Frequency Frame rate in Hz.
+     * @return True when the clock divider is within 2..4095.
+     */
+    bool DacFrequencyFits(uint64_t Frequency) const;
+
+    /** @brief Clears the TX FIFO and (re)starts transmission and DMA requests (no effect before configuration). */
+    void StartTx();
+
+    /** @brief Stops transmission and DMA requests, the frame clock keeps running (no effect before configuration). */
+    void StopTx();
 
     /**
      * @brief Returns the frame rate produced by the programmed dividers.
@@ -693,6 +752,115 @@ public:
 #define PADS_SLEW (1u << 4) ///< Pad register: slew rate not limited.
 /** @} */
 
+/**
+ * @name PWM
+ * @{
+ */
+#define PWM_BASE (0x0020C000) ///< Offset of the PWM block (PWM0 on BCM2711).
+#define PWM_LEN 0x28          ///< Size of the PWM register block.
+
+#define PWM_CTL (0x00 / 4)  ///< Control.
+#define PWM_STA (0x04 / 4)  ///< Status.
+#define PWM_DMAC (0x08 / 4) ///< DMA configuration.
+#define PWM_RNG1 (0x10 / 4) ///< Channel 1 range.
+#define PWM_DAT1 (0x14 / 4) ///< Channel 1 data.
+#define PWM_FIF1 (0x18 / 4) ///< FIFO input.
+
+#define PWM_CTL_PWEN1 (1u << 0)  ///< CTL: channel 1 enabled.
+#define PWM_CTL_USEF1 (1u << 5)  ///< CTL: channel 1 takes its data from the FIFO.
+#define PWM_CTL_CLRF1 (1u << 6)  ///< CTL: clear the FIFO.
+#define PWM_CTL_MSEN1 (1u << 7)  ///< CTL: channel 1 in mark/space mode.
+#define PWM_DMAC_ENAB (1u << 31) ///< DMAC: DMA requests enabled.
+
+#define PWM_FIFO_DEPTH 16 ///< FIFO depth in words.
+#define PWM_DREQ_LEVEL 8  ///< DREQ and panic threshold in words: the FIFO is kept at this level.
+
+#define PWMCLK_CNTL (40) ///< PWM clock control (clock manager word index).
+#define PWMCLK_DIV (41)  ///< PWM clock divider (clock manager word index).
+/** @} */
+
+/**
+ * @brief PWM channel 1 used as the DMA pacing source and as a mark/space DAC: each FIFO word is the duty
+ *        (0 to range) of one period, and one word is consumed per period.
+ *
+ * The constructor maps the block and saves its registers and its clock generator; nothing is changed until
+ * SetFrequency(). The destructor then stops the channel and restores the saved state.
+ *
+ * The FIFO is kept at @ref PWM_DREQ_LEVEL words, so the word written by a slot is output
+ * @ref PWM_DREQ_LEVEL periods after the registers written by the same slot take effect.
+ */
+class pwmgpio : public gpio {
+protected:
+    gpio clk;                  ///< Clock manager mapping.
+    int pllnumber = clk_plld;  ///< Clock source of the PWM clock.
+    int Mash = 1;              ///< MASH order of the PWM clock.
+    uint64_t Pllfrequency = 0; ///< Frequency of the source in Hz.
+    double clk_ppm = 0;        ///< Crystal correction in ppm (see clkgpio::Setppm()).
+    uint32_t range = 0;        ///< Programmed range (period in PWM clocks).
+    uint32_t divInt = 0;       ///< Programmed integer divider.
+    uint32_t divFrac = 0;      ///< Programmed fractional divider.
+    bool used = false;         ///< The block has been configured (and must be restored).
+
+public:
+    uint32_t savedClkCtl = 0; ///< PWMCLK_CNTL at construction (without password).
+    uint32_t savedClkDiv = 0; ///< PWMCLK_DIV at construction (without password).
+    uint32_t savedCtl = 0;    ///< PWM_CTL at construction.
+    uint32_t savedRng = 0;    ///< PWM_RNG1 at construction.
+    uint32_t savedDmac = 0;   ///< PWM_DMAC at construction.
+
+    /** @brief Maps the PWM block and the clock manager and saves their state. */
+    pwmgpio();
+
+    /** @brief Stops the channel and restores the saved state when the block was configured. */
+    ~pwmgpio();
+
+    /**
+     * @brief Sets the crystal correction applied to the PWM clock (takes effect at the next SetFrequency()).
+     * @param ppm Correction in ppm (see clkgpio::Setppm()).
+     */
+    void Setppm(double ppm);
+
+    /**
+     * @brief Programs the period rate and the range and starts the channel with DMA requests.
+     * @param Frequency Period (sample) rate in Hz.
+     * @param Range     Period length in PWM clocks (the full-scale duty).
+     * @return 0, or -1 when the clock divider is out of range (nothing is changed).
+     */
+    int SetFrequency(uint64_t Frequency, uint32_t Range);
+
+    /**
+     * @brief Tells whether SetFrequency() can produce a period rate with the current source and correction.
+     * @param Frequency Period rate in Hz.
+     * @param Range     Period length in PWM clocks.
+     * @return True when the clock divider is within 2..4095.
+     */
+    bool FrequencyFits(uint64_t Frequency, uint32_t Range) const;
+
+    /** @brief Clears the FIFO and (re)starts the channel and DMA requests (no effect before configuration). */
+    void StartTx();
+
+    /** @brief Stops the channel, the output stays low (no effect before configuration). */
+    void StopTx();
+
+    /**
+     * @brief Returns the period rate produced by the programmed divider.
+     * @return Rate in Hz (0 before SetFrequency()).
+     */
+    double GetFrameRate() const;
+
+    /**
+     * @brief Returns the programmed range.
+     * @return Full-scale duty value.
+     */
+    uint32_t Range() const;
+
+    /**
+     * @brief Tells whether the block has been configured.
+     * @return True after a successful SetFrequency().
+     */
+    bool Used() const;
+};
+
 /** @brief Pad drive strength of GPIO 0-27, used as a coarse amplitude control. */
 class padgpio : public gpio {
 public:
@@ -715,7 +883,9 @@ enum dma_common_reg {
     dma_pllc_frac = 0x7E000000 + (PLLC_FRAC << 2) + CLK_BASE, ///< PLLC fractional multiplier.
     dma_pcm = 0x7E000000 + (PCM_FIFO_A << 2) + PCM_BASE,      ///< PCM FIFO.
     dma_fsel = 0x7E000000 + (GPFSEL0 << 2) + GENERAL_BASE,    ///< GPIO function select 0-9.
-    dma_pad = 0x7E000000 + (PADS_GPIO_0 << 2) + PADS_GPIO     ///< Pad control of GPIO 0-27.
+    dma_fsel2 = 0x7E000000 + (GPFSEL2 << 2) + GENERAL_BASE,   ///< GPIO function select 20-29.
+    dma_pad = 0x7E000000 + (PADS_GPIO_0 << 2) + PADS_GPIO,    ///< Pad control of GPIO 0-27.
+    dma_pwm = 0x7E000000 + (PWM_FIF1 << 2) + PWM_BASE         ///< PWM FIFO.
 };
 
 #endif

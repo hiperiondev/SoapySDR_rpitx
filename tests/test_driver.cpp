@@ -11,6 +11,8 @@
 // readStreamStatus and sensors. The build points the device tree, /dev/mem and /dev/vcio paths to files
 // generated in the build directory (see CMakeLists.txt).
 
+#include <chrono>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -207,6 +209,118 @@ void testStatusAndSensors() {
     CHECK(dev.getStreamMTU(st) == 0);
 }
 
+void testParsing() {
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    // Integers are decimal: a leading zero is not octal.
+    dev.writeSetting("harmonic", "010");
+    CHECK(dev.readSetting("harmonic") == "10");
+    dev.writeSetting("harmonic", "1");
+    CHECK(throws([&] { dev.writeSetting("harmonic", "0x2"); }));
+    // Floats must be complete numbers.
+    CHECK(throws([&] { dev.writeSetting("iq_scale", "2,5"); }));
+    CHECK(throws([&] { dev.writeSetting("ppm", "1.5ppm"); }));
+    dev.writeSetting("iq_scale", " 2.5 ");
+    CHECK(dev.readSetting("iq_scale") == "2.5");
+    // debug_level is range checked like the other settings.
+    CHECK(throws([&] { dev.writeSetting("debug_level", "7"); }));
+    dev.writeSetting("debug_level", "0");
+
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"fifo_ms", "0250"}, {"rt_priority", "0"}});
+    CHECK(st != nullptr);
+    dev.closeStream(st);
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"ring_size", "0x1000"}}); }));
+}
+
+void testAmplitudeSettings() {
+    SoapySDR::Kwargs args;
+    args["amplitude_quantizer"] = "sigma_delta";
+    args["ampm_lut"] = "0,0,0,0,0,0,10,-90";
+    SoapyRPITX dev(args);
+    CHECK(dev.readSetting("amplitude_quantizer") == "sigma_delta");
+    CHECK(dev.readSetting("ampm_lut") == "0,0,0,0,0,0,10,-90");
+
+    dev.writeSetting("amplitude_lut", "0.05,0.2,0.45,0.6,0.75,0.85,0.95,1");
+    CHECK(dev.readSetting("amplitude_lut") == "0.05,0.2,0.45,0.6,0.75,0.85,0.95,1");
+    CHECK(throws([&] { dev.writeSetting("amplitude_lut", "1,2,3"); }));
+    CHECK(throws([&] { dev.writeSetting("amplitude_lut", "1,2,3,4,5,6,7,"); }));
+    CHECK(dev.readSetting("amplitude_lut") == "0.05,0.2,0.45,0.6,0.75,0.85,0.95,1");
+    dev.writeSetting("amplitude_lut", "");
+    CHECK(dev.readSetting("amplitude_lut").empty());
+    CHECK(throws([&] { dev.writeSetting("amplitude_quantizer", "dither"); }));
+    CHECK(throws([&] { dev.writeSetting("sigma_delta_order", "3"); }));
+    CHECK(throws([&] { dev.writeSetting("envelope_delay", "99"); }));
+    dev.writeSetting("envelope_delay", "1.25");
+    CHECK(dev.readSetting("envelope_delay") == "1.25");
+    dev.writeSetting("eer_lut", "0,0.6,0.9,1");
+    CHECK(throws([&] { dev.writeSetting("eer_drive", "8"); }));
+    CHECK(throws([&] { dev.writeSetting("eer_gain", "0"); }));
+    dev.writeSetting("rfdac_lut", "0.6,0.3,0.95");
+    CHECK(dev.readSetting("rfdac_lut") == "0.6,0.3,0.95");
+
+    bool haveLut = false, haveEer = false;
+    for (const auto &a : dev.getSettingInfo()) {
+        haveLut = haveLut || a.key == "amplitude_lut";
+        haveEer = haveEer || a.key == "eer_drive";
+    }
+    CHECK(haveLut && haveEer);
+}
+
+void testEnvelopeStreamArguments() {
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"envelope_output", "dac"}}); }));
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"pwm_gpio", "13"}}); }));
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"slots_per_sample", "5"}}); }));
+    dev.setSampleRate(SOAPY_SDR_TX, 0, 96000);
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"slots_per_sample", "4"}}); }));
+    dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {},
+                                           {{"envelope_output", "pwm"}, {"pwm_bits", "10"}, {"slots_per_sample", "2"}, {"rt_priority", "0"}});
+    CHECK(st != nullptr);
+    CHECK(std::fabs(std::stod(dev.readSensor("sample_rate")) - kRate) < kRate * 1e-3);
+    CHECK(dev.readSensor("envelope_clip") == "0");
+    // The slot rate of the open stream limits the sample rate.
+    CHECK(throws([&] { dev.setSampleRate(SOAPY_SDR_TX, 0, 192000); }));
+    dev.closeStream(st);
+
+    bool haveEnv = false, haveSlots = false;
+    for (const auto &a : dev.getStreamArgsInfo(SOAPY_SDR_TX, 0)) {
+        haveEnv = haveEnv || a.key == "envelope_output";
+        haveSlots = haveSlots || a.key == "slots_per_sample";
+    }
+    CHECK(haveEnv && haveSlots);
+}
+
+void testCloseDuringDrain() {
+    // closeStream() stops the transmitter at once, even while deactivateStream() waits for the burst.
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"fifo_ms", "3000"}});
+    CHECK(dev.activateStream(st) == 0);
+    std::vector<std::complex<float>> buf(2 * kRate, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = SOAPY_SDR_END_BURST;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+
+    std::thread drain([&] { dev.deactivateStream(st); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto t0 = std::chrono::steady_clock::now();
+    dev.closeStream(st);
+    SoapySDR::Stream *again = nullptr;
+    for (int i = 0; i < 50 && again == nullptr; i++) {
+        try {
+            again = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+        } catch (const std::runtime_error &) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    CHECK(again != nullptr);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
+    drain.join();
+    if (again != nullptr)
+        dev.closeStream(again);
+}
+
 } // namespace
 
 int main() {
@@ -214,6 +328,10 @@ int main() {
     testStreamArguments();
     testFormats();
     testStatusAndSensors();
+    testParsing();
+    testAmplitudeSettings();
+    testEnvelopeStreamArguments();
+    testCloseDuringDrain();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

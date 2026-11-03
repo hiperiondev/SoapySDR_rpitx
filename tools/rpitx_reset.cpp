@@ -22,7 +22,8 @@
 // - The session record left in the lock file is recovered: DMA channel reset, carrier off, pads, PCM and
 //   clock tree restored, VideoCore memory released.
 // - Without a record, a clock output left on GPIO4 is switched off and GPCLK0 is stopped.
-// - --dma-channel N additionally resets DMA channel N (e.g. after a crash of another librpitx program).
+// - --dma-channel N additionally resets DMA channel N (e.g. after a crash of another librpitx program); only legacy
+//   channels not reserved for the kernel are accepted (0-10 on BCM2711, 0-14 otherwise).
 //
 // Run as root. Suitable for ExecStopPost= in systemd units.
 
@@ -72,6 +73,8 @@ int main(int argc, char **argv) {
         SoapyRPITX_Session session(kRfGpio);
         if (session.Recovered()) {
             std::printf("recovered the transmitter left by %s\n", session.RecoveryReport().c_str());
+        } else if (session.Discarded()) {
+            std::printf("discarded an implausible transmitter record (%s); nothing was restored\n", session.RecoveryReport().c_str());
         } else {
             generalgpio g;
             if (((g.gpioreg[GPFSEL0] >> (3 * kRfGpio)) & 7) == fsel_alt0) {
@@ -87,6 +90,10 @@ int main(int argc, char **argv) {
         }
 
         if (extraChannel >= 0) {
+            if (extraChannel > bcm_host_get_max_legacy_dma_channel()) {
+                std::fprintf(stderr, "DMA channel %d is not a legacy channel of this SoC (DMA4 layout); not reset\n", extraChannel);
+                return 1;
+            }
             bool known = false;
             uint32_t mask = bcm_host_get_kernel_dma_mask(&known);
             if (known && ((mask >> extraChannel) & 1u)) {

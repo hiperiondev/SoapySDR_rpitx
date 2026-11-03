@@ -19,9 +19,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/gpio.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -68,6 +70,15 @@ std::string SoapyRPITX_FormatRecord(const SoapyRPITX_SessionRecord &r) {
         put(out, "pcm_ctl", r.pcmCtl);
         put(out, "pcm_div", r.pcmDiv);
     }
+    for (const auto &pf : r.pinFunctions)
+        put(out, ("pin_function_" + std::to_string(pf.first)).c_str(), pf.second);
+    if (r.pwmValid) {
+        put(out, "pwm_clk_ctl", r.pwmClkCtl);
+        put(out, "pwm_clk_div", r.pwmClkDiv);
+        put(out, "pwm_ctl", r.pwmCtl);
+        put(out, "pwm_rng", r.pwmRng);
+        put(out, "pwm_dmac", r.pwmDmac);
+    }
     const ClockTreeState &t = r.clockTree;
     if (t.valid) {
         put(out, "core_ctl", t.coreCtl);
@@ -94,6 +105,7 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
     bool havePid = false;
     int treeFields = 0;
     int pcmFields = 0;
+    int pwmFields = 0;
 
     std::istringstream in(text);
     std::string line;
@@ -126,6 +138,27 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
         } else if (key == "pcm_div") {
             r.pcmDiv = u;
             pcmFields++;
+        } else if (key.compare(0, 13, "pin_function_") == 0 && key.size() > 13) {
+            char *pinEnd = nullptr;
+            long pin = std::strtol(key.c_str() + 13, &pinEnd, 10);
+            if (*pinEnd == '\0' && pin >= 0 && pin <= 53)
+                r.pinFunctions.emplace_back((unsigned) pin, u & 7);
+        } else if (key.compare(0, 4, "pwm_") == 0) {
+            uint32_t *field = nullptr;
+            if (key == "pwm_clk_ctl")
+                field = &r.pwmClkCtl;
+            else if (key == "pwm_clk_div")
+                field = &r.pwmClkDiv;
+            else if (key == "pwm_ctl")
+                field = &r.pwmCtl;
+            else if (key == "pwm_rng")
+                field = &r.pwmRng;
+            else if (key == "pwm_dmac")
+                field = &r.pwmDmac;
+            if (field != nullptr) {
+                *field = u;
+                pwmFields++;
+            }
         } else {
             uint32_t *field = nullptr;
             if (key == "core_ctl")
@@ -164,8 +197,60 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
     }
 
     r.pcmValid = pcmFields == 2;
+    r.pwmValid = pwmFields == 5;
     r.clockTree.valid = treeFields == 17;
     return havePid;
+}
+
+uint32_t SoapyRPITX_RestoredFunction(unsigned pin, uint32_t function) {
+    if ((pin == 4 && function == fsel_alt0) || (pin == 20 && function == fsel_alt5))
+        return fsel_input;
+    return function & 7;
+}
+
+bool SoapyRPITX_RecordPlausible(const SoapyRPITX_SessionRecord &r, std::string &why) {
+    auto validSource = [](uint32_t ctl) { return (ctl & CM_SRC_MASK) <= 7; };
+
+    if (r.dmaChannel >= 0) {
+        if (r.dmaChannel > bcm_host_get_max_legacy_dma_channel()) {
+            why = "DMA channel " + std::to_string(r.dmaChannel) + " is not a legacy channel of this SoC";
+            return false;
+        }
+        bool known = false;
+        uint32_t mask = bcm_host_get_kernel_dma_mask(&known);
+        if (!known || ((mask >> r.dmaChannel) & 1u) != 0) {
+            why = "DMA channel " + std::to_string(r.dmaChannel) + (known ? " is reserved for the kernel" : " cannot be checked against the kernel mask");
+            return false;
+        }
+    }
+    if (r.pads > 0x1F) {
+        why = "invalid pad value";
+        return false;
+    }
+    for (const auto &pf : r.pinFunctions) {
+        if (pf.first > 27) {
+            why = "GPIO" + std::to_string(pf.first) + " is not used by the transmitter";
+            return false;
+        }
+    }
+    if (r.pcmValid && (r.pcmCtl & CM_SRC_MASK) > 7) {
+        why = "invalid PCM clock";
+        return false;
+    }
+    if (r.pwmValid && (r.pwmClkCtl & CM_SRC_MASK) > 7) {
+        why = "invalid PWM clock";
+        return false;
+    }
+    const ClockTreeState &t = r.clockTree;
+    if (t.valid) {
+        uint32_t pdiv = (t.pllcCtrl >> 12) & 7;
+        uint32_t ndiv = t.pllcCtrl & 0x3FF;
+        if (pdiv == 0 || ndiv == 0 || !validSource(t.coreCtl) || !validSource(t.emmcCtl) || !validSource(t.gp0Ctl)) {
+            why = "invalid clock tree";
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsigned gpioLine) {
@@ -173,7 +258,7 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
     log << "process " << r.pid << ":";
 
     // Stop the transmission first: the DMA rewrites GPFSEL0 on every data slot.
-    if (r.dmaChannel >= 0 && r.dmaChannel <= 14) {
+    if (r.dmaChannel >= 0 && r.dmaChannel <= bcm_host_get_max_legacy_dma_channel()) {
         try {
             dmagpio d;
             d.gpioreg[DMA_CS + r.dmaChannel * DMA_CHANNEL_WORDS] = BCM2708_DMA_RESET;
@@ -187,9 +272,12 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
 
     try {
         generalgpio g;
-        uint32_t function = r.gpioFunction == fsel_alt0 ? (uint32_t) fsel_input : r.gpioFunction;
-        g.setmode(gpioLine, function);
+        g.setmode(gpioLine, SoapyRPITX_RestoredFunction(gpioLine, r.gpioFunction));
         log << " GPIO" << gpioLine << " restored;";
+        for (const auto &pf : r.pinFunctions) {
+            g.setmode(pf.first, SoapyRPITX_RestoredFunction(pf.first, pf.second));
+            log << " GPIO" << pf.first << " restored;";
+        }
     } catch (const std::exception &e) {
         log << " GPIO restore failed (" << e.what() << ");";
     }
@@ -205,14 +293,31 @@ std::string SoapyRPITX_RecoverHardware(const SoapyRPITX_SessionRecord &r, unsign
     try {
         gpio cm(CLK_BASE, CLK_LEN);
         cm_stop_generator(cm.gpioreg, GPCLK_CNTL);
-        try {
-            gpio pcm(PCM_BASE, PCM_LEN);
-            pcm.gpioreg[PCM_CS_A] = 0;
-        } catch (const std::exception &) {
+        if (r.pcmValid) {
+            try {
+                gpio pcm(PCM_BASE, PCM_LEN);
+                pcm.gpioreg[PCM_CS_A] = 0;
+            } catch (const std::exception &) {
+            }
         }
         if (r.pcmValid)
             cm_program_generator(cm.gpioreg, PCMCLK_CNTL, r.pcmCtl & CM_SRC_MASK, (r.pcmCtl >> CM_MASH_SHIFT) & 3, (r.pcmDiv >> 12) & 0xFFF, r.pcmDiv & 0xFFF,
                                  (r.pcmCtl & CM_ENAB) != 0);
+        if (r.pwmValid) {
+            try {
+                gpio pwm(PWM_BASE, PWM_LEN);
+                pwm.gpioreg[PWM_CTL] = 0;
+                pwm.gpioreg[PWM_DMAC] = 0;
+                cm_program_generator(cm.gpioreg, PWMCLK_CNTL, r.pwmClkCtl & CM_SRC_MASK, (r.pwmClkCtl >> CM_MASH_SHIFT) & 3, (r.pwmClkDiv >> 12) & 0xFFF,
+                                     r.pwmClkDiv & 0xFFF, (r.pwmClkCtl & CM_ENAB) != 0);
+                pwm.gpioreg[PWM_RNG1] = r.pwmRng;
+                pwm.gpioreg[PWM_DMAC] = r.pwmDmac;
+                pwm.gpioreg[PWM_CTL] = r.pwmCtl;
+                log << " PWM restored;";
+            } catch (const std::exception &e) {
+                log << " PWM restore failed (" << e.what() << ");";
+            }
+        }
         if (r.clockTree.valid) {
             cm_restore_tree(cm.gpioreg, r.clockTree);
             log << " clock tree restored;";
@@ -268,8 +373,10 @@ bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer) {
     return false;
 }
 
-bool SoapyRPITX_I2sEnabled() {
-    std::ifstream in(RPITX_DT_ROOT "/soc/i2s@7e203000/status", std::ios::binary);
+namespace {
+
+bool nodeEnabled(const char *path) {
+    std::ifstream in(path, std::ios::binary);
     if (!in)
         return false;
     std::string status;
@@ -277,16 +384,55 @@ bool SoapyRPITX_I2sEnabled() {
     return status == "okay" || status == "ok";
 }
 
+// Owner of the lock: the recorded process, or a child that inherited the lock when the recorded process no
+// longer exists.
+std::string lockOwner(int fd) {
+    SoapyRPITX_SessionRecord r;
+    if (!SoapyRPITX_ParseRecord(readAll(fd), r))
+        return "";
+    if (r.pid > 0 && kill((pid_t) r.pid, 0) != 0 && errno == ESRCH)
+        return " by a child process of terminated process " + std::to_string(r.pid) + " (a fork that inherited the lock)";
+    return " by process " + std::to_string(r.pid);
+}
+
+void checkPrivateDirectory(const std::string &dir) {
+    if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST)
+        throw std::runtime_error("rpitx: cannot create the lock directory " + dir + ": " + strerror(errno));
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0)
+        throw std::runtime_error("rpitx: cannot access the lock directory " + dir + ": " + strerror(errno));
+    if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) != 0)
+        throw std::runtime_error("rpitx: the lock directory " + dir + " must be a directory owned by the user running the driver, with mode 0700");
+}
+
+} // namespace
+
+bool SoapyRPITX_I2sEnabled() {
+    return nodeEnabled(RPITX_DT_ROOT "/soc/i2s@7e203000/status");
+}
+
+bool SoapyRPITX_PwmEnabled() {
+    return nodeEnabled(RPITX_DT_ROOT "/soc/pwm@7e20c000/status") || nodeEnabled(RPITX_DT_ROOT "/soc/audio/status") ||
+           nodeEnabled(RPITX_DT_ROOT "/audio/status");
+}
+
 SoapyRPITX_Session::SoapyRPITX_Session(unsigned gpioLine) {
+    checkPrivateDirectory(RPITX_LOCK_DIR);
     std::string path = LockPath();
-    fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0)
         throw std::runtime_error("rpitx: cannot open the lock file " + path + ": " + strerror(errno));
 
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1) {
+        close(fd);
+        fd = -1;
+        throw std::runtime_error("rpitx: the lock file " + path + " must be a regular file owned by the user running the driver");
+    }
+
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         int err = errno;
-        SoapyRPITX_SessionRecord r;
-        std::string owner = SoapyRPITX_ParseRecord(readAll(fd), r) ? " by process " + std::to_string(r.pid) : "";
+        std::string owner = lockOwner(fd);
         close(fd);
         fd = -1;
         if (err == EWOULDBLOCK)
@@ -296,8 +442,14 @@ SoapyRPITX_Session::SoapyRPITX_Session(unsigned gpioLine) {
 
     SoapyRPITX_SessionRecord stale;
     if (SoapyRPITX_ParseRecord(readAll(fd), stale)) {
-        report = SoapyRPITX_RecoverHardware(stale, gpioLine);
-        recovered = true;
+        std::string why;
+        if (SoapyRPITX_RecordPlausible(stale, why)) {
+            report = SoapyRPITX_RecoverHardware(stale, gpioLine);
+            recovered = true;
+        } else {
+            report = "process " + std::to_string(stale.pid) + ": " + why;
+            discarded = true;
+        }
     }
     Clear();
 }
@@ -311,6 +463,10 @@ SoapyRPITX_Session::~SoapyRPITX_Session() {
 
 bool SoapyRPITX_Session::Recovered() const {
     return recovered;
+}
+
+bool SoapyRPITX_Session::Discarded() const {
+    return discarded;
 }
 
 const std::string &SoapyRPITX_Session::RecoveryReport() const {

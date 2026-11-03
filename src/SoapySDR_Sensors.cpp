@@ -31,7 +31,7 @@
 // ******************** Sensor API ********************
 
 std::vector<std::string> SoapyRPITX::listSensors(void) const {
-    return {"pll_locked", "dma_running", "fifo_fill", "underflows", "late", "dma_errors", "sample_rate"};
+    return {"pll_locked", "dma_running", "fifo_fill", "underflows", "late", "dma_errors", "sample_rate", "envelope_clip", "envelope_late"};
 }
 
 SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
@@ -71,9 +71,19 @@ SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
         info.value = "0";
     } else if (key == "sample_rate") {
         info.name = "Actual sample rate";
-        info.description = "Sample rate produced by the PCM pacing clock (the nominal rate quantised by its divider).";
+        info.description = "IQ sample rate produced by the pacing clock (the nominal rate quantised by its divider).";
         info.type = SoapySDR::ArgInfo::FLOAT;
         info.units = "Hz";
+        info.value = "0";
+    } else if (key == "envelope_clip") {
+        info.name = "Envelope clips";
+        info.description = "Slots whose envelope (|IQ| x iq_scale, or the EER code) exceeded full scale and was limited.";
+        info.type = SoapySDR::ArgInfo::INT;
+        info.value = "0";
+    } else if (key == "envelope_late") {
+        info.name = "Late envelope words";
+        info.description = "Envelope words that could not be written ahead of their sample because the DMA ring was nearly empty.";
+        info.type = SoapySDR::ArgInfo::INT;
         info.value = "0";
     } else {
         throw std::runtime_error("rpitx: unknown sensor '" + key + "'");
@@ -109,6 +119,10 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
         return std::to_string(stats.underflows);
     if (key == "dma_errors")
         return std::to_string(stats.dmaErrors);
+    if (key == "envelope_clip")
+        return std::to_string(stats.envelopeClips);
+    if (key == "envelope_late")
+        return std::to_string(stats.envelopeLate);
     if (key == "sample_rate") {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.3f", tx.GetActualSampleRate());

@@ -38,7 +38,25 @@
 namespace {
 
 // Keys accepted both as device arguments and as settings.
-const char *const kSettingKeys[] = {"ppm", "ppm_ntp", "harmonic", "amplitude_mode", "iq_scale", "debug_level"};
+const char *const kSettingKeys[] = {"ppm",
+                                    "ppm_ntp",
+                                    "harmonic",
+                                    "amplitude_mode",
+                                    "iq_scale",
+                                    "debug_level",
+                                    "amplitude_lut",
+                                    "ampm_lut",
+                                    "amplitude_quantizer",
+                                    "sigma_delta_order",
+                                    "envelope_delay",
+                                    "envelope_floor",
+                                    "rfdac_lut",
+                                    "eer_lut",
+                                    "eer_ampm_lut",
+                                    "eer_gain",
+                                    "eer_offset",
+                                    "eer_idle",
+                                    "eer_drive"};
 // Device arguments produced by enumeration and by SoapySDR itself; they are not settings.
 const char *const kIdentificationKeys[] = {"driver", "label", "product", "serial", "manufacturer", "tuner", "type"};
 
@@ -65,13 +83,16 @@ double parseDouble(const std::string &key, const std::string &value) {
     in >> v;
     if (in.fail() || !std::isfinite(v))
         throw std::runtime_error("rpitx: invalid value '" + value + "' for " + key);
+    in >> std::ws;
+    if (!in.eof())
+        throw std::runtime_error("rpitx: invalid value '" + value + "' for " + key);
     return v;
 }
 
 long parseInt(const std::string &key, const std::string &value) {
     try {
         size_t used = 0;
-        long v = std::stol(value, &used, 0);
+        long v = std::stol(value, &used, 10);
         if (used != value.size())
             throw std::invalid_argument(value);
         return v;
@@ -95,6 +116,44 @@ std::string formatDouble(double v) {
     out.imbue(std::locale::classic());
     out << v;
     return out.str();
+}
+
+// Comma-separated list of numbers; an empty string is an empty list. Angles are given in degrees.
+std::vector<double> parseList(const std::string &key, const std::string &value, double scale) {
+    std::vector<double> out;
+    std::string item;
+    std::istringstream in(value);
+    bool any = false;
+    while (std::getline(in, item, ',')) {
+        any = true;
+        out.push_back(parseDouble(key, item) * scale);
+    }
+    if (any && value.back() == ',')
+        throw std::runtime_error("rpitx: invalid value '" + value + "' for " + key);
+    return out;
+}
+
+std::string formatList(const std::vector<double> &v, double scale) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i)
+            s += ",";
+        s += formatDouble(v[i] / scale);
+    }
+    return s;
+}
+
+constexpr double kDegree = M_PI / 180.0;
+
+SoapySDR::ArgInfo makeArg(const char *key, const char *value, const char *name, const char *description, SoapySDR::ArgInfo::Type type, const char *units = "") {
+    SoapySDR::ArgInfo a;
+    a.key = key;
+    a.value = value;
+    a.name = name;
+    a.description = description;
+    a.type = type;
+    a.units = units;
+    return a;
 }
 
 } // namespace
@@ -126,6 +185,8 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
 SoapyRPITX::~SoapyRPITX(void) {
     std::lock_guard<std::mutex> lock(device_mutex);
     streamHandle.store(nullptr);
+    if (tx_stream)
+        tx_stream->transmitter().Stop();
     tx_stream.reset();
 }
 
@@ -224,6 +285,57 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     debug.range = SoapySDR::Range(0, 2, 1);
     setArgs.push_back(debug);
 
+    setArgs.push_back(makeArg("amplitude_lut", "", "Amplitude table",
+                              "Relative RF amplitude of pad drive levels 0-7, 8 comma-separated increasing values measured at the operating band "
+                              "(empty: (level + 1) / 8).",
+                              SoapySDR::ArgInfo::STRING));
+    setArgs.push_back(makeArg("ampm_lut", "", "AM/PM table", "Phase of pad drive levels 0-7 relative to the reference, 8 comma-separated values (empty: 0).",
+                              SoapySDR::ArgInfo::STRING, "deg"));
+    SoapySDR::ArgInfo quant = makeArg("amplitude_quantizer", "nearest", "Amplitude quantizer",
+                                      "nearest: amplitude state nearest to |IQ|; sigma_delta: noise-shaped selection (quantisation noise moved away from "
+                                      "the carrier, up to +/- slot rate / 2).",
+                                      SoapySDR::ArgInfo::STRING);
+    quant.options = {"nearest", "sigma_delta"};
+    quant.optionNames = {"Nearest", "Sigma-delta"};
+    setArgs.push_back(quant);
+    SoapySDR::ArgInfo order = makeArg("sigma_delta_order", "2", "Sigma-delta order", "Order of the error feedback.", SoapySDR::ArgInfo::INT);
+    order.range = SoapySDR::Range(1, 2, 1);
+    setArgs.push_back(order);
+    SoapySDR::ArgInfo delay = makeArg("envelope_delay", "0.5", "Envelope delay",
+                                      "Delay of the envelope relative to the phase path (0.5 aligns the held envelope with the phase ramp of each "
+                                      "sample; adjust with a two-tone test).",
+                                      SoapySDR::ArgInfo::FLOAT, "samples");
+    delay.range = SoapySDR::Range(-RPITX_MAX_ENVELOPE_DELAY, RPITX_MAX_ENVELOPE_DELAY);
+    setArgs.push_back(delay);
+    SoapySDR::ArgInfo floorArg = makeArg("envelope_floor", "0", "Envelope floor",
+                                         "Envelope below which the carrier is switched off after 2 ms (0 disables it).", SoapySDR::ArgInfo::FLOAT);
+    floorArg.range = SoapySDR::Range(0, 1);
+    setArgs.push_back(floorArg);
+    setArgs.push_back(makeArg("rfdac_lut", "", "RF-DAC table",
+                              "Relative RF amplitude with GPIO4 only, GPIO20 only and both clock pins on (rf_dac stream argument), 3 values "
+                              "(empty: 2/3, 1/3, 1).",
+                              SoapySDR::ArgInfo::STRING));
+    setArgs.push_back(makeArg("eer_lut", "", "EER table",
+                              "RF amplitude measured at equally spaced envelope codes from 0 to full scale, 2-64 increasing values (empty: linear).",
+                              SoapySDR::ArgInfo::STRING));
+    setArgs.push_back(makeArg("eer_ampm_lut", "", "EER AM/PM table", "Phase measured at equally spaced envelope codes, 2-64 values (empty: 0).",
+                              SoapySDR::ArgInfo::STRING, "deg"));
+    SoapySDR::ArgInfo gain = makeArg("eer_gain", "1.0", "EER gain", "Gain applied to the envelope code.", SoapySDR::ArgInfo::FLOAT);
+    gain.range = SoapySDR::Range(0, 10);
+    setArgs.push_back(gain);
+    SoapySDR::ArgInfo offset =
+            makeArg("eer_offset", "0", "EER offset", "Offset added to the envelope code (fraction of full scale).", SoapySDR::ArgInfo::FLOAT);
+    offset.range = SoapySDR::Range(-1, 1);
+    setArgs.push_back(offset);
+    SoapySDR::ArgInfo idle = makeArg("eer_idle", "0", "EER idle code", "Envelope code output while no sample is transmitted (fraction of full scale).",
+                                     SoapySDR::ArgInfo::FLOAT);
+    idle.range = SoapySDR::Range(0, 1);
+    setArgs.push_back(idle);
+    SoapySDR::ArgInfo drive =
+            makeArg("eer_drive", "7", "EER drive", "Pad drive level of the clock pins while the EER output is active.", SoapySDR::ArgInfo::INT);
+    drive.range = SoapySDR::Range(0, 7, 1);
+    setArgs.push_back(drive);
+
     return setArgs;
 }
 
@@ -261,11 +373,57 @@ void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) 
             tx_stream->transmitter().SetIqScale(iqScale);
     } else if (key == "debug_level") {
         long d = parseInt(key, value);
-        debugLevel = (int) std::min<long>(std::max<long>(d, 0), 2);
+        if (d < 0 || d > 2)
+            throw std::runtime_error("rpitx: debug_level out of range [0, 2]");
+        debugLevel = (int) d;
         dbg_setlevel(debugLevel);
     } else {
-        throw std::runtime_error("rpitx: unknown setting '" + key + "'");
+        SoapyRPITX_AmplitudeConfig a = ampCfg;
+        if (key == "amplitude_lut") {
+            a.amplitudeLut = parseList(key, value, 1.0);
+        } else if (key == "ampm_lut") {
+            a.ampmLut = parseList(key, value, kDegree);
+        } else if (key == "amplitude_quantizer") {
+            if (value == "nearest")
+                a.quantizer = SoapyRPITX_Quantizer::Nearest;
+            else if (value == "sigma_delta")
+                a.quantizer = SoapyRPITX_Quantizer::SigmaDelta;
+            else
+                throw std::runtime_error("rpitx: amplitude_quantizer must be 'nearest' or 'sigma_delta'");
+        } else if (key == "sigma_delta_order") {
+            a.sigmaDeltaOrder = (int) parseInt(key, value);
+        } else if (key == "envelope_delay") {
+            a.envelopeDelay = parseDouble(key, value);
+        } else if (key == "envelope_floor") {
+            a.envelopeFloor = parseDouble(key, value);
+        } else if (key == "rfdac_lut") {
+            a.rfdacLut = parseList(key, value, 1.0);
+        } else if (key == "eer_lut") {
+            a.eerLut = parseList(key, value, 1.0);
+        } else if (key == "eer_ampm_lut") {
+            a.eerAmpmLut = parseList(key, value, kDegree);
+        } else if (key == "eer_gain") {
+            a.eerGain = parseDouble(key, value);
+        } else if (key == "eer_offset") {
+            a.eerOffset = parseDouble(key, value);
+        } else if (key == "eer_idle") {
+            a.eerIdle = parseDouble(key, value);
+        } else if (key == "eer_drive") {
+            a.eerDrive = (int) parseInt(key, value);
+        } else {
+            throw std::runtime_error("rpitx: unknown setting '" + key + "'");
+        }
+        ApplyAmplitude(a);
     }
+}
+
+void SoapyRPITX::ApplyAmplitude(const SoapyRPITX_AmplitudeConfig &a) {
+    std::string why = SoapyRPITX_CheckAmplitudeConfig(a);
+    if (!why.empty())
+        throw std::runtime_error("rpitx: " + why);
+    if (tx_stream && !tx_stream->transmitter().SetAmplitudeConfig(a))
+        throw std::runtime_error("rpitx: envelope_delay needs more look-ahead than the DMA ring of the open stream allows");
+    ampCfg = a;
 }
 
 std::string SoapyRPITX::readSetting(const std::string &key) const {
@@ -283,6 +441,32 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
         return formatDouble(iqScale);
     if (key == "debug_level")
         return std::to_string(debugLevel);
+    if (key == "amplitude_lut")
+        return formatList(ampCfg.amplitudeLut, 1.0);
+    if (key == "ampm_lut")
+        return formatList(ampCfg.ampmLut, kDegree);
+    if (key == "amplitude_quantizer")
+        return ampCfg.quantizer == SoapyRPITX_Quantizer::SigmaDelta ? "sigma_delta" : "nearest";
+    if (key == "sigma_delta_order")
+        return std::to_string(ampCfg.sigmaDeltaOrder);
+    if (key == "envelope_delay")
+        return formatDouble(ampCfg.envelopeDelay);
+    if (key == "envelope_floor")
+        return formatDouble(ampCfg.envelopeFloor);
+    if (key == "rfdac_lut")
+        return formatList(ampCfg.rfdacLut, 1.0);
+    if (key == "eer_lut")
+        return formatList(ampCfg.eerLut, 1.0);
+    if (key == "eer_ampm_lut")
+        return formatList(ampCfg.eerAmpmLut, kDegree);
+    if (key == "eer_gain")
+        return formatDouble(ampCfg.eerGain);
+    if (key == "eer_offset")
+        return formatDouble(ampCfg.eerOffset);
+    if (key == "eer_idle")
+        return formatDouble(ampCfg.eerIdle);
+    if (key == "eer_drive")
+        return std::to_string(ampCfg.eerDrive);
 
     throw std::runtime_error("rpitx: unknown setting '" + key + "'");
 }
@@ -459,10 +643,16 @@ void SoapyRPITX::setSampleRate(const int direction, const size_t, const double r
     std::lock_guard<std::mutex> lock(device_mutex);
     SoapyRPITX_TuneConfig t = tune;
     t.sampleRate = (uint32_t) std::lround(rate);
-    if (tx_stream && !SoapyRPITX_RingFitsRate(tx_stream->transmitter().RingSize(), t.sampleRate))
-        throw std::runtime_error("rpitx: the DMA ring of the open stream (" + std::to_string(tx_stream->transmitter().RingSize()) +
-                                 " samples) is shorter than " + std::to_string(RPITX_MIN_RING_MS) + " ms at " + std::to_string(t.sampleRate) +
-                                 " Hz; close the stream or set ring_size");
+    if (tx_stream) {
+        const uint64_t slotRate = (uint64_t) t.sampleRate * tx_stream->transmitter().SlotsPerSample();
+        if (slotRate > RPITX_MAX_SAMPLE_RATE)
+            throw std::runtime_error("rpitx: sample rate " + formatDouble(rate) + " Hz times slots_per_sample of the open stream exceeds " +
+                                     std::to_string(RPITX_MAX_SAMPLE_RATE) + " Hz");
+        if (!SoapyRPITX_RingFitsRate(tx_stream->transmitter().RingSize(), (uint32_t) slotRate))
+            throw std::runtime_error("rpitx: the DMA ring of the open stream (" + std::to_string(tx_stream->transmitter().RingSize()) +
+                                     " slots) is shorter than " + std::to_string(RPITX_MIN_RING_MS) + " ms at " + std::to_string(slotRate) +
+                                     " slots/s; close the stream or set ring_size");
+    }
     ApplyTune(t);
     SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: sample rate %u Hz", t.sampleRate);
 }

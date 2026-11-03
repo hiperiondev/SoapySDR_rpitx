@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -42,8 +43,9 @@ std::map<unsigned, Allocation> g_maps;  // physical base -> mapping
 std::map<unsigned, Allocation> g_vcmem; // memory handle -> allocation
 unsigned g_nextHandle = 1;
 uint32_t g_kernelDmaMask = 0;
-bool g_kernelDmaMaskKnown = false;
+bool g_kernelDmaMaskKnown = true;
 bool g_failNextAlloc = false;
+std::function<void()> g_vcMapHook;
 
 constexpr unsigned kPeriBase = 0x20000000; // BCM2835 peripheral base reported without a device tree
 
@@ -116,10 +118,17 @@ unsigned mem_unlock(int, unsigned) {
 }
 
 void *mapmem(unsigned base, unsigned size) {
-    std::lock_guard<std::mutex> l(g_lock);
+    std::unique_lock<std::mutex> l(g_lock);
     unsigned handle = base >> 24;
-    if (base < kPeriBase && g_vcmem.count(handle))
-        return g_vcmem[handle].mem;
+    if (base < kPeriBase && g_vcmem.count(handle)) {
+        void *mem = g_vcmem[handle].mem;
+        std::function<void()> hook;
+        hook.swap(g_vcMapHook);
+        l.unlock();
+        if (hook)
+            hook();
+        return mem;
+    }
 
     auto it = g_maps.find(base);
     if (it != g_maps.end())
@@ -147,6 +156,10 @@ unsigned bcm_host_get_sdram_address(void) {
     return 0x40000000u;
 }
 
+int bcm_host_get_max_legacy_dma_channel(void) {
+    return 14;
+}
+
 uint32_t bcm_host_get_kernel_dma_mask(bool *known) {
     std::lock_guard<std::mutex> l(g_lock);
     *known = g_kernelDmaMaskKnown;
@@ -157,6 +170,11 @@ void MockSetKernelDmaMask(uint32_t mask, bool known) {
     std::lock_guard<std::mutex> l(g_lock);
     g_kernelDmaMask = mask;
     g_kernelDmaMaskKnown = known;
+}
+
+void MockOnNextVcMap(std::function<void()> hook) {
+    std::lock_guard<std::mutex> l(g_lock);
+    g_vcMapHook = std::move(hook);
 }
 
 void MockFailNextAlloc() {
@@ -206,6 +224,81 @@ void MockDmaEngine::Run() {
     using clock = std::chrono::steady_clock;
     auto last = clock::now();
     double credit = 0;
+    bool wasActive = false;
+    std::deque<uint32_t> fifo;
+    uint32_t frac = 0, pad = kDefaultPads, fsel0 = 0, fsel2 = 0;
+
+    // Executes control blocks until a DREQ-paced block finds the FIFO at its DREQ level.
+    auto runChain = [&](volatile uint32_t *cb) {
+        for (int guard = 0; guard < 1000000; guard++) {
+            uint32_t bus = *cb;
+            unsigned handle = (bus >> 24) & 0x3F;
+            uint8_t *mem;
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                auto it = g_vcmem.find(handle);
+                if (it == g_vcmem.end())
+                    return;
+                mem = (uint8_t *) it->second.mem;
+            }
+            const uint32_t busBase = 0x40000000u | (handle << 24);
+            const volatile uint32_t *block = (const volatile uint32_t *) (mem + (bus - busBase));
+            const uint32_t info = block[0], src = block[1], dst = block[2], next = block[5];
+            const uint32_t value = *(const volatile uint32_t *) (mem + (src - busBase));
+
+            if (info & BCM2708_DMA_D_DREQ) {
+                uint32_t level = 1;
+                if (dst == (uint32_t) dma_pcm) {
+                    volatile uint32_t *pcm = MockRegisters(PCM_BASE);
+                    level = pcm != nullptr ? (pcm[PCM_DREQ_A] >> 8) & 0x7F : 1;
+                } else if (dst == (uint32_t) dma_pwm) {
+                    volatile uint32_t *p = MockRegisters(PWM_BASE);
+                    level = p != nullptr ? p[PWM_DMAC] & 0xFF : 1;
+                }
+                if (level == 0)
+                    level = 1;
+                if (fifo.size() >= level)
+                    return;
+                fifo.push_back(value);
+            } else {
+                volatile uint32_t *regs = nullptr;
+                uint32_t word = 0;
+                if (dst == (uint32_t) dma_pllc_frac) {
+                    frac = value;
+                    regs = MockRegisters(CLK_BASE);
+                    word = PLLC_FRAC;
+                } else if (dst == (uint32_t) dma_pad) {
+                    pad = value;
+                    regs = MockRegisters(PADS_GPIO);
+                    word = PADS_GPIO_0;
+                } else if (dst == (uint32_t) dma_fsel) {
+                    fsel0 = value;
+                    regs = MockRegisters(GENERAL_BASE);
+                    word = GPFSEL0;
+                } else if (dst == (uint32_t) dma_fsel2) {
+                    fsel2 = value;
+                    regs = MockRegisters(GENERAL_BASE);
+                    word = GPFSEL2;
+                }
+                if (regs != nullptr)
+                    regs[word] = value;
+            }
+            *cb = next;
+        }
+    };
+
+    auto record = [&](uint32_t out, bool outValid) {
+        MockSlot s;
+        s.frac = frac & 0xFFFFF;
+        s.pad = pad & 0x7;
+        s.hysteresis = (pad & PADS_HYST) != 0;
+        s.carrierOn = ((fsel0 >> 12) & 7) == fsel_alt0;
+        s.carrier2On = (fsel2 & 7) == fsel_alt5;
+        s.dac = out;
+        s.dacValid = outValid;
+        std::lock_guard<std::mutex> l(playedLock);
+        played.push_back(s);
+    };
 
     while (!stop.load()) {
         std::this_thread::sleep_for(std::chrono::microseconds(500));
@@ -220,48 +313,32 @@ void MockDmaEngine::Run() {
         }
         volatile uint32_t *cs = &dmaRegs[DMA_CS + channel * DMA_CHANNEL_WORDS];
         volatile uint32_t *cb = &dmaRegs[DMA_CONBLK_AD + channel * DMA_CHANNEL_WORDS];
-        volatile uint32_t *gpioRegs = MockRegisters(GENERAL_BASE);
         if ((*cs & DMA_CS_ACTIVE) == 0) {
             credit = 0;
+            wasActive = false;
             continue;
         }
 
-        uint32_t bus = *cb;
-        unsigned handle = (bus >> 24) & 0x3F;
-        void *mem;
-        {
-            std::lock_guard<std::mutex> l(g_lock);
-            auto it = g_vcmem.find(handle);
-            if (it == g_vcmem.end())
-                continue;
-            mem = it->second.mem;
+        if (!wasActive) {
+            // Start: the pacing FIFO was cleared; the engine runs until the FIFO reaches its DREQ level.
+            wasActive = true;
+            fifo.clear();
+            credit = 0;
+            runChain(cb);
+            record(0, false);
+            continue;
         }
 
-        // Control-block layout of the transmitter: 4 blocks of 32 bytes per slot, the user words
-        // (FRAC, PAD, FSEL) read by the first three blocks.
-        const uint32_t *cbs = (const uint32_t *) mem;
         while (credit >= 1 && (*cs & DMA_CS_ACTIVE)) {
-            uint32_t offset = *cb - (0x40000000u | (handle << 24));
-            uint32_t first = offset / 32 / 4 * 4; // first control block of the executing slot
-            const uint32_t *padCb = cbs + first * 8;
-            uint32_t padSrc = padCb[1] - (0x40000000u | (handle << 24));
-            const uint32_t *words = (const uint32_t *) ((const uint8_t *) mem + padSrc) - 1; // PAD is word 1
-
-            MockSlot s;
-            s.frac = words[0] & 0xFFFFF;
-            s.pad = words[1] & 0x7;
-            s.hysteresis = (words[1] & PADS_HYST) != 0;
-            s.carrierOn = ((words[2] >> 12) & 7) == fsel_alt0;
-            if (gpioRegs != nullptr)
-                gpioRegs[GPFSEL0] = words[2];
-            {
-                std::lock_guard<std::mutex> l(playedLock);
-                played.push_back(s);
+            uint32_t out = 0;
+            bool outValid = false;
+            if (!fifo.empty()) {
+                out = fifo.front();
+                fifo.pop_front();
+                outValid = true;
             }
-
-            // Next slot: follow the "next" pointer of the last control block of the slot.
-            const uint32_t *lastCb = cbs + (first + 3) * 8;
-            *cb = lastCb[5];
+            runChain(cb);
+            record(out, outValid);
             credit -= 1;
         }
     }

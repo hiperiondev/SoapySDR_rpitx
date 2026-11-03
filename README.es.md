@@ -29,6 +29,7 @@ sobre una copia integrada y reforzada de [librpitx](https://github.com/F5OEO/lib
 - [Instalación y verificación](#instalación-y-verificación)
 - [Uso](#uso)
 - [Herramientas](#herramientas)
+- [Amplitud precisa y EER](#amplitud-precisa-y-eer)
 - [Funcionamiento interno](#funcionamiento-interno)
 - [Solución de problemas](#solución-de-problemas)
 - [Pruebas](#pruebas)
@@ -57,20 +58,21 @@ PLL, pero el árbol de relojes se modifica en cuanto se crea un stream.
 | Formatos de muestra | `CF32` (nativo, fondo de escala 1.0), `CS16` (fondo de escala 32768), `CS8` (fondo de escala 128) |
 | Frecuencia de muestreo | 10 kHz – 200 kHz (cualquier valor; listadas 24 k / 48 k / 96 k / 192 k; por defecto 48 kHz) |
 | Frecuencia | 50 kHz – 1500 MHz (BCM2711: 50 kHz – 1000 MHz) en la fundamental; `harmonic=n` multiplica el rango |
-| Modulación | Cualquier señal I/Q: fase/frecuencia mediante el multiplicador fraccional de PLLC, amplitud mediante la corriente de salida de los pads (8 niveles) |
-| Modos de amplitud | `envelope` (la corriente sigue a \|I/Q\|) o `constant` (corriente máxima siempre que haya muestra: FM, FSK, CW, PSK de envolvente constante) |
+| Modulación | Cualquier señal I/Q: fase/frecuencia mediante el multiplicador fraccional de PLLC, amplitud mediante la corriente de salida de los pads (8 niveles, tablas calibradas, conformación de ruido sigma-delta opcional y un segundo pin de reloj) o un DAC de envolvente externo (EER) |
+| Modos de amplitud | `envelope` (la corriente sigue a \|I/Q\|) o `constant` (corriente máxima siempre que haya muestra: FM, FSK, CW, PSK de envolvente constante); salida de envolvente `none` (corriente de los pads), `pcm` (DAC I2S de 16 bits) o `pwm` |
 | Ganancia | Elemento `PAD`, 0–7 = 2 mA … 16 mA de corriente de salida |
 | Corrección de frecuencia | Estimación NTP del kernel (`ntp_adjtime`) más ppm manual; `setFrequencyCorrection()` |
 | Ráfagas | `SOAPY_SDR_END_BURST` respetado: la desactivación espera a que la ráfaga haya salido por la antena |
 | Streaming | FIFO sin bloqueos, hilo alimentador de tiempo real, pre-roll configurable, contrapresión con timeouts, escrituras parciales |
 | Cambios en vivo | Frecuencia, frecuencia de muestreo, ganancia y todos los ajustes durante la transmisión, sin perder muestras encoladas |
-| Diagnóstico | Sensores de enganche del PLL, estado del DMA, llenado de la FIFO, underflows, overruns del DMA, reinicios del DMA y frecuencia de muestreo real; `readStreamStatus()` informa `SOAPY_SDR_UNDERFLOW` |
+| Diagnóstico | Sensores de enganche del PLL, estado del DMA, llenado de la FIFO, underflows, overruns del DMA, reinicios del DMA, frecuencia de muestreo real y recortes de la envolvente; `readStreamStatus()` informa `SOAPY_SDR_UNDERFLOW` |
 | Seguridad | Bloqueo a nivel de sistema, registro de caídas y recuperación automática, limpieza opcional ante señales, herramienta `rpitx_reset`, rechazo de usuarios en conflicto de GPIO / I2S / DMA |
 | Integraciones | GNU Radio (Soapy sink), SDRangel (salida SoapySDR), Python, programas host HPSDR Protocol 1 mediante el puente |
 
 Lo que el hardware hace bien: **NBFM, FSK/AFSK, modos digitales de envolvente constante tipo WSPR/FT8, CW y BPSK**.
-AM y SSB funcionan, pero con solo 8 escalones de amplitud (y la portadora cortada por debajo del más bajo) su
-calidad es limitada por naturaleza.
+AM y SSB funcionan; con el pin solo, su calidad está limitada por los 8 escalones de amplitud (ver
+[Amplitud precisa y EER](#amplitud-precisa-y-eer) para calibración, conformación de ruido y un modulador de
+envolvente externo).
 
 ---
 
@@ -108,17 +110,26 @@ calidad es limitada por naturaleza.
   El árbol de relojes se guarda al crear el stream y se restaura al cerrarlo. Mientras el stream está abierto, los
   periféricos alimentados por el reloj de la VPU (mini-UART, I2C, SPI y el controlador SD de las Pi Zero/1/3)
   funcionan a una frecuencia distinta de la que cree el kernel.
-- **Memoria de la GPU.** Cada posición del anillo DMA usa 140 bytes de memoria VideoCore (páginas de 4 KiB):
+- **Memoria de la GPU.** Cada posición del anillo DMA usa 140 bytes de memoria VideoCore (páginas de 4 KiB; 144 bytes
+  con un DAC de envolvente, 180 bytes con el RF-DAC y un DAC de envolvente):
   4096 posiciones ≈ 560 KiB, 32768 posiciones ≈ 4,4 MiB. Mantenga `gpu_mem` en su valor por defecto (≥ 64 MB) para
   anillos grandes.
 - **GPIO4 debe estar libre.** Si un driver del kernel reclama GPIO4 — en particular el overlay `w1-gpio` (1-Wire),
   cuyo pin por defecto es GPIO4 — el driver rechaza el stream.
-- **El bloque PCM/I2S debe estar libre.** Se usa como reloj de cadencia del DMA; con un overlay de placa de sonido
-  I2S o `dtparam=i2s=on` el stream se rechaza.
-- **Un solo transmisor por sistema**, garantizado con un `flock()` sobre `/run/lock/soapy_rpitx.lock`.
+- **El bloque PCM/I2S debe estar libre.** Se usa como reloj de cadencia del DMA (y como DAC de envolvente con
+  `envelope_output=pcm`); con un overlay de placa de sonido I2S o `dtparam=i2s=on` el stream se rechaza. Con
+  `envelope_output=pwm` es el bloque PWM el que da la cadencia y debe estar libre: sin overlay `pwm` y con
+  `dtparam=audio=off`.
+- **La máscara de canales DMA del kernel debe poder leerse** del device tree (`soc/dma@…` o `soc/dma-controller@…`,
+  propiedad `dma-channel-mask` o `brcm,dma-channel-mask`) para la elección automática del canal; si no, indique
+  `dma_channel` explícitamente.
+- **Un solo transmisor por sistema**, garantizado con un `flock()` sobre `/run/soapy_rpitx/soapy_rpitx.lock`. El
+  directorio se crea con modo 0700 y debe pertenecer al usuario que ejecuta el driver; se rechaza un archivo de
+  bloqueo que no sea un archivo regular de ese usuario (por ejemplo un enlace simbólico).
 - **Las funciones de GPIO 0–9 quedan congeladas durante la transmisión.** El DMA reescribe todo el registro
   `GPFSEL0` en cada muestra (es la única forma de conmutar el pin de reloj desde el DMA). Las funciones de GPIO 0–9
-  se capturan al activar el stream; no las reconfigure (I2C en 2/3, SPI en 7–9, …) mientras transmite.
+  se capturan al activar el stream; no las reconfigure (I2C en 2/3, SPI en 7–9, …) mientras transmite. Con
+  `rf_dac=true` lo mismo vale para GPIO 20–29 (`GPFSEL2`).
 - **La corriente de salida de GPIO 0–27 sigue a la envolvente.** El registro de pads `PADS_GPIO_0` es compartido
   por GPIO 0–27 y se reescribe en cada muestra (se conserva la histéresis de entrada). Las muestras en reposo y el
   final del stream restauran el valor original.
@@ -158,7 +169,7 @@ Si SoapySDR se compiló desde el código fuente en `/usr/local`, configure con `
 |--------|-------------|-------------|
 | `RPITX_BUILD_DRIVER` | `ON` | Compila el módulo SoapySDR (requiere SoapySDR) |
 | `RPITX_BUILD_RESET_TOOL` | `ON` | Compila e instala `rpitx_reset` |
-| `RPITX_INSTALL_TOOLS` | `ON` | Instala `rpitx_tone_test.py` y `hpsdr_rpitx_bridge.py` |
+| `RPITX_INSTALL_TOOLS` | `ON` | Instala `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py` y `rpitx_amp_calibrate.py` |
 | `BUILD_TESTING` | `ON` (`OFF` en compilación cruzada) | Compila las pruebas para el host |
 | `RPITX_WERROR` | `OFF` | Trata las advertencias (`-Wall -Wextra -Wshadow`) como errores |
 
@@ -277,7 +288,7 @@ sudo cp rpitx_reset /usr/local/bin/
 |---------|---------|
 | `librpitxSupport.so` | `<libdir>/SoapySDR/modules<ABI>/` (el propio directorio de módulos de SoapySDR, p. ej. `/usr/lib/aarch64-linux-gnu/SoapySDR/modules0.8/`) |
 | `rpitx_reset` | `<prefix>/bin` |
-| `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py` | `<prefix>/bin` |
+| `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py`, `rpitx_amp_calibrate.py` | `<prefix>/bin` |
 
 No hace falta reiniciar ni copiar nada a mano. Verifique:
 
@@ -339,6 +350,9 @@ sdr.closeStream(st)
   duración de la FIFO más el anillo más 200 ms) a que se hayan reproducido todas las muestras encoladas; mientras
   tanto no retiene el mutex del dispositivo, así que la API de control sigue disponible. Sin `END_BURST`, las
   muestras encoladas se descartan.
+- `closeStream()` (y la destrucción del dispositivo) apaga la portadora de inmediato y descarta las muestras
+  encoladas, también mientras otro hilo espera en `deactivateStream()`; el hardware queda libre para un nuevo stream
+  enseguida.
 - `readStreamStatus()` devuelve `SOAPY_SDR_UNDERFLOW` (máscara de canal 1) una vez por cada nuevo vaciado de la FIFO
   dentro de una ráfaga, overrun del DMA o reinicio del DMA; si no, `SOAPY_SDR_TIMEOUT`.
 - La frecuencia, la frecuencia de muestreo, los ppm y la armónica pueden cambiar durante la transmisión: el
@@ -349,7 +363,7 @@ sdr.closeStream(st)
 
 | Clave | Por defecto | Rango | Descripción |
 |-------|-------------|-------|-------------|
-| `ring_size` | 85 ms de muestras, ≥ 4096, redondeado a 512 | 512 – 32768, y ≥ 10 ms a la frecuencia de muestreo | Tamaño del anillo DMA en muestras |
+| `ring_size` | 85 ms de posiciones, ≥ 4096, redondeado a 512 | 512 – 32768, y ≥ 10 ms a la frecuencia de posiciones | Tamaño del anillo DMA en posiciones (una por muestra, o `slots_per_sample` por muestra) |
 | `fifo_ms` | 250 | 20 – 5000 | Capacidad de la FIFO de software en ms (sigue los cambios posteriores de frecuencia de muestreo) |
 | `preroll_ms` | 100 | 0 – 5000 | Señal encolada antes de arrancar el DMA |
 | `dma_channel` | -1 | -1 – 14 | Canal DMA; -1 = primer canal libre que no pertenece al kernel |
@@ -357,6 +371,11 @@ sdr.closeStream(st)
 | `rt_priority` | 50 | 0 – 99 | Prioridad `SCHED_FIFO` del hilo alimentador (0 = planificación normal) |
 | `cpu` | -1 | -1 – 63 | CPU a la que se fija el hilo alimentador |
 | `signal_cleanup` | false | bool | Apaga la portadora cuando el proceso muere por una señal con la acción por defecto |
+| `slots_per_sample` | 1 | 1 – 4 | Posiciones DMA por muestra I/Q; la señal I/Q se interpola y la amplitud se cuantiza a la frecuencia de posiciones (frecuencia de muestreo × posiciones ≤ 200 kHz) |
+| `envelope_output` | none | `none`, `pcm`, `pwm` | Salida de envolvente para EER: `pcm` = I2S de 16 bits en GPIO18/19/21, `pwm` = ciclo de trabajo PWM en `pwm_gpio` |
+| `pwm_gpio` | 18 | 12 o 18 | Pin de la salida de envolvente PWM (GPIO18 ALT5, GPIO12 ALT0) |
+| `pwm_bits` | 8 | 6 – 12 | Resolución de la envolvente PWM (periodo de 2^bits relojes PWM) |
+| `rf_dac` | false | bool | GPIO20 como segunda salida de reloj, sumada a GPIO4 por una red ponderada externa |
 
 Latencia desde `writeStream()` hasta la antena ≈ llenado de la FIFO + ¾ del anillo (≈ 64 ms con un anillo de 4096
 posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo real mantiene la FIFO llena: latencia ≈
@@ -372,9 +391,22 @@ posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo rea
 | `amplitude_mode` | envelope | `envelope` o `constant` |
 | `iq_scale` | 1.0 | Ganancia aplicada a \|I/Q\| antes de cuantizar la amplitud (modo envelope), 0 – 100 |
 | `debug_level` | 0 | Diagnóstico de librpitx en stderr: 0 errores, 1 configuración, 2 volcados de registros |
+| `amplitude_lut` | vacío | Amplitud RF relativa medida de los niveles de corriente 0–7 (8 valores crecientes separados por comas); vacío = `(nivel + 1) / 8` |
+| `ampm_lut` | vacío | Fase medida de los niveles 0–7 en grados (8 valores); se compensa en la portadora |
+| `amplitude_quantizer` | nearest | `nearest` o `sigma_delta` (selección de amplitud con conformación de ruido) |
+| `sigma_delta_order` | 2 | Orden de la realimentación del error, 1 o 2 |
+| `envelope_delay` | 0.5 | Retardo de la envolvente respecto de la fase en muestras, −32 … 32 (0,5 alinea los dos caminos del pin solo) |
+| `envelope_floor` | 0 | Envolvente por debajo de la cual la portadora se apaga tras 2 ms (0 = nunca) |
+| `rfdac_lut` | vacío | Amplitud relativa con solo GPIO4, solo GPIO20 y ambos pines de reloj (3 valores); vacío = 2/3, 1/3, 1 |
+| `eer_lut` | vacío | Amplitud RF medida en códigos de envolvente equiespaciados de 0 a fondo de escala (2–64 valores crecientes); vacío = lineal |
+| `eer_ampm_lut` | vacío | Fase medida en los mismos códigos, en grados (2–64 valores) |
+| `eer_gain`, `eer_offset` | 1, 0 | Ganancia y desplazamiento aplicados al código de envolvente |
+| `eer_idle` | 0 | Código de envolvente mientras no se transmite (fracción del fondo de escala) |
+| `eer_drive` | 7 | Corriente de los pines de reloj mientras se usa el DAC de envolvente |
 
 Ejemplo: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Los argumentos de dispositivo desconocidos se informan con
-una advertencia.
+una advertencia. Los enteros son decimales (un cero inicial no significa octal) y los números no pueden llevar
+caracteres al final.
 
 ### Sensores
 
@@ -386,7 +418,9 @@ una advertencia.
 | `underflows` | int | La FIFO se vació en medio de una ráfaga (aplicación demasiado lenta) |
 | `late` | int | El motor DMA alcanzó al alimentador (hilo alimentador demorado) |
 | `dma_errors` | int | El motor DMA se detuvo solo y fue reiniciado |
-| `sample_rate` | float Hz | Frecuencia producida realmente por los divisores del reloj PCM |
+| `sample_rate` | float Hz | Frecuencia de muestreo I/Q producida realmente por los divisores del reloj de cadencia |
+| `envelope_clip` | int | Posiciones cuya envolvente (\|I/Q\| × `iq_scale`, o el código EER) superó el fondo de escala |
+| `envelope_late` | int | Palabras de envolvente que no pudieron escribirse por adelantado (anillo casi vacío) |
 
 ---
 
@@ -402,6 +436,20 @@ sudo rpitx_tone_test.py --freq 144.8M                         # tono NBFM de 1 k
 sudo rpitx_tone_test.py --freq 7.074M --wav voz.wav --mod usb
 sudo rpitx_tone_test.py --freq 144.8M --jitter-ms 20 --args "preroll_ms=200,fifo_ms=500"
 sudo rpitx_tone_test.py --freq 144e6 --seconds 0              # solo abre/cierra: recupera una sesión caída
+```
+
+### `rpitx_amp_calibrate.py`
+
+Mide el camino de amplitud con un receptor SoapySDR (basta un RTL-SDR junto a una carga fantasma) e imprime los
+ajustes a usar. Cada estado se alterna con una referencia de fondo de escala, de modo que la deriva de fase entre
+las dos radios se cancela; el receptor se sintoniza `--offset` Hz por debajo de la portadora.
+
+```sh
+sudo rpitx_amp_calibrate.py pad   --freq 7.1M --rx-args driver=rtlsdr         # amplitude_lut, ampm_lut
+sudo rpitx_amp_calibrate.py rfdac --freq 7.1M                                 # rfdac_lut (rf_dac=true)
+sudo rpitx_amp_calibrate.py eer   --freq 7.1M --envelope-output pcm --points 17   # eer_lut, eer_ampm_lut
+sudo rpitx_amp_calibrate.py delay --freq 7.1M --envelope-output pcm           # envelope_delay (IMD3 con dos tonos)
+rpitx_amp_calibrate.py self-test                                              # verificación del análisis, sin radio
 ```
 
 ### `rpitx_reset`
@@ -444,6 +492,75 @@ limita las radios Protocol 1 a 61,44 MHz; use `--freq-offset` o un LO de transve
 
 ---
 
+## Amplitud precisa y EER
+
+El pin solo modula la amplitud mediante la corriente de salida del pad: 8 niveles más "apagado", aproximadamente un
+cuantizador de 3 bits cuyos escalones ni siquiera son lineales (el ajuste de corriente cambia la resistencia de
+salida y los niveles altos se saturan). El driver ofrece tres formas de mejorarlo, que pueden combinarse.
+
+### 1. Tablas calibradas y conformación de ruido (sin hardware adicional)
+
+- `amplitude_lut` reemplaza el modelo lineal `(nivel + 1) / 8` por la amplitud medida de cada nivel, de modo que el
+  nivel más cercano lo es de verdad; `ampm_lut` compensa en la portadora el desfase de cada nivel. Mida ambos con
+  `rpitx_amp_calibrate.py pad` en la banda en uso.
+- `amplitude_quantizer=sigma_delta` realimenta el error de cuantización (orden 1 o 2): la amplitud media sigue
+  exactamente a la envolvente y el error se convierte en ruido alejado de la portadora. La mejora dentro de banda
+  crece con la relación de sobremuestreo (frecuencia de posiciones / ancho de banda de la señal); `slots_per_sample`
+  eleva aún más la frecuencia de posiciones (la señal I/Q se interpola). **El ruido conformado cae hasta ±
+  frecuencia de posiciones / 2 de la portadora, en los canales vecinos**, donde un filtro de banda no lo elimina:
+  use una frecuencia de posiciones alta y un filtro de salida estrecho, y verifique el espectro.
+- `envelope_delay` alinea la envolvente con la fase. El valor por defecto de 0,5 muestras hace coincidir la
+  envolvente mantenida de una posición con la rampa de fase que el PLL produce durante ella; una prueba de dos tonos
+  (`rpitx_amp_calibrate.py delay`) encuentra el mejor valor para una instalación dada.
+- `envelope_floor` apaga la portadora cuando la envolvente se mantiene por debajo de un nivel durante 2 ms (silencio
+  entre palabras), en lugar de transmitir el ruido de cuantización.
+
+### 2. RF-DAC: un segundo pin de reloj (dos resistencias y un transformador)
+
+GPCLK0 también está disponible en **GPIO20** (ALT5). Con `rf_dac=true` el DMA conmuta GPIO4 y GPIO20 de forma
+independiente; sumados mediante resistencias ponderadas (p. ej. GPIO4 a través de R y GPIO20 a través de 2R hacia un
+transformador de banda ancha), los dos pines y los 8 niveles de corriente dan unas tres veces más escalones de
+amplitud. Mida los pesos reales con `rpitx_amp_calibrate.py rfdac` (`rfdac_lut`). Las funciones de GPIO 20–29
+quedan congeladas durante la transmisión.
+
+### 3. Eliminación y Restauración de Envolvente (modulador de envolvente externo)
+
+Con `envelope_output=pcm` o `pwm`, GPIO4 lleva solo la **fase**: funciona con la corriente fija `eer_drive` en cada
+muestra de una ráfaga y excita un amplificador conmutado (clase D/E, p. ej. BS170 en paralelo o una etapa IRF510
+tras un buffer 74AC). La **envolvente** la escribe la misma posición DMA en la FIFO de cadencia y sale por un DAC
+que excita el modulador de alimentación de ese amplificador (un amplificador operacional de potencia para QRP, o un
+modulador buck/híbrido):
+
+```
+I/Q ─► camino de fase: frac de PLLC + GPIO4 encendido, corriente fija ──► GPIO4 ─► buffer ─► PA clase D/E ─► filtro ─► antena
+     └► camino de envolvente: eer_lut⁻¹ → código de 16 bits (misma posición DMA) ─► DAC ─► modulador de alimentación ─┘ V_DD(t)
+```
+
+- **`pcm`**: maestro I2S estéreo de 16 bits, 64 relojes de bit por trama, ambos canales llevan la envolvente.
+  Conecte un DAC I2S **acoplado en continua** (p. ej. PCM5102A, SCK a masa): GPIO18 → BCK, GPIO19 → LRCK,
+  GPIO21 → DIN. Los códecs acoplados en alterna no pueden entregar una envolvente. Código 0 … 32767 = envolvente
+  0 … fondo de escala (la mitad positiva de la salida).
+- **`pwm`**: canal PWM 1 en modo marca/espacio en GPIO18 (ALT5) o GPIO12 (ALT0), periodo de 2^`pwm_bits` relojes
+  PWM, un periodo por posición; sígalo de un pasabajos LC/RC y un buffer, o excite el conmutador de un modulador
+  buck. El bloque PWM da entonces también la cadencia del DMA (el bloque PCM no se usa). Requiere
+  `dtparam=audio=off`.
+
+Ambos caminos salen de una misma posición DMA, así que son síncronos por construcción. La palabra del DAC sale de la
+FIFO de cadencia un número fijo de posiciones después de que se aplican los registros de su posición (nivel DREQ
++ 1: 17 posiciones con PCM, 9 con PWM); el driver escribe cada palabra de envolvente esa cantidad de posiciones
+antes, y `envelope_delay` compensa lo que queda (retardo del filtro del DAC, ancho de banda del modulador). Calibre
+el modulador y el amplificador con `rpitx_amp_calibrate.py eer` (`eer_lut`, `eer_ampm_lut`) y el retardo con la
+prueba de dos tonos. Por debajo de `envelope_floor` también se apaga el pin de reloj, lo que elimina la fuga de
+excitación del amplificador durante los silencios.
+
+El ancho de banda de la envolvente de SSB es varias veces el ancho de banda de audio: 48 kS/s bastan para SSB de
+3 kHz, 96 kS/s dan margen. El modulador de alimentación debe tener al menos ese ancho de banda.
+
+Estos tiempos y secuencias de registros se verifican contra el motor DMA simulado de las pruebas; confírmelos en la
+placa de destino (osciloscopio en GPIO4 y en la salida del DAC, espectro con un SDR) antes de transmitir al aire.
+
+---
+
 ## Funcionamiento interno
 
 ### Visión general
@@ -460,11 +577,13 @@ limita las radios Protocol 1 a 61,44 MHz; use `--freq-offset` o un LO de transve
                                    │ retune / reinicio del DMA / underflows
 ```
 
-Cada muestra I/Q se convierte en una **posición del anillo**: tres palabras de 32 bits en la memoria de VideoCore
-(multiplicador fraccional del PLL, palabra de corriente de los pads, palabra de `GPFSEL0`) y cuatro bloques de
-control DMA que las copian a los periféricos. El cuarto bloque de control escribe una palabra ficticia en la FIFO de
-transmisión del PCM y está cadenciado por la línea DREQ del PCM, de modo que el motor avanza exactamente una posición
-por periodo de muestra. El último bloque de control apunta de nuevo al primero: el DMA reproduce el anillo
+Cada muestra I/Q se convierte en una **posición del anillo** (o `slots_per_sample` posiciones de la señal
+interpolada): tres palabras de 32 bits en la memoria de VideoCore (multiplicador fraccional del PLL, palabra de
+corriente de los pads, palabra de `GPFSEL0`, más una palabra de `GPFSEL2` con `rf_dac` y una palabra de envolvente con
+un DAC de envolvente) y cuatro o cinco bloques de control DMA que las copian a los periféricos. El último bloque de
+control escribe una palabra en la FIFO de transmisión del PCM (la FIFO PWM con `envelope_output=pwm`) y está
+cadenciado por su línea DREQ, de modo que el motor avanza exactamente una posición por periodo; la palabra es un valor
+ficticio, o el código de envolvente con un DAC de envolvente. El último bloque de control apunta de nuevo al primero: el DMA reproduce el anillo
 indefinidamente sin intervención de la CPU, y el hilo alimentador solo tiene que mantenerse por delante.
 
 ### Síntesis de frecuencia: modulación de PLLC
@@ -481,7 +600,7 @@ librpitx:
 
 Para una portadora F (frecuencia del PLL F/armónica), `ComputeBestLO()` elige el divisor entero D de GPCLK0: recorre
 D de 4095 a 2 buscando una frecuencia de VCO F·D entre 200 MHz y 1,5 GHz tal que toda la banda F ± B
-(B = frecuencia de muestreo) corresponda al mismo multiplicador **entero** del PLL. Por encima de una portadora de
+(B = 0,58 × frecuencia de posiciones, el mayor desplazamiento instantáneo incluidas las correcciones de fase) corresponda al mismo multiplicador **entero** del PLL. Por encima de una portadora de
 750 MHz (375 MHz en BCM2711) se usa en cambio el pre-divisor del PLL (divisor de GPCLK 2). El multiplicador del VCO es
 
 ```
@@ -515,16 +634,24 @@ portadora en π.
 
 El PLL realiza una frecuencia cuantizada. El driver calcula la frecuencia producida realmente por la palabra
 fraccional elegida (`GetMasterFracFrequency()`), y el error de fase resultante **se traslada a la siguiente
-muestra** (realimentación de error de primer orden, acotada a ±0,5 rad), de modo que la fase de la portadora sigue a
-la fase I/Q sin deriva en transmisiones PSK largas.
+muestra** (realimentación de error de primer orden, como mucho 0,5 rad aplicados por posición, el resto se conserva
+para las siguientes), de modo que la fase de la portadora sigue a la fase I/Q sin deriva en transmisiones PSK largas.
+Las correcciones AM/PM (`ampm_lut`, `eer_ampm_lut`) se suman a esa misma fase arrastrada.
+
+La amplitud usada en una posición es la envolvente retardada `envelope_delay` (interpolación lineal de las
+magnitudes recientes). Con un DAC de envolvente, la latencia de su FIFO se compensa escribiendo las palabras de
+envolvente de una muestra en una posición anterior; las posiciones de las últimas muestras de una ráfaga conservan
+entonces la envolvente de reposo.
 
 Las tres palabras de una posición de datos:
 
 | Palabra | Valor |
 |---------|-------|
 | `PLLC_FRAC` | `0x5A000000 \| frac(f / armónica + arrastre)` |
-| `PADS_GPIO_0` | `0x5A000000 \| HYST(original) \| SLEW \| nivel` — modo envelope: `nivel = round(min(a·iq_scale, 1)·(drive+1)) − 1`, portadora apagada si es negativo; modo constant: `nivel = drive` |
+| `PADS_GPIO_0` | `0x5A000000 \| HYST(original) \| SLEW \| nivel` — modo envelope: el nivel del estado de amplitud elegido para `a·iq_scale` (más cercano o sigma-delta; sin tablas `nivel = round(min(a·iq_scale, 1)·(drive+1)) − 1`), valor original de los pads si el estado es "apagado"; modo constant: `nivel = drive`; EER: `eer_drive` |
 | `GPFSEL0` | Funciones de GPIO 0–9 capturadas al activar, con GPIO4 = ALT0 (portadora encendida) o entrada (portadora apagada) |
+| `GPFSEL2` (`rf_dac`) | Funciones de GPIO 20–29 capturadas al activar, con GPIO20 = ALT5 o entrada |
+| envolvente (`pcm` / `pwm`) | `código << 16 \| código` con `código = round(32767·c)` (PCM), o `round(2^pwm_bits·c)` (PWM), `c` = `eer_lut⁻¹(a·iq_scale)·eer_gain + eer_offset` limitado a [0, 1] |
 
 Una **posición en reposo** contiene la palabra fraccional de la frecuencia central, el valor original de los pads y
 GPIO4 = entrada: el GPCLK sigue funcionando internamente, pero nada sale por el pin.
@@ -533,26 +660,37 @@ GPIO4 = entrada: el GPCLK sigue funcionando internamente, pero nada sale por el 
 
 El controlador PCM/I2S se configura como transmisor de un canal y 8 bits cuya longitud de trama (`PCM_MODE.FLEN`) es
 el menor valor ≥ 10 que mantiene el divisor del reloj PCM entre 2 y 4095. El reloj PCM proviene de PLLD con MASH 1 y
-un divisor fraccional de 12 bits, corregido con los mismos ppm que la portadora. El umbral DREQ de la FIFO TX es de
-64 palabras; cada trama consume una palabra, por lo que cada escritura de `CB3` se bloquea hasta que la FIFO tiene
-lugar — una posición por trama. La frecuencia producida (sensor `sample_rate`) difiere de la nominal por la
-cuantización del divisor, menos de 1 ppm.
+un divisor fraccional de 12 bits, corregido con los mismos ppm que la portadora (con `envelope_output=pcm`: un maestro
+I2S estéreo de 16 bits con 64 relojes de bit por trama y palabras de FIFO empaquetadas). Los umbrales DREQ y de
+pánico de la FIFO TX son de 16 palabras; cada trama consume una palabra, por lo que la escritura de cadencia de cada
+posición se bloquea mientras la FIFO contiene 16 palabras — una posición por trama. Con `envelope_output=pwm` el canal
+PWM 1 cumple la misma función (marca/espacio, FIFO desde el DMA, nivel DREQ 8, reloj desde PLLD a frecuencia de
+posiciones × 2^`pwm_bits`).
+
+Cada arranque del DMA (activación, retune, reinicio tras un error del DMA) empieza con posiciones en reposo: el motor
+las recorre hasta que la FIFO de cadencia alcanza su nivel DREQ, de modo que ninguna posición de datos se reproduce
+más rápido que la frecuencia de posiciones. La FIFO se vacía y el transmisor se reinicia en cada arranque, y se
+detiene cuando se detiene el DMA, lo que silencia un DAC de envolvente. La frecuencia producida (sensor
+`sample_rate`) difiere de la nominal por la cuantización del divisor, menos de 1 ppm.
 
 ### Motor DMA y memoria
 
 - **Memoria:** una única reserva contigua de VideoCore (`mem_alloc` con `MEM_FLAG_DIRECT` en BCM2836 y posteriores,
   el alias sin caché `0xC`, o `MEM_FLAG_L1_NONALLOCATING` en BCM2835; `HINT_PERMALOCK`), bloqueada para obtener su
   dirección de bus y mapeada en el proceso mediante `/dev/mem`. Primero los bloques de control (alineados a
-  32 bytes), luego las palabras de las posiciones: `anillo × (4·32 + 3·4)` = 140 bytes por posición. Cada respuesta
+  32 bytes), luego las palabras de las posiciones: `anillo × (4·32 + 3·4)` = 140 bytes por posición (hasta `5·32 + 5·4` = 180 bytes con `rf_dac` y un DAC de
+  envolvente). Cada respuesta
   del mailbox se verifica (resultado del ioctl, código de respuesta, bit de respuesta de la etiqueta).
-- **Bloques de control:** `TI = NO_WIDE_BURSTS | WAIT_RESP`, más `D_DREQ | PERMAP(2)` (PCM TX) para el bloque de
-  cadencia; una transferencia de 4 bytes cada uno, con destino la dirección de bus del periférico (`0x7E102220`
-  PLLC_FRAC, `0x7E10002C` PADS_GPIO_0, `0x7E200000` GPFSEL0, `0x7E203004` FIFO PCM).
+- **Bloques de control:** `TI = NO_WIDE_BURSTS | WAIT_RESP`, más `D_DREQ | PERMAP(2)` (PCM TX) o `PERMAP(5)` (PWM)
+  para el bloque de cadencia; una transferencia de 4 bytes cada uno, con destino la dirección de bus del periférico
+  (`0x7E102220` PLLC_FRAC, `0x7E10002C` PADS_GPIO_0, `0x7E200000` GPFSEL0, `0x7E200008` GPFSEL2, `0x7E203004` FIFO
+  PCM, `0x7E20C018` FIFO PWM).
 - **Canal:** `CS = PRIORITY(7) | PANIC_PRIORITY(7) | DISDEBUG | ACTIVE`. Solo se usan canales clásicos (0–14; 0–10 en
   BCM2711, donde 11–14 son canales DMA4 con otro formato de bloque de control). Los canales del kernel
-  (`brcm,dma-channel-mask` de cada nodo `soc/dma@…`) nunca se tocan; por defecto se usa el primero de 7, 8, 9, 10, 6, 5
-  (BCM2711) o 14 … 5 que no sea del kernel ni esté activo. Un canal explícito que esté activo solo se reinicia con
-  `dma_force=true`.
+  (`dma-channel-mask` o `brcm,dma-channel-mask` de cada nodo `soc/dma@…` y `soc/dma-controller@…`) nunca se tocan; por
+  defecto se usa el primero de 7, 8, 9, 10, 6, 5 (BCM2711) o 14 … 5 que no sea del kernel ni esté activo. Si no puede
+  leerse ninguna máscara, el canal no se adivina: hay que indicar `dma_channel`. Un canal explícito que esté activo
+  solo se reinicia con `dma_force=true`.
 
 ### El hilo alimentador
 
@@ -571,7 +709,7 @@ El alimentador se ejecuta cada 1 ms (`clock_nanosleep` sobre un plazo absoluto d
   anterior.
 - Pasa muestras de la FIFO al anillo hasta un **llenado objetivo de ¾ del anillo**, nunca a menos de 2 posiciones de
   la que se está ejecutando.
-- Cuando la FIFO está vacía y el llenado cae por debajo de `low = max(anillo/8, frecuencia/200)`, rellena con
+- Cuando la FIFO está vacía y el llenado cae por debajo de `low = max(anillo/8, frecuencia/200, anticipación de la envolvente + guarda + 16)`, rellena con
   posiciones en reposo; si había una ráfaga en curso sin `END_BURST`, se cuenta un **underflow**.
 - Si la posición del DMA es inválida o el canal deja de estar `ACTIVE` durante 5 lecturas seguidas, se considera que
   el motor se detuvo: el evento se registra con `DMA_CS` / `DMA_DEBUG`, se incrementa `dma_errors` y el stream se
@@ -604,33 +742,41 @@ alimentador lo despierta cuando libera espacio.
 ### Cierre, recuperación tras caídas y seguridad
 
 - **Cierre normal** (`deactivateStream` / `closeStream` / destrucción del dispositivo): se espera al alimentador, se
-  reinicia el DMA, GPIO4 vuelve a su función original (entrada si era la salida de reloj), se restauran los pads, se
-  desactiva el bloque PCM y se restaura su reloj, se restaura el árbol de relojes (primero PLLC, esperando el enganche,
+  reinicia el DMA, GPIO4 (y GPIO20) vuelven a su función original (entrada si era la salida de reloj), se restauran
+  los pads, los pines del DAC de envolvente vuelven a su función original, se desactiva el bloque PCM y se restaura su
+  reloj, se restaura el bloque PWM, se restaura el árbol de relojes (primero PLLC, esperando el enganche,
   luego sus canales, los relojes VPU y EMMC y GPCLK0), se libera la memoria VideoCore y se vacía el archivo de bloqueo.
 - **`exit()`:** un manejador `atexit` realiza una parada de emergencia (reinicio del DMA, portadora apagada, GPCLK0
   detenido) sin invalidar los objetos, de modo que un destructor posterior todavía completa el cierre.
 - **Señales** (`signal_cleanup=true`): manejadores para SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL
   y SIGABRT. Cuando la disposición previa era la acción por defecto (el proceso está por morir) realizan escrituras de
-  registros seguras en señales (reinicio del DMA, GPIO4 a entrada, pads, GPCLK0 apagado), restauran la acción previa y
+  registros seguras en señales (reinicio del DMA, GPIO4 / GPIO20 a entrada, pads, GPCLK0 apagado, DAC de envolvente detenido), restauran la acción previa y
   vuelven a lanzar la señal; las señales ignoradas y los manejadores de la aplicación pasan sin cambios.
 
 #### Recuperación tras una caída
 
-Mientras existe un transmisor, `/run/lock/soapy_rpitx.lock` (tmpfs, nunca sobrevive a un reinicio) se mantiene con un
-`flock()` exclusivo y contiene un registro `clave=valor` de todo lo que posee el proceso: PID, canal DMA, handle de
-memoria VideoCore, valor original de los pads y función de GPIO4, reloj PCM original y el árbol de relojes guardado.
+Mientras existe un transmisor, `/run/soapy_rpitx/soapy_rpitx.lock` (tmpfs, nunca sobrevive a un reinicio; directorio
+privado) se mantiene con un `flock()` exclusivo y contiene un registro `clave=valor` de todo lo que posee el proceso:
+PID, canal DMA y handle de memoria VideoCore (escritos en cuanto se reserva la memoria), valor original de los pads y
+funciones de GPIO4 y de los demás pines usados, reloj PCM original o estado del PWM, y el árbol de relojes (guardado
+y registrado antes de su primera modificación).
 El kernel libera el bloqueo cuando el proceso muere, incluso con `kill -9`. El siguiente proceso que obtiene el
 bloqueo y encuentra un registro no vacío sabe que el dueño murió sin limpiar y lo recupera: reinicio del canal DMA,
-GPIO4 y pads restaurados, GPCLK0 detenido, PCM desactivado y su reloj restaurado, árbol de relojes restaurado, y la
-memoria de GPU del proceso muerto liberada (los handles de VideoCore son globales para el firmware). `rpitx_reset`
-hace lo mismo a pedido.
+GPIO4 y pads restaurados, GPCLK0 detenido, PCM desactivado y su reloj restaurado, PWM restaurado, árbol de relojes
+restaurado, y la memoria de GPU del proceso muerto liberada (los handles de VideoCore son globales para el firmware).
+Antes se verifica el registro: un canal DMA que no sea un canal clásico del SoC o que pertenezca al kernel, pines
+fuera de GPIO 0–27 o valores de reloj inválidos hacen que se **descarte** (se informa, no se aplica nada).
+`rpitx_reset` hace lo mismo a pedido. Un proceso creado con `fork()` sin `exec()` comparte el bloqueo: mientras ese
+hijo viva, el siguiente proceso es informado de que el bloqueo lo tiene un hijo del proceso terminado.
 
 #### Comprobaciones de conflictos al abrir
 
 - otro proceso con el bloqueo → "the transmitter is in use by process N";
-- GPIO4 reclamado por cualquier consumidor en el chip GPIO del SoC (`pinctrl-bcm2…`, mediante la información de línea
-  del dispositivo de caracteres GPIO);
-- `soc/i2s@7e203000` habilitado en el device tree;
+- GPIO4 (y GPIO20, los pines PCM 18/19/21 o el pin PWM cuando se usan) reclamado por cualquier consumidor en el chip
+  GPIO del SoC (`pinctrl-bcm2…`, mediante la información de línea del dispositivo de caracteres GPIO);
+- `soc/i2s@7e203000` habilitado en el device tree (salvo con `envelope_output=pwm`); con `envelope_output=pwm`,
+  `soc/pwm@7e20c000` o el nodo de audio analógico habilitados;
+- el directorio o el archivo de bloqueo no privados del usuario que ejecuta el driver;
 - el canal DMA pedido pertenece al kernel, o está activo sin `dma_force`;
 - una advertencia cuando GPCLK0 ya está en marcha (otro programa podría estar usándolo).
 
@@ -652,6 +798,12 @@ de hardware se convierte en un `std::runtime_error` que la aplicación recibe de
 | "DMA channel N is reserved for the Linux kernel" / "is active" | Elija otro `dma_channel` o deje -1; `dma_force=true` solo para un canal que se sabe libre |
 | "GPIO4 is claimed by …" | Quite el overlay que usa el pin (p. ej. `dtoverlay=w1-gpio`) y reinicie |
 | "the PCM/I2S controller is enabled" | Quite el overlay de placa de sonido / `dtparam=i2s=on` y reinicie |
+| "the PWM block is enabled" | `envelope_output=pwm`: ponga `dtparam=audio=off`, quite los overlays `pwm` y reinicie |
+| "the kernel DMA channel mask cannot be read" | Indique en `dma_channel` un canal fuera de la máscara del kernel (`xxd /proc/device-tree/soc/dma*/*dma-channel-mask`) |
+| "the lock directory … must be … mode 0700" | `sudo rm -rf /run/soapy_rpitx` (se vuelve a crear) |
+| "in use by a child process of terminated process N" | Un hijo creado con fork conservó el bloqueo; termínelo |
+| `envelope_clip` aumenta | La envolvente supera el fondo de escala: baje `iq_scale` o el nivel de la aplicación |
+| `envelope_late` aumenta | El anillo quedó casi vacío durante una ráfaga: aumente `preroll_ms` / `fifo_ms` |
 | "VideoCore memory allocation failed" | Reduzca `ring_size`, aumente `gpu_mem` o ejecute `sudo rpitx_reset` para liberar memoria dejada por una caída |
 | `underflows` aumenta | La aplicación es demasiado lenta: aumente `preroll_ms` y `fifo_ms`, escriba bloques más grandes |
 | `late` aumenta | El alimentador se demoró: mantenga `rt_priority` > 0, fíjelo (`cpu=3`), considere `isolcpus=3` y el gobernador `performance` |
@@ -671,14 +823,16 @@ cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output
 ```
 
 Las pruebas se ejecutan en cualquier host Linux; `tests/mock_hw.cpp` reemplaza el mailbox, `/dev/mem`, las consultas al
-device tree y el motor DMA (un hilo que ejecuta el anillo de bloques de control a la frecuencia de muestreo y aplica
-sus palabras de `GPFSEL0`).
+device tree y el motor DMA (un hilo que interpreta la cadena de bloques de control, escribe los registros simulados y
+modela la FIFO de cadencia PCM / PWM con su nivel DREQ, registrando en cada trama los registros vigentes y la palabra
+que sale de la FIFO).
 
 | Prueba | Cubre |
 |--------|-------|
-| `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero |
-| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA, bloqueo de sesión y recuperación tras caídas, manejadores de señales |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, corrección de frecuencia, argumentos del stream, escalado CF32/CS16/CS8, vaciado con `END_BURST`, estado del stream, sensores |
+| `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
+| `rpitx_devicetree_tests` | Base de periféricos, límite de canales DMA clásicos y máscara DMA del kernel con la nomenclatura antigua y la actual del device tree |
+| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, estado del stream, sensores |
 
 La CI (`.github/workflows/ci.yml`) ejecuta las pruebas en una compilación normal, con AddressSanitizer +
 UndefinedBehaviorSanitizer y con ThreadSanitizer (`tests/tsan.supp` suprime solo los accesos a registros simulados),
@@ -697,13 +851,15 @@ src/
   SoapySDR_Sensors.cpp           sensores
   SoapyRPITX_IQ_dmaSync.*        transmisor: anillo DMA, hilo alimentador, modulación, retune, cierre
   SoapyRPITX_Buffers.hpp         SpscFifo y DmaRingTracker (independientes del hardware)
+  SoapyRPITX_Amplitude.hpp       estados de amplitud, sigma-delta, retardo de envolvente, correspondencia EER (independiente del hardware)
   SoapyRPITX_Session.*           archivo de bloqueo, registro de caídas y recuperación, comprobación de conflictos
-librpitx/src/                    librpitx integrada (dma, gpio/reloj/PCM/pads, mailbox, dsp, device tree)
+librpitx/src/                    librpitx integrada (dma, gpio/reloj/PCM/PWM/pads, mailbox, dsp, device tree)
 tools/
   rpitx_reset.cpp                herramienta de recuperación
   rpitx_tone_test.py             transmisor de prueba (tono / WAV)
+  rpitx_amp_calibrate.py         calibración de amplitud, AM/PM, RF-DAC, EER y retardo de la envolvente
   hpsdr_rpitx_bridge.py          emulación de radio openHPSDR Protocol 1
-tests/                           pruebas unitarias, del transmisor y del driver, simulación de hardware, supresiones de TSan
+tests/                           pruebas unitarias, del device tree, del transmisor y del driver, simulación de hardware, supresiones de TSan
 rpi-cross.sh                     ayudante de compilación cruzada (host Fedora / derivado de Debian)
 ```
 

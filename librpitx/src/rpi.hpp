@@ -51,12 +51,22 @@ unsigned bcm_host_get_sdram_address(void);
 /**
  * @brief Returns the DMA channels reserved for the Linux DMA engine driver.
  *
- * The "brcm,dma-channel-mask" properties of every DMA controller node of the soc node are combined; bit n
- * set means that the kernel may use channel n.
+ * The channel masks of every DMA controller node of the soc node ("dma@..." or "dma-controller@...") are
+ * combined; the property is "dma-channel-mask", or "brcm,dma-channel-mask" on older device trees. Bit n set
+ * means that the kernel may use channel n.
  *
  * @param known Receives true when at least one mask was found.
  * @return Channel bit mask (0 when unknown).
  */
 uint32_t bcm_host_get_kernel_dma_mask(bool *known);
+
+/**
+ * @brief Returns the highest legacy DMA channel of the SoC.
+ *
+ * On BCM2711 channels 11-14 are DMA4 engines with a different register and control-block layout.
+ *
+ * @return 10 on BCM2711, 14 on BCM2835/6/7.
+ */
+int bcm_host_get_max_legacy_dma_channel(void);
 
 #endif

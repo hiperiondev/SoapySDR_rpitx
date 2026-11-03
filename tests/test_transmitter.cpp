@@ -12,9 +12,12 @@
 // session lock and recovery are exercised against a DMA engine that plays the ring at the sample rate.
 
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -24,6 +27,7 @@
 #include <vector>
 
 #include "SoapyRPITX_IQ_dmaSync.hpp"
+#include "mailbox.hpp"
 #include "mock_hw.hpp"
 
 namespace {
@@ -290,7 +294,14 @@ void testDmaChannelSelection() {
         SoapyRPITX_IQ_dmaSync tx(baseConfig());
         CHECK(tx.GetChannel() == 13);
     }
+
+    // Without the kernel mask the channel is not guessed: only an explicit channel is accepted.
     MockSetKernelDmaMask(0, false);
+    CHECK(throws(baseConfig()));
+    cfg = baseConfig();
+    cfg.dmaChannel = 14;
+    CHECK(!throws(cfg));
+    MockSetKernelDmaMask(0, true);
 
     // An active channel is only reset when forced.
     volatile uint32_t *dmaRegs = MockRegisters(DMA_BASE);
@@ -446,6 +457,398 @@ void testShortBurstStarts() {
     CHECK(carrierOn(engine.Take()) == 500);
 }
 
+std::vector<std::complex<float>> level(size_t n, float mag, float phase = 0.0f) {
+    return std::vector<std::complex<float>>(n, std::polar(mag, phase));
+}
+
+// Sends one burst, waits for it and returns the recorded frames.
+std::vector<MockSlot> sendBurst(SoapyRPITX_IQ_dmaSync &tx, MockDmaEngine &engine, const std::vector<std::complex<float>> &samples) {
+    engine.Take();
+    tx.Start();
+    CHECK(tx.Write(samples.data(), samples.size(), 5000000) == samples.size());
+    tx.EndBurst();
+    CHECK(tx.WaitDrained(5000000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    tx.Stop();
+    return engine.Take();
+}
+
+// Frames from the first to the last frame with a clock pin on.
+std::vector<MockSlot> dataFrames(const std::vector<MockSlot> &s) {
+    size_t first = s.size(), last = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i].carrierOn || s[i].carrier2On) {
+            first = std::min(first, i);
+            last = i;
+        }
+    }
+    if (first > last)
+        return {};
+    return std::vector<MockSlot>(s.begin() + (std::ptrdiff_t) first, s.begin() + (std::ptrdiff_t) last + 1);
+}
+
+SoapyRPITX_TxConfig envelopeConfig() {
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.constantEnvelope = false;
+    cfg.prerollMs = 50;
+    return cfg;
+}
+
+uint32_t mostFrequent(const std::vector<uint32_t> &v) {
+    std::map<uint32_t, size_t> count;
+    for (uint32_t x : v)
+        count[x]++;
+    uint32_t best = 0;
+    size_t n = 0;
+    for (const auto &c : count)
+        if (c.second > n) {
+            best = c.first;
+            n = c.second;
+        }
+    return best;
+}
+
+void testPacingStart() {
+    // The DMA start runs through idle slots only: every data sample lasts exactly one frame.
+    SoapyRPITX_IQ_dmaSync tx(envelopeConfig());
+    MockDmaEngine engine(14, kRate);
+    volatile uint32_t *pcm = MockRegisters(PCM_BASE);
+    CHECK(pcm != nullptr && ((pcm[PCM_DREQ_A] >> 8) & 0x7F) == PCM_TX_DREQ_LEVEL);
+    for (int burst = 0; burst < 3; burst++) {
+        std::vector<MockSlot> played = sendBurst(tx, engine, level(1000, 1.0f));
+        CHECK(carrierOn(played) == 1000);
+        CHECK(holes(played) == 0);
+    }
+}
+
+void testEnvelopeDelayFrames() {
+    // Step from 0.25 (level 1) to 1.0 (level 7): with the half-sample envelope delay one frame shows the
+    // midpoint 0.625 (level 4); without delay the level jumps directly.
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+    std::vector<std::complex<float>> burst = level(2400, 0.25f);
+    std::vector<std::complex<float>> high = level(2400, 1.0f);
+    burst.insert(burst.end(), high.begin(), high.end());
+
+    auto countPad = [](const std::vector<MockSlot> &s, uint32_t p) {
+        size_t n = 0;
+        for (const MockSlot &x : s)
+            n += (x.carrierOn && x.pad == p) ? 1 : 0;
+        return n;
+    };
+    std::vector<MockSlot> played = sendBurst(tx, engine, burst);
+    CHECK(countPad(played, 4) == 1);
+    CHECK(countPad(played, 1) >= 2398 && countPad(played, 7) >= 2398);
+
+    cfg.amplitude.envelopeDelay = 0;
+    CHECK(tx.SetAmplitudeConfig(cfg.amplitude));
+    played = sendBurst(tx, engine, burst);
+    CHECK(countPad(played, 4) == 0);
+
+    // A delay that needs more look-ahead than the ring allows is refused.
+    cfg.amplitude.envelopeDelay = -RPITX_MAX_ENVELOPE_DELAY;
+    SoapyRPITX_AmplitudeConfig big = cfg.amplitude;
+    CHECK(tx.SetAmplitudeConfig(big) == (32u <= tx.RingSize() / 8));
+}
+
+void testSigmaDeltaAverage() {
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.amplitude.quantizer = SoapyRPITX_Quantizer::SigmaDelta;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+
+    auto meanAmplitude = [](const std::vector<MockSlot> &s) {
+        std::vector<MockSlot> d = dataFrames(s);
+        double sum = 0;
+        for (const MockSlot &x : d)
+            sum += x.carrierOn ? (x.pad + 1) / 8.0 : 0.0;
+        return d.empty() ? 0.0 : sum / (double) d.size();
+    };
+    CHECK(std::fabs(meanAmplitude(sendBurst(tx, engine, level(9600, 0.3f))) - 0.3) < 0.005);
+
+    cfg.amplitude.quantizer = SoapyRPITX_Quantizer::Nearest;
+    CHECK(tx.SetAmplitudeConfig(cfg.amplitude));
+    CHECK(std::fabs(meanAmplitude(sendBurst(tx, engine, level(9600, 0.3f))) - 0.25) < 0.002);
+}
+
+void testAmpmCorrection() {
+    // Level 7 is 90 degrees ahead of the other levels: entering level 7 adds a phase step of -90 degrees to the
+    // carrier, i.e. the integral of the frequency offset over the step equals a quarter of a cycle.
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.amplitude.ampmLut = {0, 0, 0, 0, 0, 0, 0, -M_PI / 2};
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+
+    std::vector<std::complex<float>> burst = level(4800, 0.5f);
+    std::vector<std::complex<float>> high = level(4800, 1.0f);
+    burst.insert(burst.end(), high.begin(), high.end());
+    for (size_t i = 0; i < 4800; i++) {
+        double ph = 2 * M_PI * 1000.0 * (double) i / kRate;
+        burst.push_back(std::polar(1.0f, (float) ph));
+    }
+    std::vector<MockSlot> d = dataFrames(sendBurst(tx, engine, burst));
+    CHECK(d.size() == burst.size());
+    if (d.size() != burst.size())
+        return;
+
+    // The carried quantisation error dithers the fractional word: its mean is the exact centre frequency.
+    double center = 0;
+    for (size_t i = 100; i < 4700; i++)
+        center += d[i].frac;
+    center /= (4700 - 100);
+    double step = 0;
+    for (size_t i = 4700; i < 9500; i++)
+        step += (double) d[i].frac - center;
+    double tone = 0;
+    for (size_t i = 9700; i < 14300; i++)
+        tone += (double) d[i].frac - center;
+    tone /= (14300 - 9700);
+    // step / tone = (phase step / 2 pi) * rate / 1000 Hz = -0.25 * 48 = -12.
+    CHECK(tone > 0 && std::fabs(step / tone + 12.0) < 0.3);
+}
+
+void testRfDac() {
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.rfDac = true;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+
+    // 1/24 of full scale: GPIO20 alone at level 0 (weights 2/3, 1/3, 1).
+    std::vector<MockSlot> d = dataFrames(sendBurst(tx, engine, level(4800, 1.0f / 24.0f)));
+    size_t only20 = 0;
+    for (const MockSlot &x : d)
+        only20 += (x.carrier2On && !x.carrierOn && x.pad == 0) ? 1 : 0;
+    CHECK(only20 >= 4798);
+
+    d = dataFrames(sendBurst(tx, engine, level(4800, 1.0f)));
+    size_t both = 0;
+    for (const MockSlot &x : d)
+        both += (x.carrier2On && x.carrierOn && x.pad == 7) ? 1 : 0;
+    CHECK(both >= 4798);
+
+    volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+    CHECK((gpio[GPFSEL2] & 7) == fsel_input);
+}
+
+void testSlotsPerSample() {
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.slotsPerSample = 2;
+    cfg.amplitude.envelopeDelay = 0;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    CHECK(tx.SlotsPerSample() == 2);
+    CHECK(std::fabs(tx.GetActualSampleRate() - kRate) < kRate * 1e-4);
+    MockDmaEngine engine(14, 2 * kRate);
+    std::vector<MockSlot> played = sendBurst(tx, engine, level(4800, 1.0f));
+    CHECK(carrierOn(played) == 9600);
+    CHECK(tx.GetStats().samplesSent == 4800);
+}
+
+void testSlotRateLimit() {
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.slotsPerSample = 2;
+    cfg.tune.sampleRate = 192000;
+    CHECK(throws(cfg));
+    cfg.slotsPerSample = 5;
+    cfg.tune.sampleRate = kRate;
+    CHECK(throws(cfg));
+    cfg = baseConfig();
+    cfg.envelopeOutput = SoapyRPITX_EnvelopeOutput::Pwm;
+    cfg.pwmGpio = 13;
+    CHECK(throws(cfg));
+}
+
+// Frame of the largest frequency excursion and frame where the DAC word first exceeds a threshold.
+void checkEerAlignment(const std::vector<MockSlot> &d, size_t step, uint32_t threshold) {
+    size_t phaseFrame = 0;
+    double best = -1;
+    std::vector<uint32_t> before;
+    for (size_t i = 100; i + 100 < step; i++)
+        before.push_back(d[i].frac);
+    const double center = mostFrequent(before);
+    for (size_t i = step - 50; i < step + 50; i++) {
+        double dev = std::fabs((double) d[i].frac - center);
+        if (dev > best) {
+            best = dev;
+            phaseFrame = i;
+        }
+    }
+    size_t envFrame = d.size();
+    for (size_t i = step - 50; i < step + 50 && envFrame == d.size(); i++)
+        if (d[i].dacValid && d[i].dac > threshold)
+            envFrame = i;
+    CHECK(envFrame == phaseFrame);
+}
+
+void testEerPcm() {
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.envelopeOutput = SoapyRPITX_EnvelopeOutput::Pcm;
+    {
+        SoapyRPITX_IQ_dmaSync tx(cfg);
+        volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+        CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_alt0 && ((gpio[GPFSEL1] >> 27) & 7) == fsel_alt0 && ((gpio[GPFSEL2] >> 3) & 7) == fsel_alt0);
+        volatile uint32_t *pcm = MockRegisters(PCM_BASE);
+        CHECK((pcm[PCM_MODE_A] & PCM_MODE_FTXP) != 0);
+        CHECK(((pcm[PCM_MODE_A] >> 10) & 0x3FF) == PCM_DAC_FRAME_LENGTH - 1);
+
+        MockDmaEngine engine(14, kRate);
+        // 0.25 at phase 0, then 1.0 at phase pi: the envelope step and the phase reversal leave together.
+        std::vector<std::complex<float>> burst = level(2400, 0.25f);
+        std::vector<std::complex<float>> high = level(2400, 1.0f, (float) M_PI);
+        burst.insert(burst.end(), high.begin(), high.end());
+        std::vector<MockSlot> d = dataFrames(sendBurst(tx, engine, burst));
+        CHECK(d.size() == burst.size());
+        if (d.size() == burst.size()) {
+            CHECK(((d[1000].dac & 0xFFFF) == (uint32_t) std::lround(0.25 * 32767)) && (d[1000].dac >> 16) == (d[1000].dac & 0xFFFF));
+            CHECK((d[4000].dac & 0xFFFF) == 32767);
+            checkEerAlignment(d, 2400, (uint32_t) (0.4 * 32767) << 16);
+        }
+        SoapyRPITX_TxStats st = tx.GetStats();
+        CHECK(st.envelopeLate == 0);
+        CHECK(st.envelopeClips == 0);
+    }
+    volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+    CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_input && ((gpio[GPFSEL2] >> 3) & 7) == fsel_input);
+}
+
+void testEerPwm() {
+    SoapyRPITX_TxConfig cfg = envelopeConfig();
+    cfg.envelopeOutput = SoapyRPITX_EnvelopeOutput::Pwm;
+    cfg.pwmBits = 8;
+    {
+        SoapyRPITX_IQ_dmaSync tx(cfg);
+        volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+        CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_alt5);
+        volatile uint32_t *p = MockRegisters(PWM_BASE);
+        CHECK(p[PWM_RNG1] == 256 && (p[PWM_DMAC] & 0xFF) == PWM_DREQ_LEVEL && (p[PWM_DMAC] & PWM_DMAC_ENAB));
+        CHECK(std::fabs(tx.GetActualSampleRate() - kRate) < kRate * 1e-3);
+
+        MockDmaEngine engine(14, kRate);
+        std::vector<std::complex<float>> burst = level(2400, 0.25f);
+        std::vector<std::complex<float>> high = level(2400, 1.0f, (float) M_PI);
+        burst.insert(burst.end(), high.begin(), high.end());
+        std::vector<MockSlot> d = dataFrames(sendBurst(tx, engine, burst));
+        CHECK(d.size() == burst.size());
+        if (d.size() == burst.size()) {
+            CHECK(d[1000].dac == 64);
+            CHECK(d[4000].dac == 256);
+            checkEerAlignment(d, 2400, 100);
+        }
+    }
+    volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+    CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_input);
+    volatile uint32_t *p = MockRegisters(PWM_BASE);
+    CHECK(p[PWM_CTL] == 0 && p[PWM_DMAC] == 0);
+}
+
+void testEndBurstThenShortBurst() {
+    // A burst end signalled without samples does not let the next burst skip the pre-roll.
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.prerollMs = 300;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    MockDmaEngine engine(14, kRate);
+    tx.Start();
+    tx.EndBurst();
+    auto b = level(480, 1.0f);
+    CHECK(tx.Write(b.data(), b.size(), 100000) == b.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(!tx.GetStats().dmaRunning);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(tx.GetStats().dmaRunning);
+    CHECK(tx.WaitDrained(500000));
+    tx.Stop();
+}
+
+void testSessionSecurity() {
+    const std::string dir = RPITX_LOCK_DIR;
+    { SoapyRPITX_Session s(RPITX_TX_GPIO); }
+
+    // The lock directory must be private.
+    chmod(dir.c_str(), 0777);
+    bool refused = false;
+    try {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+    } catch (const std::runtime_error &) {
+        refused = true;
+    }
+    CHECK(refused);
+    chmod(dir.c_str(), 0700);
+
+    // A symbolic link in place of the lock file is not followed.
+    const std::string path = SoapyRPITX_Session::LockPath();
+    unlink(path.c_str());
+    CHECK(symlink((dir + "/target").c_str(), path.c_str()) == 0);
+    refused = false;
+    try {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+    } catch (const std::runtime_error &) {
+        refused = true;
+    }
+    CHECK(refused);
+    std::ifstream target(dir + "/target");
+    CHECK(!target.good());
+    unlink(path.c_str());
+
+    // A record naming a kernel DMA channel is discarded, not applied.
+    MockSetKernelDmaMask(1u << 11, true);
+    volatile uint32_t *dmaRegs = MockRegisters(DMA_BASE);
+    dmaRegs[DMA_CS + 11 * DMA_CHANNEL_WORDS] = DMA_CS_ACTIVE;
+    unsigned other = MockAllocate(4096);
+    SoapyRPITX_SessionRecord r;
+    r.pid = 4242;
+    r.dmaChannel = 11;
+    r.memHandle = other;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.Discarded() && !s.Recovered());
+        CHECK((dmaRegs[DMA_CS + 11 * DMA_CHANNEL_WORDS] & DMA_CS_ACTIVE) != 0);
+        CHECK(MockAllocated(other));
+    }
+    mem_free(0, other);
+    dmaRegs[DMA_CS + 11 * DMA_CHANNEL_WORDS] = 0;
+    MockSetKernelDmaMask(0, true);
+
+    // Recovery of the envelope pins and of the PWM block.
+    volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
+    gpio[GPFSEL2] = (gpio[GPFSEL2] & ~(7u << 3)) | ((uint32_t) fsel_alt0 << 3);
+    r = SoapyRPITX_SessionRecord();
+    r.pid = 4243;
+    r.pinFunctions = {{21, fsel_output}};
+    r.pwmValid = true;
+    r.pwmRng = 32;
+    r.pwmClkCtl = clk_osc;
+    r.pwmClkDiv = 4 << 12;
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << SoapyRPITX_FormatRecord(r);
+    }
+    {
+        SoapyRPITX_Session s(RPITX_TX_GPIO);
+        CHECK(s.Recovered());
+        CHECK(((gpio[GPFSEL2] >> 3) & 7) == fsel_output);
+        volatile uint32_t *p = MockRegisters(PWM_BASE);
+        CHECK(p != nullptr && p[PWM_RNG1] == 32);
+    }
+    gpio[GPFSEL2] &= ~(7u << 3);
+}
+
+void testAllocationRecordedEarly() {
+    // The DMA channel and the VideoCore memory are in the lock file before anything else is done with them.
+    bool checked = false;
+    MockOnNextVcMap([&] {
+        std::ifstream in(SoapyRPITX_Session::LockPath());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        SoapyRPITX_SessionRecord rec;
+        checked = SoapyRPITX_ParseRecord(text, rec) && rec.memHandle != 0 && rec.dmaChannel >= 0;
+    });
+    { SoapyRPITX_IQ_dmaSync tx(baseConfig()); }
+    CHECK(checked);
+}
+
 } // namespace
 
 int main() {
@@ -458,6 +861,18 @@ int main() {
     testSessionLockAndRecovery();
     testDmaRestartAndPads();
     testSignalCleanupHandlers();
+    testPacingStart();
+    testEnvelopeDelayFrames();
+    testSigmaDeltaAverage();
+    testAmpmCorrection();
+    testRfDac();
+    testSlotsPerSample();
+    testSlotRateLimit();
+    testEerPcm();
+    testEerPwm();
+    testEndBurstThenShortBurst();
+    testSessionSecurity();
+    testAllocationRecordedEarly();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

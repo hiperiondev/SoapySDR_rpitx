@@ -22,6 +22,9 @@
 #define DEF_DMA
 
 #include <stdint.h>
+
+#include <functional>
+
 #include "gpio.hpp"
 #include "util.hpp"
 
@@ -65,7 +68,8 @@
  *
  * Only legacy DMA channels are driven (0-14 on BCM2835/6/7, 0-10 on BCM2711, where 11-14 are DMA4 channels
  * with a different control-block format). Channels reserved for the Linux DMA engine driver by the device
- * tree ("brcm,dma-channel-mask") are never used, and a channel found active is not reset unless forced.
+ * tree ("dma-channel-mask" or "brcm,dma-channel-mask") are never used, and a channel found active is not reset
+ * unless forced.
  */
 class dma {
 protected:
@@ -112,13 +116,17 @@ public:
      * @param CBSize      Number of control blocks to allocate.
      * @param UserMemSize Number of 32-bit user-memory words to allocate after the control blocks.
      * @param Force       Reset an explicitly selected channel even when it is active.
+     * @param Allocated   Called with the channel and the VideoCore memory handle as soon as the memory is
+     *                    allocated and locked, before anything else can fail (used to record the allocation
+     *                    for crash recovery). May be empty.
      *
      * @throws std::runtime_error when the channel is not usable (DMA4 channel on BCM2711, reserved for the
-     *         kernel, or active and not forced), when no default channel is free, when the mailbox cannot be
-     *         opened, the VideoCore memory cannot be allocated or locked, or /dev/mem cannot be mapped
-     *         (typically because the process is not root).
+     *         kernel, or active and not forced), when no default channel is requested but the kernel channel
+     *         mask cannot be read from the device tree, when no default channel is free, when the mailbox
+     *         cannot be opened, the VideoCore memory cannot be allocated or locked, or /dev/mem cannot be
+     *         mapped (typically because the process is not root).
      */
-    dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force = false);
+    dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force = false, const std::function<void(int, unsigned)> &Allocated = {});
 
     /** @brief Stops the channel, unmaps and releases the VideoCore memory and closes the mailbox. */
     ~dma();
@@ -203,7 +211,8 @@ public:
     /**
      * @brief Fills a control block that copies user-memory words to a peripheral register.
      *
-     * Transfers to the PCM FIFO are paced by its DREQ line; the other destinations are written immediately.
+     * Transfers to the PCM FIFO and to the PWM FIFO are paced by their DREQ line; the other destinations are
+     * written immediately.
      *
      * @param cbp    Control block to fill.
      * @param index  Index of the first source word in @ref usermem.
@@ -238,10 +247,12 @@ public:
      * @param tcbbysample       Control blocks per slot.
      * @param tregisterbysample User-memory words per slot.
      * @param Force             Reset an explicitly selected channel even when it is active.
+     * @param Allocated         Allocation callback (see dma::dma()).
      *
      * @throws std::runtime_error on channel or allocation failure (see dma::dma()).
      */
-    bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force = false);
+    bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force = false,
+              const std::function<void(int, unsigned)> &Allocated = {});
 
     /** @brief Builds the control-block chain; the base implementation does nothing. */
     void SetDmaAlgo();

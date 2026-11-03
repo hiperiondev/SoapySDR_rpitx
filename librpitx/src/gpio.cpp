@@ -488,11 +488,15 @@ void clkgpio::print_clock_tree(void) {
 
 // https://elinux.org/The_Undocumented_Pi
 // See also https://github.com/raspberrypi/linux/blob/ffd7bf4085b09447e5db96edd74e524f118ca3fe/drivers/clk/bcm/clk-bcm2835.c#L695
+void clkgpio::SaveClockTree() {
+    if (!SavedTree.valid)
+        cm_save_tree(gpioreg, SavedTree);
+}
+
 void clkgpio::SetAdvancedPllMode(bool Advanced) {
     ModulateFromMasterPLL = Advanced;
     if (ModulateFromMasterPLL) {
-        if (!SavedTree.valid)
-            cm_save_tree(gpioreg, SavedTree);
+        SaveClockTree();
 
         // Move the clocks that depend on PLLC away from it, since PLLC is modulated.
         // switch the core over to PLLA
@@ -601,10 +605,11 @@ pcmgpio::pcmgpio() :
         clk(CLK_BASE, CLK_LEN) {
     savedCtl = clk.gpioreg[PCMCLK_CNTL] & 0x00FFFFFFu;
     savedDiv = clk.gpioreg[PCMCLK_DIV] & 0x00FFFFFFu;
-    gpioreg[PCM_CS_A] = 1; // Disable Rx+Tx, Enable PCM block
 }
 
 pcmgpio::~pcmgpio() {
+    if (!used)
+        return;
     gpioreg[PCM_CS_A] = 0; // PCM block, transmitter and DMA requests off
     cm_program_generator(clk.gpioreg, PCMCLK_CNTL, savedCtl & CM_SRC_MASK, (savedCtl >> CM_MASH_SHIFT) & 3, (savedDiv >> 12) & 0xFFF, savedDiv & 0xFFF,
                          (savedCtl & CM_ENAB) != 0);
@@ -638,17 +643,70 @@ int pcmgpio::ComputePrediv(uint64_t Frequency) {
     return 1000;
 }
 
-int pcmgpio::SetFrequency(uint64_t Frequency) {
-    Prediv = ComputePrediv(Frequency);
-    double Freqresult = (double) Pllfrequency / (double) (Frequency * (uint64_t) Prediv);
+bool pcmgpio::ProgramClock(double bitRate) {
+    if (!(bitRate > 0))
+        return false;
+    double Freqresult = (double) Pllfrequency / bitRate;
+    if (!(Freqresult >= 2.0 && Freqresult < 4096.0))
+        return false;
     divInt = (uint32_t) Freqresult;
     divFrac = (uint32_t) (4096 * (Freqresult - (double) divInt));
     dbg_printf(1, "PCM clk=%u / %u\n", divInt, divFrac);
-    if ((divInt > 4095) || (divInt < 2))
-        dbg_printf(0, "PCM Frequency out of range\n");
     cm_program_generator(clk.gpioreg, PCMCLK_CNTL, (unsigned) pllnumber, (unsigned) Mash, divInt, divFrac, true);
+    return true;
+}
+
+int pcmgpio::SetFrequency(uint64_t Frequency) {
+    used = true;
+    gpioreg[PCM_CS_A] = PCM_CS_EN | PCM_CS_STBY; // block enabled, transmitter and receiver off
+    Prediv = ComputePrediv(Frequency);
+    if (!ProgramClock((double) Frequency * (double) Prediv))
+        dbg_printf(0, "PCM Frequency out of range\n");
     SetPrediv(Prediv);
     return 0;
+}
+
+bool pcmgpio::DacFrequencyFits(uint64_t Frequency) const {
+    double Freqresult = (double) Pllfrequency / ((double) Frequency * PCM_DAC_FRAME_LENGTH);
+    return Freqresult >= 2.0 && Freqresult < 4096.0;
+}
+
+int pcmgpio::SetDacFrequency(uint64_t Frequency) {
+    if (!DacFrequencyFits(Frequency))
+        return -1;
+
+    used = true;
+    gpioreg[PCM_CS_A] = PCM_CS_EN | PCM_CS_STBY;
+    usleep(100);
+    Prediv = PCM_DAC_FRAME_LENGTH;
+    ProgramClock((double) Frequency * PCM_DAC_FRAME_LENGTH);
+
+    // I2S: frame sync low for the left channel, data one bit clock after the frame edge, MSB first.
+    const uint32_t half = PCM_DAC_FRAME_LENGTH / 2;
+    gpioreg[PCM_MODE_A] = PCM_MODE_FTXP | PCM_MODE_CLKI | PCM_MODE_FSI | ((uint32_t) (PCM_DAC_FRAME_LENGTH - 1) << 10) | half;
+    usleep(100);
+    // Channel 1 and 2: enabled, 16 bits (width field 8 = 8 + 8 bits), positions 1 and half + 1.
+    gpioreg[PCM_TXC_A] = (1u << 30) | (1u << 20) | (8u << 16) | (1u << 14) | ((half + 1) << 4) | 8u;
+    usleep(100);
+    gpioreg[PCM_DREQ_A] = (uint32_t) PCM_TX_DREQ_LEVEL << 24 | (uint32_t) PCM_TX_DREQ_LEVEL << 8;
+    usleep(100);
+    StartTx();
+    return 0;
+}
+
+void pcmgpio::StartTx() {
+    if (!used)
+        return;
+    gpioreg[PCM_CS_A] = (gpioreg[PCM_CS_A] & ~(PCM_CS_TXON | PCM_CS_DMAEN)) | PCM_CS_TXCLR;
+    usleep(10);
+    gpioreg[PCM_CS_A] |= PCM_CS_DMAEN;
+    gpioreg[PCM_CS_A] |= PCM_CS_TXON;
+}
+
+void pcmgpio::StopTx() {
+    if (!used)
+        return;
+    gpioreg[PCM_CS_A] &= ~(PCM_CS_TXON | PCM_CS_DMAEN);
 }
 
 double pcmgpio::GetFrameRate() const {
@@ -669,15 +727,98 @@ int pcmgpio::SetPrediv(int predivisor) {
 
     gpioreg[PCM_MODE_A] = (uint32_t) (predivisor - 1) << 10; // SHOULD NOT EXCEED 1000 !!!
     usleep(100);
-    gpioreg[PCM_CS_A] |= 1 << 4 | 1 << 3; // Clear FIFOs
+    gpioreg[PCM_DREQ_A] = (uint32_t) PCM_TX_DREQ_LEVEL << 24 | (uint32_t) PCM_TX_DREQ_LEVEL << 8; // TX DREQ and panic levels
     usleep(100);
-    gpioreg[PCM_DREQ_A] = 64 << 24 | 64 << 8; // TX DREQ and panic levels at 64 words
-    usleep(100);
-    gpioreg[PCM_CS_A] |= 1 << 9; // Enable DMA
-    usleep(100);
-    gpioreg[PCM_CS_A] |= 1 << 2; //START TX PCM
+    StartTx();
 
     return 0;
+}
+
+// ********************************** PWM GPIO **********************************
+
+pwmgpio::pwmgpio() :
+        gpio(PWM_BASE, PWM_LEN),
+        clk(CLK_BASE, CLK_LEN) {
+    savedClkCtl = clk.gpioreg[PWMCLK_CNTL] & 0x00FFFFFFu;
+    savedClkDiv = clk.gpioreg[PWMCLK_DIV] & 0x00FFFFFFu;
+    savedCtl = gpioreg[PWM_CTL];
+    savedRng = gpioreg[PWM_RNG1];
+    savedDmac = gpioreg[PWM_DMAC];
+    Pllfrequency = cm_pll_frequency(clk.gpioreg, pllnumber, clk.XOSC_FREQUENCY, clk.pi_is_2711, clk_ppm);
+}
+
+pwmgpio::~pwmgpio() {
+    if (!used)
+        return;
+    gpioreg[PWM_CTL] = 0;
+    gpioreg[PWM_DMAC] = 0;
+    usleep(10);
+    cm_program_generator(clk.gpioreg, PWMCLK_CNTL, savedClkCtl & CM_SRC_MASK, (savedClkCtl >> CM_MASH_SHIFT) & 3, (savedClkDiv >> 12) & 0xFFF,
+                         savedClkDiv & 0xFFF, (savedClkCtl & CM_ENAB) != 0);
+    gpioreg[PWM_RNG1] = savedRng;
+    gpioreg[PWM_DMAC] = savedDmac;
+    gpioreg[PWM_CTL] = savedCtl;
+}
+
+void pwmgpio::Setppm(double ppm) {
+    clk_ppm = ppm;
+    Pllfrequency = cm_pll_frequency(clk.gpioreg, pllnumber, clk.XOSC_FREQUENCY, clk.pi_is_2711, clk_ppm);
+}
+
+bool pwmgpio::FrequencyFits(uint64_t Frequency, uint32_t Range) const {
+    if (Range < 2)
+        return false;
+    double Freqresult = (double) Pllfrequency / ((double) Frequency * (double) Range);
+    return Freqresult >= 2.0 && Freqresult < 4096.0;
+}
+
+int pwmgpio::SetFrequency(uint64_t Frequency, uint32_t Range) {
+    if (!FrequencyFits(Frequency, Range))
+        return -1;
+    double Freqresult = (double) Pllfrequency / ((double) Frequency * (double) Range);
+
+    used = true;
+    range = Range;
+    divInt = (uint32_t) Freqresult;
+    divFrac = (uint32_t) (4096 * (Freqresult - (double) divInt));
+
+    gpioreg[PWM_CTL] = 0;
+    gpioreg[PWM_DMAC] = 0;
+    usleep(10);
+    cm_program_generator(clk.gpioreg, PWMCLK_CNTL, (unsigned) pllnumber, (unsigned) Mash, divInt, divFrac, true);
+    gpioreg[PWM_RNG1] = range;
+    usleep(10);
+    gpioreg[PWM_DMAC] = PWM_DMAC_ENAB | ((uint32_t) PWM_DREQ_LEVEL << 8) | (uint32_t) PWM_DREQ_LEVEL;
+    StartTx();
+    return 0;
+}
+
+void pwmgpio::StartTx() {
+    if (!used)
+        return;
+    gpioreg[PWM_CTL] = PWM_CTL_CLRF1;
+    usleep(10);
+    gpioreg[PWM_CTL] = PWM_CTL_PWEN1 | PWM_CTL_USEF1 | PWM_CTL_MSEN1;
+}
+
+void pwmgpio::StopTx() {
+    if (!used)
+        return;
+    gpioreg[PWM_CTL] = 0;
+}
+
+double pwmgpio::GetFrameRate() const {
+    if (divInt == 0 || range == 0)
+        return 0;
+    return (double) Pllfrequency / (((double) divInt + (double) divFrac / 4096.0) * (double) range);
+}
+
+uint32_t pwmgpio::Range() const {
+    return range;
+}
+
+bool pwmgpio::Used() const {
+    return used;
 }
 
 // ********************************** PADGPIO (Amplitude) **********************************

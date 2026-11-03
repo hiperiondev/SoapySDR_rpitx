@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -40,6 +41,13 @@ void MockSetKernelDmaMask(uint32_t mask, bool known);
 void MockFailNextAlloc();
 
 /**
+ * @brief Calls a function, once, when the next VideoCore allocation is mapped into the process (after it was
+ *        allocated and locked).
+ * @param hook Function to call (empty to cancel).
+ */
+void MockOnNextVcMap(std::function<void()> hook);
+
+/**
  * @brief Allocates simulated VideoCore memory outside the code under test.
  * @param size Size in bytes.
  * @return Memory handle.
@@ -59,25 +67,30 @@ bool MockAllocated(unsigned handle);
  */
 size_t MockLiveAllocations();
 
-/** @brief Content of one ring slot as executed by the simulated DMA engine. */
+/** @brief Output of the transmitter during one frame (period of the pacing FIFO), as seen by the simulated DMA engine. */
 struct MockSlot {
-    uint32_t frac = 0;      ///< PLLC fractional multiplier.
-    uint32_t pad = 0;       ///< Pad drive level.
-    bool hysteresis = true; ///< Input hysteresis of GPIO 0-27 enabled.
-    bool carrierOn = false; ///< GPIO4 switched to the clock output.
+    uint32_t frac = 0;       ///< PLLC fractional multiplier.
+    uint32_t pad = 0;        ///< Pad drive level.
+    bool hysteresis = true;  ///< Input hysteresis of GPIO 0-27 enabled.
+    bool carrierOn = false;  ///< GPIO4 switched to the clock output.
+    bool carrier2On = false; ///< GPIO20 switched to the clock output (ALT5).
+    uint32_t dac = 0;        ///< Word leaving the pacing FIFO in this frame (envelope code with an envelope DAC).
+    bool dacValid = false;   ///< A word left the pacing FIFO in this frame.
 };
 
 /**
- * @brief Simulated DMA engine: while the channel ACTIVE bit is set it executes one ring slot per sample period
- *        by following the control-block chain, writes the GPFSEL0 word of each slot to the simulated GPIO
- *        block, and records what each slot would have output.
+ * @brief Simulated DMA engine: while the channel ACTIVE bit is set it interprets the control-block chain,
+ *        writes each block's word to the simulated register it addresses, and models the pacing FIFO (PCM or
+ *        PWM, with the DREQ level programmed in the simulated registers): a DREQ-paced block waits while the
+ *        FIFO holds the DREQ level, and one word leaves the FIFO per frame. One MockSlot is recorded per frame
+ *        with the registers in effect and the FIFO word output.
  */
 class MockDmaEngine {
 public:
     /**
      * @brief Starts the engine thread.
      * @param dmaChannel DMA channel to watch.
-     * @param rate       Slots executed per second.
+     * @param rate       Frames per second (the slot rate of the transmitter).
      */
     MockDmaEngine(int dmaChannel, uint32_t rate);
 
@@ -85,8 +98,8 @@ public:
     ~MockDmaEngine();
 
     /**
-     * @brief Returns and clears the slots executed so far.
-     * @return Executed slots in order.
+     * @brief Returns and clears the frames recorded so far.
+     * @return Recorded frames in order.
      */
     std::vector<MockSlot> Take();
 
@@ -95,9 +108,9 @@ private:
     void Run();
 
     int channel;                   ///< Watched DMA channel.
-    uint32_t sampleRate;           ///< Slots per second.
+    uint32_t sampleRate;           ///< Frames per second.
     std::atomic<bool> stop{false}; ///< Stop request.
     std::mutex playedLock;         ///< Protects @ref played.
-    std::vector<MockSlot> played;  ///< Executed slots.
+    std::vector<MockSlot> played;  ///< Recorded frames.
     std::thread worker;            ///< Engine thread.
 };

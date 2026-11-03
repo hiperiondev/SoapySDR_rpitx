@@ -40,7 +40,7 @@ std::string hex(uint32_t v) {
 
 } // namespace
 
-dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force) {
+dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force, const std::function<void(int, unsigned)> &Allocated) {
     const bool bcm2711 = dma_reg.pi_is_2711;
     const int maxChannel = bcm2711 ? 10 : 14;
     bool maskKnown = false;
@@ -60,6 +60,8 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force) {
                                      " is active (in use by another program); select another channel or force it");
         channel = Channel;
     } else {
+        if (!maskKnown)
+            throw std::runtime_error("librpitx: the kernel DMA channel mask cannot be read from the device tree; select the DMA channel explicitly");
         const int *list = bcm2711 ? kPreferred2711 : kPreferredLegacy;
         size_t count = bcm2711 ? sizeof(kPreferred2711) / sizeof(int) : sizeof(kPreferredLegacy) / sizeof(int);
         channel = -1;
@@ -98,6 +100,16 @@ dma::dma(int Channel, uint32_t CBSize, uint32_t UserMemSize, bool Force) {
         mem_free(mbox.handle, mbox.mem_ref);
         mbox_close(mbox.handle);
         throw std::runtime_error("librpitx: VideoCore memory lock failed");
+    }
+    if (Allocated) {
+        try {
+            Allocated(channel, mbox.mem_ref);
+        } catch (...) {
+            mem_unlock(mbox.handle, mbox.mem_ref);
+            mem_free(mbox.handle, mbox.mem_ref);
+            mbox_close(mbox.handle);
+            throw;
+        }
     }
 
     mbox.virt_addr = (uint8_t *) mapmem(BUS_TO_PHYS(mbox.bus_addr), (unsigned) NumPages * VC_PAGE_SIZE);
@@ -219,14 +231,17 @@ bool dma::SetEasyCB(dma_cb_t *cbp, uint32_t index, dma_common_reg dst, uint32_t 
     uint32_t src = mem_virt_to_phys(&usermem[index]);
     if (dst == dma_pcm)
         flag |= BCM2708_DMA_D_DREQ | BCM2708_DMA_PER_MAP(DREQ_PCM_TX);
+    else if (dst == dma_pwm)
+        flag |= BCM2708_DMA_D_DREQ | BCM2708_DMA_PER_MAP(DREQ_PWM);
     SetCB(cbp, flag, src, (uint32_t) dst, repeat);
     return true;
 }
 
 // ************************************** BUFFER DMA **************************************
 
-bufferdma::bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force) :
-        dma(Channel, tbuffersize * tcbbysample, tbuffersize * tregisterbysample, Force) {
+bufferdma::bufferdma(int Channel, uint32_t tbuffersize, uint32_t tcbbysample, uint32_t tregisterbysample, bool Force,
+                     const std::function<void(int, unsigned)> &Allocated) :
+        dma(Channel, tbuffersize * tcbbysample, tbuffersize * tregisterbysample, Force, Allocated) {
     buffersize = tbuffersize;
     cbbysample = tcbbysample;
     registerbysample = tregisterbysample;

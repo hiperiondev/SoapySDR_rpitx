@@ -43,10 +43,6 @@
 
 namespace {
 
-// Control blocks per ring slot: PAD, PLLC_FRAC, GPFSEL0 and the PCM pacing write.
-constexpr uint32_t kCbPerSample = 4;
-// User-memory words per ring slot: PLLC_FRAC, PAD, GPFSEL0.
-constexpr uint32_t kRegPerSample = 3;
 // Feeder thread period.
 constexpr auto kFeederPeriod = std::chrono::microseconds(1000);
 // Maximum blocking slice of a producer waiting for FIFO space.
@@ -55,8 +51,12 @@ constexpr auto kProducerSlice = std::chrono::milliseconds(2);
 constexpr auto kRetuneTimeout = std::chrono::seconds(3);
 // Consecutive polls without a valid DMA position before the engine is considered stopped.
 constexpr int kBadPollLimit = 5;
-// Bound of the phase error carried between samples, in radians.
-constexpr double kMaxPhaseCarry = 0.5;
+// Largest phase correction applied in one slot, in radians.
+constexpr double kMaxPhaseStep = 0.5;
+// Bound of the phase error carried between slots, in radians.
+constexpr double kMaxPhaseCarry = 2 * M_PI;
+// Time the envelope must stay below the floor before the carrier is switched off.
+constexpr double kFloorHangSeconds = 0.002;
 // Signals handled when signal cleanup is requested.
 const int kCleanupSignals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT};
 
@@ -126,19 +126,89 @@ size_t fifoCapacityFor(uint32_t fifoMs, uint32_t sampleRate) {
     return (size_t) std::max<uint64_t>(samples, 1024);
 }
 
+// Slots kept between the executing slot and the slots the feeder writes behind the write position.
+uint32_t guardSlots(uint32_t ringSize, uint32_t slotRate) {
+    return std::min<uint32_t>(ringSize / 4, std::max<uint32_t>(32, slotRate / 500));
+}
+
+// Words held in the pacing FIFO.
+uint32_t pacingLevelFor(SoapyRPITX_EnvelopeOutput out) {
+    return out == SoapyRPITX_EnvelopeOutput::Pwm ? PWM_DREQ_LEVEL : PCM_TX_DREQ_LEVEL;
+}
+
+// Slots between the registers of a slot taking effect and its pacing word leaving the FIFO: the word enters
+// behind the FIFO level when the next slot starts, and is output one frame after the words ahead of it.
+double envelopeLatencyFor(SoapyRPITX_EnvelopeOutput out) {
+    return out == SoapyRPITX_EnvelopeOutput::None ? 0.0 : (double) pacingLevelFor(out) + 1.0;
+}
+
+// Largest number of slots the envelope words may be written ahead of their sample.
+uint32_t maxAdvanceFor(uint32_t ringSize) {
+    return ringSize / 8;
+}
+
+bool advanceFits(const SoapyRPITX_AmplitudeConfig &a, uint32_t slotsPerSample, SoapyRPITX_EnvelopeOutput out, uint32_t ringSize) {
+    int advance = 0;
+    SoapyRPITX_SplitEnvelopeDelay(a.envelopeDelay * slotsPerSample, envelopeLatencyFor(out), advance);
+    return (uint32_t) advance <= maxAdvanceFor(ringSize);
+}
+
+std::vector<unsigned> extraPinsFor(const SoapyRPITX_TxConfig &cfg) {
+    std::vector<unsigned> pins;
+    if (cfg.rfDac)
+        pins.push_back(RPITX_TX2_GPIO);
+    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
+        pins.push_back(18);
+        pins.push_back(19);
+        pins.push_back(21);
+    } else if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        pins.push_back((unsigned) cfg.pwmGpio);
+    }
+    return pins;
+}
+
 } // namespace
 
-uint32_t SoapyRPITX_DefaultRingSize(uint32_t sampleRate) {
-    uint64_t samples = (uint64_t) sampleRate * RPITX_DEFAULT_RING_MS / 1000;
+uint32_t SoapyRPITX_DefaultRingSize(uint32_t slotRate) {
+    uint64_t samples = (uint64_t) slotRate * RPITX_DEFAULT_RING_MS / 1000;
     samples = (samples + 511) / 512 * 512;
     return (uint32_t) std::min<uint64_t>(std::max<uint64_t>(samples, 4096), RPITX_MAX_RING_SIZE);
 }
 
-bool SoapyRPITX_RingFitsRate(uint32_t ringSize, uint32_t sampleRate) {
-    return (uint64_t) ringSize * 1000 >= (uint64_t) sampleRate * RPITX_MIN_RING_MS;
+bool SoapyRPITX_RingFitsRate(uint32_t ringSize, uint32_t slotRate) {
+    return (uint64_t) ringSize * 1000 >= (uint64_t) slotRate * RPITX_MIN_RING_MS;
 }
 
-SoapyRPITX_HardwareClaim::SoapyRPITX_HardwareClaim() {
+void SoapyRPITX_CheckTxConfig(const SoapyRPITX_TxConfig &cfg) {
+    if (cfg.tune.harmonic < 1)
+        throw std::runtime_error("rpitx: harmonic must be >= 1");
+    if (cfg.slotsPerSample < 1 || cfg.slotsPerSample > RPITX_MAX_SLOTS_PER_SAMPLE)
+        throw std::runtime_error("rpitx: slots per sample must be 1 to " + std::to_string(RPITX_MAX_SLOTS_PER_SAMPLE));
+    if (cfg.tune.sampleRate < RPITX_MIN_SAMPLE_RATE || cfg.tune.sampleRate > RPITX_MAX_SAMPLE_RATE)
+        throw std::runtime_error("rpitx: unsupported sample rate");
+    const uint64_t slotRate = (uint64_t) cfg.tune.sampleRate * cfg.slotsPerSample;
+    if (slotRate > RPITX_MAX_SAMPLE_RATE)
+        throw std::runtime_error("rpitx: the slot rate " + std::to_string(slotRate) + " Hz (sample rate x slots per sample) exceeds " +
+                                 std::to_string(RPITX_MAX_SAMPLE_RATE) + " Hz");
+    const uint32_t ring = clampRingSize(cfg.ringSize);
+    if (!SoapyRPITX_RingFitsRate(ring, (uint32_t) slotRate))
+        throw std::runtime_error("rpitx: the DMA ring of " + std::to_string(ring) + " slots is shorter than " + std::to_string(RPITX_MIN_RING_MS) + " ms at " +
+                                 std::to_string(slotRate) + " slots/s");
+    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        if (cfg.pwmGpio != 12 && cfg.pwmGpio != 18)
+            throw std::runtime_error("rpitx: the PWM envelope output must be GPIO12 or GPIO18");
+        if (cfg.pwmBits < 6 || cfg.pwmBits > 12)
+            throw std::runtime_error("rpitx: PWM envelope resolution must be 6 to 12 bits");
+    }
+    std::string why = SoapyRPITX_CheckAmplitudeConfig(cfg.amplitude);
+    if (!why.empty())
+        throw std::runtime_error("rpitx: " + why);
+    if (!advanceFits(cfg.amplitude, cfg.slotsPerSample, cfg.envelopeOutput, ring))
+        throw std::runtime_error("rpitx: envelope_delay needs more look-ahead than the DMA ring allows (" + std::to_string(maxAdvanceFor(ring)) + " slots)");
+}
+
+SoapyRPITX_HardwareClaim::SoapyRPITX_HardwareClaim(const SoapyRPITX_TxConfig &cfg) {
+    SoapyRPITX_CheckTxConfig(cfg);
     if (g_hardwareClaimed.exchange(true))
         throw std::runtime_error("rpitx: the transmitter hardware is already in use by another stream");
 
@@ -146,17 +216,37 @@ SoapyRPITX_HardwareClaim::SoapyRPITX_HardwareClaim() {
         session.reset(new SoapyRPITX_Session(RPITX_TX_GPIO));
         if (session->Recovered())
             SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: recovered the transmitter left running by a terminated %s", session->RecoveryReport().c_str());
+        if (session->Discarded())
+            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: discarded an implausible transmitter record (%s); nothing was restored",
+                          session->RecoveryReport().c_str());
 
-        std::string consumer;
-        if (SoapyRPITX_GpioLineClaimed(RPITX_TX_GPIO, consumer))
-            throw std::runtime_error("rpitx: GPIO" + std::to_string(RPITX_TX_GPIO) + " is claimed by '" + consumer +
-                                     "'; disable the overlay or program that uses it (for example w1-gpio)");
-        if (SoapyRPITX_I2sEnabled())
+        std::vector<unsigned> pins = extraPinsFor(cfg);
+        std::vector<unsigned> checked = pins;
+        checked.insert(checked.begin(), RPITX_TX_GPIO);
+        for (unsigned pin : checked) {
+            std::string consumer;
+            if (SoapyRPITX_GpioLineClaimed(pin, consumer))
+                throw std::runtime_error("rpitx: GPIO" + std::to_string(pin) + " is claimed by '" + consumer +
+                                         "'; disable the overlay or program that uses it (for example w1-gpio)");
+        }
+        if (cfg.envelopeOutput != SoapyRPITX_EnvelopeOutput::Pwm && SoapyRPITX_I2sEnabled())
             throw std::runtime_error("rpitx: the PCM/I2S controller is enabled in the device tree (sound card overlay or dtparam=i2s=on); "
                                      "it is needed as the DMA pacing clock");
+        if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm && SoapyRPITX_PwmEnabled())
+            throw std::runtime_error(
+                    "rpitx: the PWM block is enabled in the device tree (pwm overlay or dtparam=audio=on); it is needed for the envelope output");
 
         padgpio p;
         originalPads = p.gpioreg[PADS_GPIO_0] & 0x1F;
+        generalgpio g;
+        auto functionOf = [&](unsigned pin) { return (g.gpioreg[pin / 10] >> (3 * (pin % 10))) & 7; };
+        originalGpioFunction = functionOf(RPITX_TX_GPIO);
+        for (unsigned pin : pins)
+            originalPins.emplace_back(pin, functionOf(pin));
+
+        record.pads = originalPads;
+        record.gpioFunction = originalGpioFunction;
+        record.pinFunctions = originalPins;
     } catch (...) {
         session.reset();
         g_hardwareClaimed.store(false);
@@ -169,9 +259,28 @@ SoapyRPITX_HardwareClaim::~SoapyRPITX_HardwareClaim() {
     g_hardwareClaimed.store(false);
 }
 
+void SoapyRPITX_HardwareClaim::RecordDmaAllocation(int channel, unsigned memHandle) {
+    record.dmaChannel = channel;
+    record.memHandle = memHandle;
+    PublishRecord();
+}
+
+void SoapyRPITX_HardwareClaim::PublishRecord() {
+    session->Write(record);
+}
+
+uint32_t SoapyRPITX_IQ_dmaSync::WordsPerSlot(const SoapyRPITX_TxConfig &cfg) {
+    return 3 + (cfg.rfDac ? 1 : 0) + (cfg.envelopeOutput != SoapyRPITX_EnvelopeOutput::None ? 1 : 0);
+}
+
+uint32_t SoapyRPITX_IQ_dmaSync::CbsPerSlot(const SoapyRPITX_TxConfig &cfg) {
+    return 4 + (cfg.rfDac ? 1 : 0);
+}
+
 SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
-        SoapyRPITX_HardwareClaim(),
-        bufferdma(cfg.dmaChannel, clampRingSize(cfg.ringSize), kCbPerSample, kRegPerSample, cfg.dmaForce),
+        SoapyRPITX_HardwareClaim(cfg),
+        bufferdma(cfg.dmaChannel, clampRingSize(cfg.ringSize), CbsPerSlot(cfg), WordsPerSlot(cfg), cfg.dmaForce,
+                  [this](int ch, unsigned handle) { RecordDmaAllocation(ch, handle); }),
         clkgpio(),
         pcmgpio(),
         tuneCfg(cfg.tune),
@@ -181,49 +290,69 @@ SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
         rtPriority(cfg.rtPriority),
         cpu(cfg.cpu),
         signalCleanup(cfg.signalCleanup),
+        slotsPerSample(cfg.slotsPerSample),
+        envelopeOutput(cfg.envelopeOutput),
+        pwmGpio(cfg.pwmGpio),
+        pwmRange(1u << std::min(std::max(cfg.pwmBits, 6), 12)),
+        rfDac(cfg.rfDac),
+        wordsPerSlot(WordsPerSlot(cfg)),
+        wordFsel2(cfg.rfDac ? 3 : -1),
+        wordEnv(cfg.envelopeOutput != SoapyRPITX_EnvelopeOutput::None ? (cfg.rfDac ? 4 : 3) : -1),
+        pacingLevel(pacingLevelFor(cfg.envelopeOutput)),
         driveLevel(std::min(std::max(cfg.driveLevel, 0), 7)),
         iqScale(std::max(cfg.iqScale, 0.0f)),
         constantEnvelope(cfg.constantEnvelope),
+        ampCfg(cfg.amplitude),
         fifo(fifoCapacityFor(cfg.fifoMs, RPITX_MAX_SAMPLE_RATE)),
         tracker(clampRingSize(cfg.ringSize)),
         chunk(512),
         shadow(clampRingSize(cfg.ringSize)) {
-    if (cfg.tune.harmonic < 1)
-        throw std::runtime_error("rpitx: harmonic must be >= 1");
-    if (cfg.tune.sampleRate < RPITX_MIN_SAMPLE_RATE || cfg.tune.sampleRate > RPITX_MAX_SAMPLE_RATE)
-        throw std::runtime_error("rpitx: unsupported sample rate");
-    if (!SoapyRPITX_RingFitsRate(tracker.size(), cfg.tune.sampleRate))
-        throw std::runtime_error("rpitx: the DMA ring of " + std::to_string(tracker.size()) + " samples is shorter than " + std::to_string(RPITX_MIN_RING_MS) +
-                                 " ms at " + std::to_string(cfg.tune.sampleRate) + " Hz");
-
-    volatile uint32_t *fsel = clkgpio::gengpio.gpioreg;
-    originalGpioFunction = (fsel[GPFSEL0] >> (3 * RPITX_TX_GPIO)) & 7;
+    volatile uint32_t *gp = clkgpio::gengpio.gpioreg;
+    clkgpio::SaveClockTree();
     WriteSessionRecord();
 
     try {
         if (!session->Recovered() && (clkgpio::gpioreg[GPCLK_CNTL] & CM_ENAB))
             SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: GPCLK0 was already running; another program may be using it");
 
-        // A clock output left on GPIO4 (e.g. by a process that was killed while transmitting) is switched off first.
+        // A clock output left on the RF pins (e.g. by a process that was killed while transmitting) is switched off first.
         if (originalGpioFunction == fsel_alt0)
             clkgpio::gengpio.setmode(RPITX_TX_GPIO, fsel_input);
+        for (const auto &pf : originalPins) {
+            if (pf.first == RPITX_TX2_GPIO && rfDac && pf.second == fsel_alt5)
+                clkgpio::gengpio.setmode(RPITX_TX2_GPIO, fsel_input);
+        }
 
-        uint32_t base = fsel[GPFSEL0] & ~(7u << (3 * RPITX_TX_GPIO));
+        uint32_t base = gp[GPFSEL0] & ~(7u << (3 * RPITX_TX_GPIO));
         fselIdle = base | ((uint32_t) fsel_input << (3 * RPITX_TX_GPIO));
         fselOn = base | ((uint32_t) fsel_alt0 << (3 * RPITX_TX_GPIO));
+        uint32_t base2 = gp[GPFSEL2] & ~(7u << (3 * (RPITX_TX2_GPIO % 10)));
+        fsel2Idle = base2 | ((uint32_t) fsel_input << (3 * (RPITX_TX2_GPIO % 10)));
+        fsel2On = base2 | ((uint32_t) fsel_alt5 << (3 * (RPITX_TX2_GPIO % 10)));
 
         SetDmaAlgo();
 
         clkgpio::SetAdvancedPllMode(true);
-        WriteSessionRecord();
         pcmgpio::SetPllNumber(clk_plld, 1);
 
+        if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
+            clkgpio::gengpio.setmode(18, fsel_alt0); // PCM_CLK
+            clkgpio::gengpio.setmode(19, fsel_alt0); // PCM_FS
+            clkgpio::gengpio.setmode(21, fsel_alt0); // PCM_DOUT
+        } else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+            clkgpio::gengpio.setmode((uint32_t) pwmGpio, pwmGpio == 18 ? fsel_alt5 : fsel_alt0); // PWM0
+        }
+
+        PublishModel();
+        RefreshModel();
+
         if (!ApplyTune(tuneCfg))
-            throw std::runtime_error("rpitx: the requested frequency cannot be produced by the PLL");
+            throw std::runtime_error("rpitx: the requested frequency or the envelope DAC rate cannot be produced");
 
         ResetRing();
     } catch (...) {
         RestoreGpio();
+        RestoreEnvelopePins();
         throw;
     }
 
@@ -242,36 +371,36 @@ SoapyRPITX_IQ_dmaSync::~SoapyRPITX_IQ_dmaSync() {
     Stop();
     StopDma();
     RestoreGpio();
+    RestoreEnvelopePins();
 }
 
 void SoapyRPITX_IQ_dmaSync::WriteSessionRecord() {
-    SoapyRPITX_SessionRecord r;
-    r.dmaChannel = GetChannel();
-    r.memHandle = GetMemoryHandle();
-    r.pads = originalPads;
-    r.gpioFunction = originalGpioFunction;
-    r.pcmValid = true;
-    r.pcmCtl = pcmgpio::savedCtl;
-    r.pcmDiv = pcmgpio::savedDiv;
-    r.clockTree = clkgpio::SavedClockTree();
-    session->Write(r);
+    record.pcmValid = envelopeOutput != SoapyRPITX_EnvelopeOutput::Pwm;
+    record.pcmCtl = pcmgpio::savedCtl;
+    record.pcmDiv = pcmgpio::savedDiv;
+    record.pwmValid = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm;
+    record.pwmClkCtl = pwm.savedClkCtl;
+    record.pwmClkDiv = pwm.savedClkDiv;
+    record.pwmCtl = pwm.savedCtl;
+    record.pwmRng = pwm.savedRng;
+    record.pwmDmac = pwm.savedDmac;
+    record.clockTree = clkgpio::SavedClockTree();
+    PublishRecord();
 }
 
 void SoapyRPITX_IQ_dmaSync::SetDmaAlgo() {
     dma_cb_t *cbp = cbarray;
-    for (uint32_t samplecnt = 0; samplecnt < buffersize; samplecnt++) {
-        SetEasyCB(cbp, samplecnt * registerbysample + 1, dma_pad, 1);
-        cbp++;
-
-        SetEasyCB(cbp, samplecnt * registerbysample, dma_pllc_frac, 1);
-        cbp++;
-
-        SetEasyCB(cbp, samplecnt * registerbysample + 2, dma_fsel, 1);
-        cbp++;
-
-        // Paced by the PCM FIFO DREQ: one slot per sample period. The written value is irrelevant.
-        SetEasyCB(cbp, samplecnt * registerbysample, dma_pcm, 1);
-        cbp++;
+    const dma_common_reg pacing = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm ? dma_pwm : dma_pcm;
+    for (uint32_t slot = 0; slot < buffersize; slot++) {
+        const uint32_t base = slot * registerbysample;
+        SetEasyCB(cbp++, base + kWordPad, dma_pad, 1);
+        SetEasyCB(cbp++, base + kWordFrac, dma_pllc_frac, 1);
+        SetEasyCB(cbp++, base + kWordFsel0, dma_fsel, 1);
+        if (wordFsel2 >= 0)
+            SetEasyCB(cbp++, base + (uint32_t) wordFsel2, dma_fsel2, 1);
+        // Paced by the PCM or PWM FIFO DREQ: one slot per slot period. The word is the envelope code with an
+        // envelope DAC, a dummy value otherwise.
+        SetEasyCB(cbp++, base + (wordEnv >= 0 ? (uint32_t) wordEnv : (uint32_t) kWordFrac), pacing, 1);
     }
 
     // Close the loop.
@@ -284,7 +413,11 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
         return false;
     if (tune.sampleRate < RPITX_MIN_SAMPLE_RATE || tune.sampleRate > RPITX_MAX_SAMPLE_RATE)
         return false;
-    if (!SoapyRPITX_RingFitsRate(tracker.size(), tune.sampleRate))
+    const uint64_t rate64 = (uint64_t) tune.sampleRate * slotsPerSample;
+    if (rate64 > RPITX_MAX_SAMPLE_RATE)
+        return false;
+    const uint32_t rate = (uint32_t) rate64;
+    if (!SoapyRPITX_RingFitsRate(tracker.size(), rate))
         return false;
 
     double previousPpm = clkgpio::Getppm();
@@ -296,8 +429,28 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     }
     clkgpio::Setppm(basePpm + tune.ppm);
 
+    // The envelope DAC must be able to run at the slot rate before anything is reprogrammed.
+    bool dacFits = true;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
+        pcmgpio::Setppm(clkgpio::Getppm());
+        dacFits = pcmgpio::DacFrequencyFits(rate);
+        if (!dacFits)
+            pcmgpio::Setppm(previousPpm);
+    } else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        pwm.Setppm(clkgpio::Getppm());
+        dacFits = pwm.FrequencyFits(rate, pwmRange);
+        if (!dacFits)
+            pwm.Setppm(previousPpm);
+    }
+    if (!dacFits) {
+        clkgpio::Setppm(previousPpm);
+        return false;
+    }
+
+    // Instantaneous frequencies stay within +/- rate / 2, plus the largest phase correction of one slot.
+    const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
     uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
-    if (clkgpio::SetCenterFrequency(pllFrequency, (int) tune.sampleRate) != 0) {
+    if (clkgpio::SetCenterFrequency(pllFrequency, bandwidth) != 0) {
         clkgpio::Setppm(previousPpm);
         return false;
     }
@@ -305,16 +458,25 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
         SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: PLLC did not report lock at %.0f Hz", tune.frequency);
     if (clkgpio::CrossesBoundary())
         SoapySDR_logf(SOAPY_SDR_WARNING,
-                      "rpitx: at %.0f Hz the band of +/-%u Hz crosses a PLL integer step; deviations beyond the step are clipped "
+                      "rpitx: at %.0f Hz the band of +/-%d Hz crosses a PLL integer step; deviations beyond the step are clipped "
                       "(a slightly different frequency or a lower sample rate avoids it)",
-                      tune.frequency, tune.sampleRate);
+                      tune.frequency, bandwidth);
 
-    pcmgpio::Setppm(clkgpio::Getppm());
-    pcmgpio::SetFrequency(tune.sampleRate);
-    mydsp.samplerate = tune.sampleRate;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        pwm.SetFrequency(rate, pwmRange);
+    } else {
+        pcmgpio::Setppm(clkgpio::Getppm());
+        if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm)
+            pcmgpio::SetDacFrequency(rate);
+        else
+            pcmgpio::SetFrequency(rate);
+    }
+    slotRate = rate;
+    mydsp.samplerate = rate;
     mydsp.reset();
     phaseCarry = 0;
-    carryToHz = (double) tune.sampleRate / (2.0 * M_PI);
+    appliedPhase = 0;
+    carryToHz = (double) rate / (2.0 * M_PI);
     fifo.setLimit(fifoCapacityFor(fifoMs, tune.sampleRate));
 
     {
@@ -330,47 +492,188 @@ void SoapyRPITX_IQ_dmaSync::ComputeIdleWords() {
     idlePad = (0x5Au << 24) | originalPads;
 }
 
+void SoapyRPITX_IQ_dmaSync::PublishModel() {
+    std::lock_guard<std::mutex> lock(modelMutex);
+    auto m = std::make_shared<const SoapyRPITX_AmplitudeModel>(ampCfg, driveLevel.load(), rfDac);
+    std::atomic_store(&published, m);
+}
+
+void SoapyRPITX_IQ_dmaSync::RefreshModel() {
+    std::shared_ptr<const SoapyRPITX_AmplitudeModel> m = std::atomic_load(&published);
+    if (m == model)
+        return;
+    model = m;
+
+    envDelaySlots = SoapyRPITX_SplitEnvelopeDelay(m->config.envelopeDelay * slotsPerSample, envelopeLatencyFor(envelopeOutput), envAdvance);
+    envAdvance = std::min<int>(envAdvance, (int) maxAdvanceFor(tracker.size()));
+    envDelaySlots = std::min(envDelaySlots, (double) (SoapyRPITX_EnvelopeDelay::kLength - 2));
+
+    double idle = std::min(std::max(m->config.eerIdle, 0.0), 1.0);
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
+        uint32_t c = (uint32_t) std::lround(idle * 32767.0);
+        idleEnv = (c << 16) | c;
+    } else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm) {
+        idleEnv = (uint32_t) std::lround(idle * (double) pwmRange);
+    } else {
+        idleEnv = 0;
+    }
+}
+
+void SoapyRPITX_IQ_dmaSync::ResetAmplitudeState() {
+    quantizer.reset();
+    envHistory.reset();
+    floorCount = 0;
+    prevIq = std::complex<float>(0.0f, 0.0f);
+}
+
 void SoapyRPITX_IQ_dmaSync::WriteIdleSlot(uint32_t slot) {
     volatile uint32_t *tab = sampletab + (size_t) slot * registerbysample;
-    tab[0] = idleFrac;
-    tab[1] = idlePad;
-    tab[2] = fselIdle;
+    tab[kWordFrac] = idleFrac;
+    tab[kWordPad] = idlePad;
+    tab[kWordFsel0] = fselIdle;
+    if (wordFsel2 >= 0)
+        tab[wordFsel2] = fsel2Idle;
+    if (wordEnv >= 0)
+        tab[wordEnv] = idleEnv;
     shadow[slot] = std::complex<float>(0.0f, 0.0f);
 }
 
-void SoapyRPITX_IQ_dmaSync::WriteDataSlot(uint32_t slot, std::complex<float> sample) {
+void SoapyRPITX_IQ_dmaSync::UpdateBehindLimit() {
+    if (!dmaRunning.load(std::memory_order_relaxed)) {
+        behindLimit = 0;
+        return;
+    }
+    double elapsed = std::chrono::duration<double>(clock::now() - lastPoll).count();
+    behindLimit = tracker.readPos() + (uint64_t) std::max(0.0, elapsed * slotRate) + guardSlots(tracker.size(), slotRate);
+}
+
+void SoapyRPITX_IQ_dmaSync::WriteDataSlot(uint64_t pos, std::complex<float> sample) {
+    const uint32_t slot = tracker.slotOf(pos);
     mydsp.pushsample(sample);
     shadow[slot] = sample;
+    envHistory.push(mydsp.amplitude);
 
-    const int drive = driveLevel.load(std::memory_order_relaxed);
-    int level;
-    bool on;
+    const SoapyRPITX_AmplitudeModel &m = *model;
+    const SoapyRPITX_AmplitudeConfig &c = m.config;
+    const bool constant = constantEnvelope.load(std::memory_order_relaxed);
+    const double raw = envHistory.at(envDelaySlots);
+    double a = raw * (double) iqScale.load(std::memory_order_relaxed);
+    if (!(a > 0))
+        a = 0;
 
-    if (constantEnvelope.load(std::memory_order_relaxed)) {
-        on = mydsp.amplitude >= mydsp.magnitude_gate;
-        level = drive;
-    } else {
-        double a = mydsp.amplitude * (double) iqScale.load(std::memory_order_relaxed);
-        if (!(a > 0))
-            a = 0;
-        if (a > 1)
-            a = 1;
-        // Drive levels 0..drive map to the upper part of the magnitude range; below it the carrier is off.
-        level = (int) std::lround(a * (drive + 1)) - 1;
-        on = level >= 0;
+    bool floored = false;
+    if (!constant && c.envelopeFloor > 0) {
+        const uint32_t hang = std::max<uint32_t>(1, (uint32_t) (kFloorHangSeconds * slotRate));
+        if (a < c.envelopeFloor) {
+            if (floorCount < hang)
+                floorCount++;
+        } else {
+            floorCount = 0;
+        }
+        floored = floorCount >= hang;
     }
 
-    // The PLL realises a quantised frequency: the resulting phase error is added to the next sample.
+    // Words of the amplitude path (written envAdvance slots ahead) and of the phase path (this slot).
+    uint32_t padWord, fsel0Word, fsel2Word = fsel2Idle, envWord = idleEnv;
+    double phase = appliedPhase;
+    const uint32_t hyst = (originalPads & PADS_HYST) | PADS_SLEW;
+
+    if (wordEnv >= 0) {
+        bool on;
+        double code;
+        if (constant) {
+            on = raw >= mydsp.magnitude_gate;
+            code = on ? 1.0 : c.eerIdle;
+        } else {
+            bool clipped = false;
+            on = !floored;
+            code = on ? m.eerCode(a, clipped) : c.eerIdle;
+            if (clipped)
+                envelopeClips.fetch_add(1, std::memory_order_relaxed);
+            if (on)
+                phase = m.eerPhase(code);
+        }
+        padWord = on ? ((0x5Au << 24) | hyst | ((uint32_t) c.eerDrive & PADS_DRIVE_MASK)) : idlePad;
+        fsel0Word = on ? fselOn : fselIdle;
+        if (rfDac)
+            fsel2Word = on ? fsel2On : fsel2Idle;
+        if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm) {
+            uint32_t v = (uint32_t) std::lround(code * 32767.0);
+            envWord = (v << 16) | v;
+        } else {
+            envWord = (uint32_t) std::lround(code * (double) pwmRange);
+        }
+    } else {
+        size_t q;
+        if (constant) {
+            q = raw >= mydsp.magnitude_gate ? m.top() : 0;
+        } else {
+            if (a > 1.0)
+                envelopeClips.fetch_add(1, std::memory_order_relaxed);
+            if (floored) {
+                quantizer.reset();
+                q = 0;
+            } else {
+                q = quantizer.quantize(m, a, c.quantizer == SoapyRPITX_Quantizer::SigmaDelta, c.sigmaDeltaOrder);
+            }
+        }
+        const SoapyRPITX_AmpState &st = m.state(q);
+        padWord = st.pins != 0 ? ((0x5Au << 24) | hyst | ((uint32_t) st.level & PADS_DRIVE_MASK)) : idlePad;
+        fsel0Word = (st.pins & 1u) ? fselOn : fselIdle;
+        if (rfDac)
+            fsel2Word = (st.pins & 2u) ? fsel2On : fsel2Idle;
+        if (st.pins != 0)
+            phase = st.phase;
+    }
+
+    // AM/PM: the phase change of the output stage is compensated on the carrier (the PLL runs at 1/harmonic).
+    phaseCarry += (phase - appliedPhase) / tuneCfg.harmonic;
+    appliedPhase = phase;
+
+    // The PLL realises a quantised frequency: the resulting phase error is corrected on the next slots.
     const double target = mydsp.frequency / tuneCfg.harmonic;
-    const uint32_t frac = GetMasterFrac(target + phaseCarry * carryToHz);
+    const double correction = std::min(std::max(phaseCarry, -kMaxPhaseStep), kMaxPhaseStep);
+    const uint32_t frac = GetMasterFrac(target + correction * carryToHz);
     const double realised = GetMasterFracFrequency(frac);
     phaseCarry += (target - realised) / carryToHz;
     phaseCarry = std::min(std::max(phaseCarry, -kMaxPhaseCarry), kMaxPhaseCarry);
 
     volatile uint32_t *tab = sampletab + (size_t) slot * registerbysample;
-    tab[0] = (0x5Au << 24) | frac;
-    tab[1] = (0x5Au << 24) | (originalPads & PADS_HYST) | PADS_SLEW | ((uint32_t) (on ? level : 0) & PADS_DRIVE_MASK);
-    tab[2] = on ? fselOn : fselIdle;
+    tab[kWordFrac] = (0x5Au << 24) | frac;
+
+    const bool eer = wordEnv >= 0;
+    if (eer) {
+        tab[kWordPad] = padWord;
+        tab[kWordFsel0] = fsel0Word;
+        if (wordFsel2 >= 0)
+            tab[wordFsel2] = fsel2Word;
+    }
+
+    volatile uint32_t *amp = tab;
+    if (envAdvance > 0) {
+        // This slot's amplitude words belong to a later sample: until it arrives they hold "off".
+        if (eer) {
+            tab[wordEnv] = idleEnv;
+        } else {
+            tab[kWordPad] = idlePad;
+            tab[kWordFsel0] = fselIdle;
+            if (wordFsel2 >= 0)
+                tab[wordFsel2] = fsel2Idle;
+        }
+        if (pos < (uint64_t) envAdvance || pos - (uint64_t) envAdvance < behindLimit) {
+            envelopeLate.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        amp = sampletab + (size_t) tracker.slotOf(pos - (uint64_t) envAdvance) * registerbysample;
+    }
+    if (eer) {
+        amp[wordEnv] = envWord;
+    } else {
+        amp[kWordPad] = padWord;
+        amp[kWordFsel0] = fsel0Word;
+        if (wordFsel2 >= 0)
+            amp[wordFsel2] = fsel2Word;
+    }
 }
 
 void SoapyRPITX_IQ_dmaSync::ResetRing() {
@@ -380,10 +683,16 @@ void SoapyRPITX_IQ_dmaSync::ResetRing() {
     playedPos.store(0);
     lastDataPos.store(0);
     phaseCarry = 0;
+    idlePrefix = 0;
 }
 
 void SoapyRPITX_IQ_dmaSync::StartDma() {
-    // The engine restarts at slot 0, where ResetRing() put the read position and the pre-roll begins.
+    // The engine restarts at slot 0, where ResetRing() put the read position. The idle prefix written there
+    // fills the pacing FIFO before the first data slot.
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
+        pwm.StartTx();
+    else
+        pcmgpio::StartTx();
     bufferdma::start();
     lastPoll = clock::now();
     badPolls = 0;
@@ -392,18 +701,35 @@ void SoapyRPITX_IQ_dmaSync::StartDma() {
 
 void SoapyRPITX_IQ_dmaSync::StopDma() {
     bufferdma::stop();
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
+        pwm.StopTx();
+    else
+        pcmgpio::StopTx();
     dmaRunning.store(false);
 }
 
 void SoapyRPITX_IQ_dmaSync::CarrierOff() {
     clkgpio::gengpio.setmode(RPITX_TX_GPIO, fsel_input);
+    if (rfDac)
+        clkgpio::gengpio.setmode(RPITX_TX2_GPIO, fsel_input);
     pads.gpioreg[PADS_GPIO_0] = (0x5Au << 24) | originalPads;
 }
 
 void SoapyRPITX_IQ_dmaSync::RestoreGpio() {
-    uint32_t function = originalGpioFunction == fsel_alt0 ? (uint32_t) fsel_input : originalGpioFunction;
-    clkgpio::gengpio.setmode(RPITX_TX_GPIO, function);
+    clkgpio::gengpio.setmode(RPITX_TX_GPIO, SoapyRPITX_RestoredFunction(RPITX_TX_GPIO, originalGpioFunction));
+    for (const auto &pf : originalPins) {
+        if (pf.first == RPITX_TX2_GPIO && rfDac)
+            clkgpio::gengpio.setmode(RPITX_TX2_GPIO, SoapyRPITX_RestoredFunction(RPITX_TX2_GPIO, pf.second));
+    }
     pads.gpioreg[PADS_GPIO_0] = (0x5Au << 24) | originalPads;
+}
+
+void SoapyRPITX_IQ_dmaSync::RestoreEnvelopePins() {
+    for (const auto &pf : originalPins) {
+        if (pf.first == RPITX_TX2_GPIO && rfDac)
+            continue;
+        clkgpio::gengpio.setmode(pf.first, pf.second);
+    }
 }
 
 void SoapyRPITX_IQ_dmaSync::Start() {
@@ -412,10 +738,14 @@ void SoapyRPITX_IQ_dmaSync::Start() {
     if (feeder.joinable())
         feeder.join();
 
-    // Sample the other GPIO 0-9 functions now: the DMA rewrites the whole GPFSEL0 register.
-    uint32_t base = clkgpio::gengpio.gpioreg[GPFSEL0] & ~(7u << (3 * RPITX_TX_GPIO));
+    // Sample the other GPIO 0-9 (and 20-29) functions now: the DMA rewrites the whole GPFSEL0 (and GPFSEL2).
+    volatile uint32_t *gp = clkgpio::gengpio.gpioreg;
+    uint32_t base = gp[GPFSEL0] & ~(7u << (3 * RPITX_TX_GPIO));
     fselIdle = base | ((uint32_t) fsel_input << (3 * RPITX_TX_GPIO));
     fselOn = base | ((uint32_t) fsel_alt0 << (3 * RPITX_TX_GPIO));
+    uint32_t base2 = gp[GPFSEL2] & ~(7u << (3 * (RPITX_TX2_GPIO % 10)));
+    fsel2Idle = base2 | ((uint32_t) fsel_input << (3 * (RPITX_TX2_GPIO % 10)));
+    fsel2On = base2 | ((uint32_t) fsel_alt5 << (3 * (RPITX_TX2_GPIO % 10)));
 
     fifo.clear();
     consumedTotal.store(fifo.pushedTotal());
@@ -427,10 +757,15 @@ void SoapyRPITX_IQ_dmaSync::Start() {
     late.store(0);
     dmaErrors.store(0);
     samplesSent.store(0);
+    envelopeClips.store(0);
+    envelopeLate.store(0);
     inBurst = false;
     firstQueuedValid = false;
     badPolls = 0;
     mydsp.reset();
+    appliedPhase = 0;
+    RefreshModel();
+    ResetAmplitudeState();
     ResetRing();
 
     running.store(true);
@@ -475,15 +810,14 @@ size_t SoapyRPITX_IQ_dmaSync::Write(const std::complex<float> *samples, size_t n
     if (!active.load() || n == 0)
         return 0;
 
+    // A new burst starts: the previous burst end no longer applies to the samples queued from now on.
+    endBurst.store(false);
+
     const auto deadline = clock::now() + std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
     size_t done = 0;
 
     while (done < n) {
-        size_t m = fifo.push(samples + done, n - done);
-        if (m > 0) {
-            done += m;
-            endBurst.store(false);
-        }
+        done += fifo.push(samples + done, n - done);
         if (done == n || timeoutUs <= 0 || !active.load())
             break;
 
@@ -550,6 +884,7 @@ bool SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
 
 void SoapyRPITX_IQ_dmaSync::SetDriveLevel(int level) {
     driveLevel.store(std::min(std::max(level, 0), 7));
+    PublishModel();
 }
 
 void SoapyRPITX_IQ_dmaSync::SetIqScale(float scale) {
@@ -558,6 +893,17 @@ void SoapyRPITX_IQ_dmaSync::SetIqScale(float scale) {
 
 void SoapyRPITX_IQ_dmaSync::SetConstantEnvelope(bool constant) {
     constantEnvelope.store(constant);
+}
+
+bool SoapyRPITX_IQ_dmaSync::SetAmplitudeConfig(const SoapyRPITX_AmplitudeConfig &amplitude) {
+    if (!SoapyRPITX_CheckAmplitudeConfig(amplitude).empty() || !advanceFits(amplitude, slotsPerSample, envelopeOutput, tracker.size()))
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(modelMutex);
+        ampCfg = amplitude;
+    }
+    PublishModel();
+    return true;
 }
 
 SoapyRPITX_TuneConfig SoapyRPITX_IQ_dmaSync::GetTune() const {
@@ -571,6 +917,8 @@ SoapyRPITX_TxStats SoapyRPITX_IQ_dmaSync::GetStats() {
     stats.late = late.load();
     stats.dmaErrors = dmaErrors.load();
     stats.samplesSent = samplesSent.load();
+    stats.envelopeClips = envelopeClips.load();
+    stats.envelopeLate = envelopeLate.load();
     stats.fifoLevel = fifo.size();
     stats.fifoCapacity = fifo.capacity();
     stats.dmaRunning = dmaRunning.load() && bufferdma::isrunning();
@@ -585,8 +933,13 @@ uint32_t SoapyRPITX_IQ_dmaSync::RingSize() const {
     return tracker.size();
 }
 
+uint32_t SoapyRPITX_IQ_dmaSync::SlotsPerSample() const {
+    return slotsPerSample;
+}
+
 double SoapyRPITX_IQ_dmaSync::GetActualSampleRate() const {
-    return pcmgpio::GetFrameRate();
+    double frames = envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm ? pwm.GetFrameRate() : pcmgpio::GetFrameRate();
+    return frames / slotsPerSample;
 }
 
 bool SoapyRPITX_IQ_dmaSync::IsPllLocked() {
@@ -597,8 +950,14 @@ void SoapyRPITX_IQ_dmaSync::SignalSafeStop() {
     dma_reg.gpioreg[DMA_CS + channel * DMA_CHANNEL_WORDS] = BCM2708_DMA_RESET;
     volatile uint32_t *fsel = clkgpio::gengpio.gpioreg;
     fsel[GPFSEL0] = (fsel[GPFSEL0] & ~(7u << (3 * RPITX_TX_GPIO))) | ((uint32_t) fsel_input << (3 * RPITX_TX_GPIO));
+    if (rfDac)
+        fsel[GPFSEL2] = (fsel[GPFSEL2] & ~(7u << (3 * (RPITX_TX2_GPIO % 10)))) | ((uint32_t) fsel_input << (3 * (RPITX_TX2_GPIO % 10)));
     pads.gpioreg[PADS_GPIO_0] = (0x5Au << 24) | originalPads;
     clkgpio::gpioreg[GPCLK_CNTL] = CM_PASSWD | ((uint32_t) clkgpio::Mash << CM_MASH_SHIFT) | (uint32_t) clkgpio::pllnumber;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm)
+        pcmgpio::gpioreg[PCM_CS_A] = pcmgpio::gpioreg[PCM_CS_A] & ~(PCM_CS_TXON | PCM_CS_DMAEN);
+    else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
+        pwm.gpioreg[PWM_CTL] = 0;
 }
 
 void SoapyRPITX_IQ_dmaSync::EmergencyStop() {
@@ -632,61 +991,77 @@ void SoapyRPITX_IQ_dmaSync::SetupFeederThread() {
 
 uint32_t SoapyRPITX_IQ_dmaSync::PumpData(uint32_t target) {
     uint32_t total = 0;
-    bool fromFifo = false;
+    uint64_t fromFifo = 0;
+    const uint32_t k = slotsPerSample;
 
     for (;;) {
         uint32_t w = tracker.writable(target);
         if (w == 0)
             break;
-
-        const size_t want = std::min<size_t>(w, chunk.size());
-        size_t m = 0;
-        const bool replaying = replayPos < replay.size();
-        if (replaying) {
-            m = std::min(want, replay.size() - replayPos);
-            std::copy(replay.begin() + (std::ptrdiff_t) replayPos, replay.begin() + (std::ptrdiff_t)(replayPos + m), chunk.begin());
-            replayPos += m;
-        } else {
-            m = fifo.pop(chunk.data(), want);
-            fromFifo = fromFifo || m > 0;
-        }
-        if (m == 0)
-            break;
+        UpdateBehindLimit();
 
         uint64_t pos = tracker.writePos();
-        for (size_t i = 0; i < m; i++)
-            WriteDataSlot(tracker.slotOf(pos + i), chunk[i]);
-        tracker.advanceWrite((uint32_t) m);
-        total += (uint32_t) m;
+        if (replayPos < replay.size()) {
+            // Replayed samples are slot samples: one per slot.
+            const size_t m = std::min<size_t>(std::min<size_t>(w, chunk.size()), replay.size() - replayPos);
+            for (size_t i = 0; i < m; i++)
+                WriteDataSlot(pos + i, replay[replayPos + i]);
+            replayPos += m;
+            tracker.advanceWrite((uint32_t) m);
+            total += (uint32_t) m;
 
-        // Publish the new end of data before the samples stop being counted as queued, so that WaitDrained()
-        // never sees them in neither place.
-        lastDataPos.store(tracker.writePos());
-        if (replaying) {
+            // Publish the new end of data before the samples stop being counted as queued, so that
+            // WaitDrained() never sees them in neither place.
+            lastDataPos.store(tracker.writePos());
             if (replayPos == replay.size()) {
                 replay.clear();
                 replayPos = 0;
             }
             replayLeft.store(replay.size() - replayPos);
-        } else {
-            consumedTotal.fetch_add(m);
+            continue;
         }
+
+        const size_t want = std::min<size_t>(w / k, chunk.size());
+        if (want == 0)
+            break;
+        const size_t m = fifo.pop(chunk.data(), want);
+        if (m == 0)
+            break;
+
+        for (size_t i = 0; i < m; i++) {
+            const std::complex<float> x = chunk[i];
+            if (k == 1) {
+                WriteDataSlot(pos++, x);
+            } else {
+                // Linear interpolation from the previous sample: the last slot of the group is the sample itself.
+                for (uint32_t j = 1; j <= k; j++)
+                    WriteDataSlot(pos++, j == k ? x : prevIq + (x - prevIq) * ((float) j / (float) k));
+            }
+            prevIq = x;
+        }
+        tracker.advanceWrite((uint32_t) (m * k));
+        total += (uint32_t) (m * k);
+        fromFifo += m;
+
+        lastDataPos.store(tracker.writePos());
+        consumedTotal.fetch_add(m);
     }
 
-    if (total > 0) {
-        samplesSent.fetch_add(total);
-        if (fromFifo && waitingProducers.load() > 0)
+    if (fromFifo > 0) {
+        samplesSent.fetch_add(fromFifo);
+        if (waitingProducers.load() > 0)
             spaceCv.notify_all();
     }
     return total;
 }
 
-void SoapyRPITX_IQ_dmaSync::PadIdle(uint32_t target) {
+uint32_t SoapyRPITX_IQ_dmaSync::PadIdle(uint32_t target) {
     uint32_t w = tracker.writable(target);
     uint64_t pos = tracker.writePos();
     for (uint32_t i = 0; i < w; i++)
         WriteIdleSlot(tracker.slotOf(pos + i));
     tracker.advanceWrite(w);
+    return w;
 }
 
 void SoapyRPITX_IQ_dmaSync::ScrubCompleted() {
@@ -705,7 +1080,7 @@ bool SoapyRPITX_IQ_dmaSync::FeederRetune(const SoapyRPITX_TuneConfig &request) {
         int slot = GetCurrentSample();
         if (slot >= 0) {
             auto now = clock::now();
-            tracker.update((uint32_t) slot, std::chrono::duration<double>(now - lastPoll).count() * tuneCfg.sampleRate);
+            tracker.update((uint32_t) slot, std::chrono::duration<double>(now - lastPoll).count() * slotRate);
             lastPoll = now;
         }
     }
@@ -747,6 +1122,8 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
     auto next = clock::now();
 
     while (running.load()) {
+        RefreshModel();
+
         // Retune request from the control thread.
         SoapyRPITX_TuneConfig request;
         uint64_t seq = 0;
@@ -772,15 +1149,24 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
 
         const auto now = clock::now();
         const uint32_t n = tracker.size();
-        const uint32_t rate = tuneCfg.sampleRate;
+        const uint32_t rate = slotRate;
+        const uint32_t k = slotsPerSample;
+        const uint32_t guard = guardSlots(n, rate);
         const uint32_t target = n * 3 / 4;
-        const uint32_t low = std::min<uint32_t>(target, std::max<uint32_t>(n / 8, rate / 200));
-        const uint32_t guard = std::min<uint32_t>(n / 4, std::max<uint32_t>(32, rate / 500));
+        // Idle padding keeps enough slots ahead of the engine for the envelope words written ahead.
+        const uint32_t low = std::min<uint32_t>(target, std::max<uint32_t>(std::max<uint32_t>(n / 8, rate / 200), (uint32_t) envAdvance + guard + 16));
 
         if (!dmaRunning.load()) {
+            // Idle slots at the start of the ring fill the pacing FIFO when the engine starts (plus one slot that
+            // lasts until the first frame boundary) and leave room for the envelope words of the first samples.
+            if (tracker.writePos() == 0 && idlePrefix == 0) {
+                idlePrefix = pacingLevel + 1 + (uint32_t) envAdvance;
+                PadIdle(idlePrefix);
+            }
             PumpData(target);
 
-            size_t queued = fifo.size() + replayLeft.load() + (size_t) std::max<int64_t>(tracker.fill(), 0);
+            const int64_t ringData = std::max<int64_t>(tracker.fill() - (int64_t) idlePrefix, 0);
+            const uint64_t queued = (uint64_t) fifo.size() * k + replayLeft.load() + (uint64_t) ringData;
             if (queued > 0 && !firstQueuedValid) {
                 firstQueuedTime = now;
                 firstQueuedValid = true;
@@ -827,7 +1213,8 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
                             underflows.fetch_add(1);
                         inBurst = false;
                     }
-                    PadIdle(low);
+                    if (PadIdle(low) > 0)
+                        ResetAmplitudeState();
                 }
             }
         }

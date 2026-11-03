@@ -54,6 +54,11 @@ unsigned bcm_host_get_sdram_address(void) {
     return address;
 }
 
+// A DMA controller node is named "dma@<addr>" or "dma-controller@<addr>" depending on the kernel version.
+static bool is_dma_controller_node(const char *name) {
+    return strncmp(name, "dma@", 4) == 0 || strncmp(name, "dma-controller@", 15) == 0;
+}
+
 uint32_t bcm_host_get_kernel_dma_mask(bool *known) {
     *known = false;
     uint32_t mask = 0;
@@ -64,15 +69,20 @@ uint32_t bcm_host_get_kernel_dma_mask(bool *known) {
         return 0;
 
     while (struct dirent *e = readdir(dir)) {
-        if (strncmp(e->d_name, "dma@", 4) != 0)
+        if (!is_dma_controller_node(e->d_name))
             continue;
-        std::string prop = soc + "/" + e->d_name + "/brcm,dma-channel-mask";
+        std::string node = soc + "/" + e->d_name;
         unsigned value = 0;
-        if (get_dt_cell(prop.c_str(), 0, &value)) {
+        // The property is "dma-channel-mask" on current device trees and "brcm,dma-channel-mask" on older ones.
+        if (get_dt_cell((node + "/dma-channel-mask").c_str(), 0, &value) || get_dt_cell((node + "/brcm,dma-channel-mask").c_str(), 0, &value)) {
             mask |= value;
             *known = true;
         }
     }
     closedir(dir);
     return mask;
+}
+
+int bcm_host_get_max_legacy_dma_channel(void) {
+    return bcm_host_get_peripheral_address() == 0xFE000000 ? 10 : 14;
 }

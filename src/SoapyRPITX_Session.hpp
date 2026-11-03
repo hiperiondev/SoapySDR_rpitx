@@ -28,17 +28,21 @@
 #include <stdint.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "gpio.hpp"
 
 /**
  * @brief Directory of the lock file.
  *
- * A tmpfs directory, so that a record never survives a reboot (VideoCore handles do not either). Can be
- * overridden at build time (the host-side tests use their build directory).
+ * A private directory on tmpfs, so that a record never survives a reboot (VideoCore handles do not either).
+ * It is created with mode 0700 and must be owned by the effective user and not accessible to anybody else;
+ * otherwise the session refuses to start. Can be overridden at build time (the host-side tests use their build
+ * directory).
  */
 #ifndef RPITX_LOCK_DIR
-#define RPITX_LOCK_DIR "/run/lock"
+#define RPITX_LOCK_DIR "/run/soapy_rpitx"
 #endif
 
 /** @brief Name of the lock file inside @ref RPITX_LOCK_DIR. */
@@ -52,16 +56,48 @@
  * VideoCore memory.
  */
 struct SoapyRPITX_SessionRecord {
-    long pid = 0;              ///< Process that owned the transmitter.
-    int dmaChannel = -1;       ///< DMA channel in use (-1 when none was allocated).
-    unsigned memHandle = 0;    ///< VideoCore memory handle (0 when none was allocated).
-    uint32_t pads = 0x1B;      ///< PADS_GPIO_0 value (drive, hysteresis, slew) to restore.
-    uint32_t gpioFunction = 0; ///< Function-select code to restore on the RF output GPIO.
-    bool pcmValid = false;     ///< @ref pcmCtl and @ref pcmDiv hold the original PCM clock.
-    uint32_t pcmCtl = 0;       ///< Original PCMCLK_CNTL (without password).
-    uint32_t pcmDiv = 0;       ///< Original PCMCLK_DIV (without password).
-    ClockTreeState clockTree;  ///< Clock tree before librpitx modified it.
+    long pid = 0;                                            ///< Process that owned the transmitter.
+    int dmaChannel = -1;                                     ///< DMA channel in use (-1 when none was allocated).
+    unsigned memHandle = 0;                                  ///< VideoCore memory handle (0 when none was allocated).
+    uint32_t pads = 0x1B;                                    ///< PADS_GPIO_0 value (drive, hysteresis, slew) to restore.
+    uint32_t gpioFunction = 0;                               ///< Function-select code to restore on the RF output GPIO.
+    bool pcmValid = false;                                   ///< The PCM block was used; @ref pcmCtl and @ref pcmDiv hold its original clock.
+    uint32_t pcmCtl = 0;                                     ///< Original PCMCLK_CNTL (without password).
+    uint32_t pcmDiv = 0;                                     ///< Original PCMCLK_DIV (without password).
+    ClockTreeState clockTree;                                ///< Clock tree before librpitx modified it.
+    std::vector<std::pair<unsigned, uint32_t>> pinFunctions; ///< Other GPIOs used by the transmitter and their original function.
+    bool pwmValid = false;                                   ///< The PWM fields hold the original PWM state.
+    uint32_t pwmClkCtl = 0;                                  ///< Original PWMCLK_CNTL (without password).
+    uint32_t pwmClkDiv = 0;                                  ///< Original PWMCLK_DIV (without password).
+    uint32_t pwmCtl = 0;                                     ///< Original PWM_CTL.
+    uint32_t pwmRng = 0;                                     ///< Original PWM_RNG1.
+    uint32_t pwmDmac = 0;                                    ///< Original PWM_DMAC.
 };
+
+/**
+ * @brief Returns the function to restore on a GPIO used by the transmitter.
+ *
+ * A clock output left on the RF pins (GPIO4 ALT0, GPIO20 ALT5) is replaced by input, so that a recorded
+ * state taken while a carrier was on does not switch the carrier back on.
+ *
+ * @param pin      GPIO number.
+ * @param function Recorded function-select code.
+ * @return Function-select code to restore.
+ */
+uint32_t SoapyRPITX_RestoredFunction(unsigned pin, uint32_t function);
+
+/**
+ * @brief Checks that a record only describes hardware a transmitter may have owned.
+ *
+ * The DMA channel must be a legacy channel of the SoC not reserved for the kernel, the GPIOs must be in
+ * 0-27, the pad value must only hold drive, hysteresis and slew, and the saved clock generators must use a
+ * valid source.
+ *
+ * @param r   Record.
+ * @param why Receives the reason when the record is refused.
+ * @return True when the record can be applied by SoapyRPITX_RecoverHardware().
+ */
+bool SoapyRPITX_RecordPlausible(const SoapyRPITX_SessionRecord &r, std::string &why);
 
 /**
  * @brief Formats a record as the text stored in the lock file.
@@ -81,9 +117,11 @@ bool SoapyRPITX_ParseRecord(const std::string &text, SoapyRPITX_SessionRecord &r
 /**
  * @brief Returns the hardware described by a record to its idle state.
  *
- * Resets the DMA channel, switches the RF output GPIO to its recorded function (input when it was the clock
- * output), restores the pads, stops GPCLK0, disables the PCM block and restores its clock, restores the
- * clock tree and releases the VideoCore memory. Every step is attempted even when an earlier one fails.
+ * Resets the DMA channel, switches the RF output GPIO and the other recorded GPIOs to their recorded function
+ * (input instead of a clock output, see SoapyRPITX_RestoredFunction()), restores the pads, stops GPCLK0,
+ * disables the PCM block and restores its clock (when it was used), stops the PWM block and restores it (when it
+ * was used), restores the clock tree
+ * and releases the VideoCore memory. Every step is attempted even when an earlier one fails.
  *
  * @param r   Record left by the terminated process.
  * @param gpioLine RF output GPIO.
@@ -109,19 +147,30 @@ bool SoapyRPITX_GpioLineClaimed(unsigned line, std::string &consumer);
 bool SoapyRPITX_I2sEnabled();
 
 /**
+ * @brief Tells whether the device tree enables a user of the PWM block (PWM driver or analogue audio).
+ * @return True when the pwm node or the audio node has status "okay".
+ */
+bool SoapyRPITX_PwmEnabled();
+
+/**
  * @brief Exclusive, system-wide claim of the transmitter hardware.
  *
  * Holds an flock() on @ref RPITX_LOCK_DIR/@ref RPITX_LOCK_FILE_NAME for its lifetime. The lock is released
  * by the kernel when the process dies, so finding a non-empty lock file after acquiring the lock means that
  * the previous owner terminated without cleaning up: its record is then recovered with
- * SoapyRPITX_RecoverHardware().
+ * SoapyRPITX_RecoverHardware(), or discarded when SoapyRPITX_RecordPlausible() refuses it.
+ *
+ * The lock directory must be a directory owned by the effective user with no access for group and others,
+ * and the lock file a regular file owned by the effective user with a single link; symbolic links are not
+ * followed. The lock is shared with child processes created by fork() without exec().
  */
 class SoapyRPITX_Session {
 public:
     /**
      * @brief Acquires the lock and recovers a stale record.
      * @param gpioLine RF output GPIO (used by the recovery).
-     * @throws std::runtime_error when the lock file cannot be opened or another running process holds it.
+     * @throws std::runtime_error when the lock directory or file is not private to the effective user, the
+     *         lock file cannot be opened, or another running process holds it.
      */
     explicit SoapyRPITX_Session(unsigned gpioLine);
 
@@ -138,8 +187,15 @@ public:
     bool Recovered() const;
 
     /**
+     * @brief Tells whether a stale record was found and discarded as implausible.
+     * @return True when a record was refused by SoapyRPITX_RecordPlausible().
+     */
+    bool Discarded() const;
+
+    /**
      * @brief Returns the description of the recovery.
-     * @return Text built by SoapyRPITX_RecoverHardware() (empty without recovery).
+     * @return Text built by SoapyRPITX_RecoverHardware(), or the reason a record was discarded (empty
+     *         otherwise).
      */
     const std::string &RecoveryReport() const;
 
@@ -161,5 +217,6 @@ public:
 private:
     int fd = -1;            ///< Lock file descriptor.
     bool recovered = false; ///< A stale record was recovered.
+    bool discarded = false; ///< A stale record was discarded.
     std::string report;     ///< Recovery description.
 };
