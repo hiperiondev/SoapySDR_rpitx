@@ -353,6 +353,22 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     return setArgs;
 }
 
+struct SoapyRPITX::PendingSettings {
+    SoapyRPITX_TuneConfig tune;
+    SoapyRPITX_AmplitudeConfig amp;
+    bool constantEnvelope = false;
+    float iqScale = 1.0f;
+    int debugLevel = 0;
+    int driveLevel = 7;
+    bool tuneTouched = false;
+    bool harmonicTouched = false;
+    bool ampTouched = false;
+    bool modeTouched = false;
+    bool scaleTouched = false;
+    bool debugTouched = false;
+    bool gainTouched = false;
+};
+
 void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *explicitArgs) {
     if (path.empty()) {
         std::lock_guard<std::mutex> lock(device_mutex);
@@ -384,83 +400,90 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
             SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown stream argument '%s' ignored", path.c_str(), kv.first.c_str());
     }
 
-    for (const auto &kv : p.settings) {
-        if (!isSettingKey(kv.first)) {
-            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown setting '%s' ignored", path.c_str(), kv.first.c_str());
-            continue;
+    std::lock_guard<std::mutex> lock(device_mutex);
+
+    // Phase 1: parse and validate everything into a copy of the state; neither the hardware nor the device is touched.
+    PendingSettings pending;
+    pending.tune = tune;
+    pending.amp = ampCfg;
+    pending.constantEnvelope = constantEnvelope;
+    pending.iqScale = iqScale;
+    pending.debugLevel = debugLevel;
+    pending.driveLevel = driveLevel;
+
+    try {
+        for (const auto &kv : p.settings) {
+            if (!isSettingKey(kv.first)) {
+                SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown setting '%s' ignored", path.c_str(), kv.first.c_str());
+                continue;
+            }
+            if (explicitArgs && explicitArgs->count(kv.first))
+                continue;
+            ParseSetting(kv.first, kv.second, pending);
         }
-        if (explicitArgs && explicitArgs->count(kv.first))
-            continue;
-        try {
-            writeSetting(kv.first, kv.second);
-        } catch (const std::runtime_error &e) {
-            throw context(e);
+        if (p.hasGain) {
+            double g = parseDouble("gain", p.gain);
+            if (!(g >= 0 && g <= 7))
+                throw std::runtime_error("rpitx: gain out of range [0, 7]");
+            pending.driveLevel = (int) std::lround(g);
+            pending.gainTouched = true;
         }
-    }
-    if (p.hasGain) {
-        double g;
-        try {
-            g = parseDouble("gain", p.gain);
-        } catch (const std::runtime_error &e) {
-            throw context(e);
-        }
-        if (!(g >= 0 && g <= 7))
-            throw std::runtime_error("rpitx: profile '" + path + "': gain out of range [0, 7]");
-        setGain(SOAPY_SDR_TX, 0, g);
+        ValidateSettings(pending);
+
+        // Dry run of the stream arguments with the parsers of setupStream().
+        SoapyRPITX_TxConfig cfg;
+        cfg.tune = pending.tune;
+        std::string envOut;
+        ParseStreamArgs(stream, cfg, envOut);
+
+        // Phase 2: apply once.
+        ApplySettings(pending);
+    } catch (const std::runtime_error &e) {
+        throw context(e);
     }
 
-    std::lock_guard<std::mutex> lock(device_mutex);
     profilePath = path;
     profileStream = stream;
     SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: profile '%s' loaded (%zu settings, %zu stream arguments%s)", path.c_str(), p.settings.size(), stream.size(),
                   p.hasGain ? ", gain" : "");
 }
 
-void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) {
-    if (key == "profile") {
-        LoadProfile(value, nullptr);
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(device_mutex);
-
+void SoapyRPITX::ParseSetting(const std::string &key, const std::string &value, PendingSettings &pending) const {
     if (key == "ppm") {
-        SetPpmLocked(parseDouble(key, value));
+        double ppm = parseDouble(key, value);
+        if (!(ppm >= -200 && ppm <= 200))
+            throw std::runtime_error("rpitx: ppm out of range [-200, 200]");
+        pending.tune.ppm = ppm;
+        pending.tuneTouched = true;
     } else if (key == "ppm_ntp") {
-        SoapyRPITX_TuneConfig t = tune;
-        t.ppmFromNtp = parseBool(key, value);
-        ApplyTune(t);
+        pending.tune.ppmFromNtp = parseBool(key, value);
+        pending.tuneTouched = true;
     } else if (key == "harmonic") {
         long h = parseInt(key, value);
         if (h < 1 || h > 15)
             throw std::runtime_error("rpitx: harmonic out of range [1, 15]");
-        SoapySDR::Range r = PllRange();
-        if (tune.frequency < r.minimum() * (double) h || tune.frequency > r.maximum() * (double) h)
-            throw std::runtime_error("rpitx: the current frequency cannot be reached with harmonic " + value);
-        SoapyRPITX_TuneConfig t = tune;
-        t.harmonic = (int) h;
-        ApplyTune(t);
+        pending.tune.harmonic = (int) h;
+        pending.tuneTouched = true;
+        pending.harmonicTouched = true;
     } else if (key == "amplitude_mode") {
         if (value != "envelope" && value != "constant")
             throw std::runtime_error("rpitx: amplitude_mode must be 'envelope' or 'constant'");
-        constantEnvelope = (value == "constant");
-        if (tx_stream)
-            tx_stream->transmitter().SetConstantEnvelope(constantEnvelope);
+        pending.constantEnvelope = (value == "constant");
+        pending.modeTouched = true;
     } else if (key == "iq_scale") {
         double s = parseDouble(key, value);
         if (s < 0 || s > 100)
             throw std::runtime_error("rpitx: iq_scale out of range [0, 100]");
-        iqScale = (float) s;
-        if (tx_stream)
-            tx_stream->transmitter().SetIqScale(iqScale);
+        pending.iqScale = (float) s;
+        pending.scaleTouched = true;
     } else if (key == "debug_level") {
         long d = parseInt(key, value);
         if (d < 0 || d > 2)
             throw std::runtime_error("rpitx: debug_level out of range [0, 2]");
-        debugLevel = (int) d;
-        dbg_setlevel(debugLevel);
+        pending.debugLevel = (int) d;
+        pending.debugTouched = true;
     } else {
-        SoapyRPITX_AmplitudeConfig a = ampCfg;
+        SoapyRPITX_AmplitudeConfig &a = pending.amp;
         if (key == "amplitude_lut") {
             a.amplitudeLut = parseList(key, value, 1.0);
         } else if (key == "ampm_lut") {
@@ -501,8 +524,86 @@ void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) 
         } else {
             throw std::runtime_error("rpitx: unknown setting '" + key + "'");
         }
-        ApplyAmplitude(a);
+        pending.ampTouched = true;
     }
+}
+
+void SoapyRPITX::ValidateSettings(const PendingSettings &pending) const {
+    if (pending.harmonicTouched) {
+        SoapySDR::Range r = PllRange();
+        const double h = (double) pending.tune.harmonic;
+        if (pending.tune.frequency < r.minimum() * h || pending.tune.frequency > r.maximum() * h)
+            throw std::runtime_error("rpitx: the current frequency cannot be reached with harmonic " + std::to_string(pending.tune.harmonic));
+    }
+    if (pending.ampTouched) {
+        std::string why = SoapyRPITX_CheckAmplitudeConfig(pending.amp);
+        if (!why.empty())
+            throw std::runtime_error("rpitx: " + why);
+        if (tx_stream && !tx_stream->transmitter().AmplitudeConfigFits(pending.amp))
+            throw std::runtime_error("rpitx: envelope_delay needs more look-ahead than the DMA ring of the open stream allows");
+    }
+}
+
+void SoapyRPITX::ApplySettings(const PendingSettings &pending) {
+    // The two steps that can be refused by the stream come first, the retune before the amplitude update.
+    const SoapyRPITX_TuneConfig previousTune = tune;
+    if (pending.tuneTouched)
+        ApplyTune(pending.tune);
+    if (pending.ampTouched) {
+        try {
+            ApplyAmplitude(pending.amp);
+        } catch (...) {
+            if (pending.tuneTouched) {
+                try {
+                    ApplyTune(previousTune);
+                } catch (const std::exception &e) {
+                    SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: could not restore the previous tuning: %s", e.what());
+                }
+            }
+            throw;
+        }
+    }
+
+    // Nothing below can fail.
+    if (pending.modeTouched) {
+        constantEnvelope = pending.constantEnvelope;
+        if (tx_stream)
+            tx_stream->transmitter().SetConstantEnvelope(constantEnvelope);
+    }
+    if (pending.scaleTouched) {
+        iqScale = pending.iqScale;
+        if (tx_stream)
+            tx_stream->transmitter().SetIqScale(iqScale);
+    }
+    if (pending.debugTouched) {
+        debugLevel = pending.debugLevel;
+        dbg_setlevel(debugLevel);
+    }
+    if (pending.gainTouched) {
+        driveLevel = pending.driveLevel;
+        if (tx_stream)
+            tx_stream->transmitter().SetDriveLevel(driveLevel);
+    }
+}
+
+void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) {
+    if (key == "profile") {
+        LoadProfile(value, nullptr);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(device_mutex);
+
+    PendingSettings pending;
+    pending.tune = tune;
+    pending.amp = ampCfg;
+    pending.constantEnvelope = constantEnvelope;
+    pending.iqScale = iqScale;
+    pending.debugLevel = debugLevel;
+    pending.driveLevel = driveLevel;
+    ParseSetting(key, value, pending);
+    ValidateSettings(pending);
+    ApplySettings(pending);
 }
 
 void SoapyRPITX::ApplyAmplitude(const SoapyRPITX_AmplitudeConfig &a) {

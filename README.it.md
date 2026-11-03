@@ -434,7 +434,7 @@ gain=7
 
 - Le chiavi delle impostazioni si applicano nell'ordine del file; un'impostazione data anche come argomento del
   dispositivo ha la precedenza sul file. Un valore rifiutato interrompe il caricamento con un errore che nomina il
-  file (le righe precedenti restano applicate).
+  file (il caricamento è tutto o niente: nulla viene modificato e, con uno stream aperto, c'è al massimo un retune).
 - Le righe `stream.<chiave>` diventano i valori predefiniti di `setupStream()`; gli argomenti passati
   dall'applicazione hanno la precedenza.
 - `gain` imposta il guadagno PAD (0–7).

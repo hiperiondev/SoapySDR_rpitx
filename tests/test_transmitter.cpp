@@ -241,6 +241,52 @@ void testRetuneCarrierOffAndReplay() {
     tx.Stop();
 }
 
+void testRefusedRetuneKeepsTransmitting() {
+    SoapyRPITX_IQ_dmaSync tx(baseConfig());
+    MockDmaEngine engine(14, kRate);
+    tx.Start();
+
+    std::vector<std::complex<float>> block(kRate / 2, std::complex<float>(1.0f, 0.0f));
+    CHECK(tx.Write(block.data(), block.size(), 1000000) == block.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(tx.GetStats().dmaRunning);
+
+    // The carrier must stay on the pin and PLLC must not be reprogrammed while refused requests arrive.
+    std::atomic<bool> stop{false};
+    std::atomic<int> disturbed{0};
+    const uint32_t pllc = MockPeek(CLK_BASE, PLLC_CTRL);
+    std::thread monitor([&] {
+        while (!stop.load()) {
+            if (((MockPeek(GENERAL_BASE, GPFSEL0) >> 12) & 7) != fsel_alt0 || MockPeek(CLK_BASE, PLLC_CTRL) != pllc)
+                disturbed++;
+        }
+    });
+    SoapyRPITX_TuneConfig t = tx.GetTune();
+    const double frequency = t.frequency;
+    for (double bad : {5e9, 1e3, -1.0}) {
+        t.frequency = bad;
+        CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
+    }
+    t = tx.GetTune();
+    t.sampleRate = 1; // out of range
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
+    t = tx.GetTune();
+    t.harmonic = 0;
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
+    stop.store(true);
+    monitor.join();
+    CHECK(disturbed.load() == 0);
+    CHECK(tx.GetStats().dmaRunning);
+    CHECK(tx.GetTune().frequency == frequency);
+
+    // A reachable request still works afterwards.
+    t = tx.GetTune();
+    t.frequency = 50.0e6;
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
+    CHECK(tx.GetTune().frequency == 50.0e6);
+    tx.Stop();
+}
+
 void testEmergencyStopThenDestroy() {
     {
         SoapyRPITX_IQ_dmaSync tx(baseConfig());
@@ -1153,6 +1199,7 @@ int main() {
     testStreaming();
     testShortBurstStarts();
     testRetuneCarrierOffAndReplay();
+    testRefusedRetuneKeepsTransmitting();
     testEmergencyStopThenDestroy();
     testConstructorFailureRestores();
     testDmaChannelSelection();

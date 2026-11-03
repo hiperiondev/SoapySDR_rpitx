@@ -461,6 +461,31 @@ void testProfileDevice() {
     CHECK(named);
     writeFile(name, "gain=9\n");
     CHECK(throws([&] { dev.writeSetting("profile", name); }));
+
+    // A refused profile changes nothing: not the settings before the bad line, nor the gain, name or stream defaults.
+    dev.writeSetting("profile", "");
+    writeFile(name, "ppm=-3\ngain=5\n");
+    dev.writeSetting("profile", name);
+    const std::string before = dev.readSetting("ppm");
+    const double gainBefore = dev.getGain(SOAPY_SDR_TX, 0, "PAD");
+    writeFile(name, "ppm=11\nharmonic=3\ngain=1\nstream.fifo_ms=300\niq_scale=500\n");
+    CHECK(throws([&] { dev.writeSetting("profile", name); }));
+    writeFile(name, "ppm=11\nharmonic=3\ngain=1\nstream.fifo_ms=notanumber\n"); // bad stream value: refused at load
+    CHECK(throws([&] { dev.writeSetting("profile", name); }));
+    writeFile(name, "ppm=11\nharmonic=3\ngain=1\nstream.slots_per_sample=9\n");
+    CHECK(throws([&] { dev.writeSetting("profile", name); }));
+    CHECK(dev.readSetting("ppm") == before);
+    CHECK(dev.readSetting("harmonic") == "1");
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0, "PAD") == gainBefore);
+    CHECK(dev.readSetting("profile") == name); // the profile loaded before the failed attempts
+    // The same file without the bad line applies as a whole.
+    writeFile(name, "ppm=11\nharmonic=3\ngain=1\n");
+    dev.writeSetting("profile", name);
+    CHECK(dev.readSetting("ppm") == "11" && dev.readSetting("harmonic") == "3");
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0, "PAD") == 1);
+    dev.writeSetting("harmonic", "1");
+    dev.writeSetting("ppm", "-3");
+    dev.setGain(SOAPY_SDR_TX, 0, 5);
     SoapySDR::Kwargs badArgs;
     badArgs["profile"] = "no_such_profile.rpitx";
     CHECK(throws([&] { SoapyRPITX d(badArgs); }));

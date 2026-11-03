@@ -405,6 +405,13 @@ public:
     bool SetAmplitudeConfig(const SoapyRPITX_AmplitudeConfig &amplitude);
 
     /**
+     * @brief Tells whether SetAmplitudeConfig() would accept the parameters (dry run, nothing is changed).
+     * @param amplitude Parameters to check.
+     * @return True when they are valid and the envelope delay fits the DMA ring of this transmitter.
+     */
+    bool AmplitudeConfigFits(const SoapyRPITX_AmplitudeConfig &amplitude) const;
+
+    /**
      * @brief Returns the current frequency-related parameters.
      * @return Tune configuration in effect.
      */
@@ -500,6 +507,20 @@ private:
      * @return True on success.
      */
     bool ApplyTune(const SoapyRPITX_TuneConfig &tune);
+
+    /**
+     * @brief Tells whether ApplyTune() would accept a tune configuration, without touching the hardware or any
+     *        state (callable from any thread).
+     *
+     * Applies the same tests in the same order: parameter ranges, ring length at the slot rate, the pacing and
+     * envelope DAC clocks with the crystal correction the tune would give (NTP estimate plus ppm), and the
+     * carrier PLL divider search. Only a change of the hardware between this call and ApplyTune() (for example
+     * the NTP estimate) can make ApplyTune() refuse what this accepted.
+     *
+     * @param tune Configuration to check.
+     * @return True when ApplyTune() would succeed.
+     */
+    bool CheckTune(const SoapyRPITX_TuneConfig &tune) const;
 
     /** @brief Recomputes the idle slot words for the current tune configuration. */
     void ComputeIdleWords();

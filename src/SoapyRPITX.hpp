@@ -810,14 +810,60 @@ private:
      */
     void SetPpmLocked(double ppm);
 
+    /** @brief Settings parsed but not yet applied (defined in SoapyRPITX_Settings.cpp). */
+    struct PendingSettings;
+
+    /**
+     * @brief Parses one setting into @p pending without touching the hardware or the device state (device_mutex held).
+     * @param key     Setting key.
+     * @param value   Value.
+     * @param pending Receives the parsed value.
+     * @throws std::runtime_error for an unknown key or an invalid value.
+     */
+    void ParseSetting(const std::string &key, const std::string &value, PendingSettings &pending) const;
+
+    /**
+     * @brief Checks the combination of parsed settings against the board and the open stream (device_mutex held).
+     * @param pending Parsed settings.
+     * @throws std::runtime_error when the combination cannot be applied.
+     */
+    void ValidateSettings(const PendingSettings &pending) const;
+
+    /**
+     * @brief Applies validated settings: at most one retune and one amplitude update (device_mutex held).
+     *
+     * When the retune is refused or times out nothing is changed. If the amplitude update fails after the retune,
+     * the previous tune is restored.
+     *
+     * @param pending Parsed and validated settings.
+     * @throws std::runtime_error when the stream refuses the change.
+     */
+    void ApplySettings(const PendingSettings &pending);
+
+    /**
+     * @brief Parses the stream arguments into @p cfg without creating anything (dry run of setupStream()).
+     *
+     * Fills the fields controlled by stream arguments; @p cfg.tune must hold the tune the stream will use
+     * (its sample rate gives the default ring size). Checks that depend on the sample rate of a later
+     * setupStream() call are left to it.
+     *
+     * @param sargs  Stream arguments (profile defaults already merged).
+     * @param cfg    Receives the values.
+     * @param envOut Receives the envelope_output name.
+     * @throws std::runtime_error for an invalid value.
+     */
+    void ParseStreamArgs(const SoapySDR::Kwargs &sargs, SoapyRPITX_TxConfig &cfg, std::string &envOut) const;
+
     /**
      * @brief Loads a profile file (device_mutex not held).
      *
-     * The settings of the file are applied in file order with writeSetting(), except the keys present in
-     * @p explicitArgs; the "gain" line sets the PAD gain; the "stream." lines replace the default stream arguments
-     * used by setupStream() for the keys the application does not pass. Unknown setting and stream argument keys
-     * are reported with a warning and ignored. When a value is refused, loading stops with an exception and the
-     * settings of the earlier lines stay applied. An empty @p path forgets the profile and its stream defaults.
+     * The load is transactional. Every setting, the gain and the stream arguments of the file (except the keys
+     * present in @p explicitArgs) are parsed and validated without touching the hardware; then the result is
+     * applied once under the device mutex (one retune, one amplitude update, gain, profile name and stream
+     * defaults). The "stream." lines replace the default stream arguments used by setupStream() for the keys the
+     * application does not pass. Unknown setting and stream argument keys are reported with a warning and
+     * ignored. When anything is refused, nothing is changed and an exception is thrown. An empty @p path forgets
+     * the profile and its stream defaults.
      *
      * @param path         Profile file name.
      * @param explicitArgs Device arguments that take precedence over the profile, or nullptr.

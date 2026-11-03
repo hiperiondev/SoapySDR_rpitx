@@ -434,7 +434,7 @@ gain=7
 
 - Las claves de ajuste se aplican en el orden del archivo; un ajuste dado también como argumento del dispositivo tiene
   prioridad sobre el archivo. Un valor rechazado detiene la carga con un error que nombra el archivo (las líneas
-  anteriores quedan aplicadas).
+  anteriores no se aplican: la carga es todo o nada, y con un stream abierto hay como máximo un retune).
 - Las líneas `stream.<clave>` pasan a ser los valores por defecto de `setupStream()`; los argumentos que pasa la
   aplicación tienen prioridad.
 - `gain` fija la ganancia PAD (0–7).

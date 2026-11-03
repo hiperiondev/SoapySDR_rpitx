@@ -170,7 +170,7 @@ public:
 #define CM_KILL (1u << 5)       ///< Clock generator CTL: stop and reset the generator immediately.
 #define CM_BUSY (1u << 7)       ///< Clock generator CTL: generator running.
 #define CM_MASH_SHIFT 9         ///< Clock generator CTL: MASH field shift.
-#define CLK_LEN 0x1660          ///< Size of the clock manager block.
+#define CLK_LEN 0x1700          ///< Size of the clock manager block (covers PLLH_STS at 0x1660 and PLLB_* up to 0x16E0).
 
 #define CORECLK_CNTL (0x08 / 4)  ///< Core (VPU) clock control.
 #define CORECLK_DIV (0x0c / 4)   ///< Core (VPU) clock divider.
@@ -541,6 +541,24 @@ public:
     int SetCenterFrequency(uint64_t Frequency, int Bandwidth);
 
     /**
+     * @brief Tells whether SetCenterFrequency() would find a PLL configuration (no register is written and no
+     *        member is changed, so it can run on any thread).
+     * @param Frequency Carrier frequency in Hz.
+     * @param Bandwidth Half-width in Hz of the band that must not cross an integer PLL multiplier.
+     * @return 0 when a divider keeps the band within one integer step, 1 when the best divider crosses one
+     *         (SetCenterFrequency() would then set CrossesBoundary()), -1 when no PLL configuration can produce
+     *         @p Frequency.
+     */
+    int CheckCenterFrequency(uint64_t Frequency, int Bandwidth) const;
+
+    /**
+     * @brief Reads the kernel NTP frequency estimate (no state is changed).
+     * @param ppm Receives the correction in ppm when the estimate is valid.
+     * @return True when the estimate is valid and within +/-200 ppm (the value SetppmFromNTP() would apply).
+     */
+    static bool ReadNtpPpm(double &ppm);
+
+    /**
      * @brief Tells whether the band requested by the last SetCenterFrequency() crosses an integer multiplier.
      *
      * When true, the part of the band beyond the integer step is clipped by GetMasterFrac().
@@ -558,6 +576,16 @@ public:
      *         an integer step, -1 when the frequency is out of range.
      */
     int ComputeBestLO(uint64_t Frequency, int Bandwidth);
+
+    /**
+     * @brief Side-effect-free search of ComputeBestLO().
+     * @param Frequency Frequency (doubled by the caller on BCM2711).
+     * @param Bandwidth Half-width of the band (doubled by the caller on BCM2711).
+     * @param dividerOut Receives the divider found (0 when none).
+     * @param quiet     Suppress the diagnostic output.
+     * @return Same as ComputeBestLO().
+     */
+    int QueryBestLO(uint64_t Frequency, int Bandwidth, int &dividerOut, bool quiet) const;
 
     /**
      * @brief Programs the PLLC multiplier.
@@ -749,6 +777,14 @@ public:
     bool FrequencyFits(uint64_t Frequency) const;
 
     /**
+     * @brief Same as FrequencyFits() for another crystal correction (no state is changed, any thread).
+     * @param Frequency Frame rate in Hz.
+     * @param ppm       Correction in ppm.
+     * @return True when the frame rate can be produced with that correction.
+     */
+    bool FrequencyFitsAt(uint64_t Frequency, double ppm) const;
+
+    /**
      * @brief Sets the frame rate and starts the PCM block as a 16-bit stereo I2S master transmitter.
      *
      * The frame is @ref PCM_DAC_FRAME_LENGTH bit clocks long (frame sync high for half of it), both channels
@@ -766,6 +802,14 @@ public:
      * @return True when the clock divider is within 2..4095.
      */
     bool DacFrequencyFits(uint64_t Frequency) const;
+
+    /**
+     * @brief Same as DacFrequencyFits() for another crystal correction (no state is changed, any thread).
+     * @param Frequency Frame rate in Hz.
+     * @param ppm       Correction in ppm.
+     * @return True when the clock divider is within 2..4095.
+     */
+    bool DacFrequencyFitsAt(uint64_t Frequency, double ppm) const;
 
     /** @brief Clears the TX FIFO and (re)starts transmission and DMA requests (no effect before configuration). */
     void StartTx();
@@ -785,6 +829,9 @@ public:
      * @return Frame length in bit clocks (10 to 999), or -1 when no frame length fits.
      */
     int ComputePrediv(uint64_t Frequency) const;
+
+    /** @brief ComputePrediv() for a given source frequency. */
+    static int ComputePrediv(uint64_t Frequency, uint64_t sourceFrequency);
 };
 
 /**
@@ -892,6 +939,15 @@ public:
      * @return True when the clock divider is within 2..4095.
      */
     bool FrequencyFits(uint64_t Frequency, uint32_t Range) const;
+
+    /**
+     * @brief Same as FrequencyFits() for another crystal correction (no state is changed, any thread).
+     * @param Frequency Period rate in Hz.
+     * @param Range     Period length in PWM clocks.
+     * @param ppm       Correction in ppm.
+     * @return True when the clock divider is within 2..4095.
+     */
+    bool FrequencyFitsAt(uint64_t Frequency, uint32_t Range, double ppm) const;
 
     /** @brief Clears the FIFO and (re)starts the channel and DMA requests (no effect before configuration). */
     void StartTx();

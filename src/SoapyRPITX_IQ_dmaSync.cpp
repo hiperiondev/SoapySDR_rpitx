@@ -420,6 +420,42 @@ void SoapyRPITX_IQ_dmaSync::SetDmaAlgo() {
     cbp->next = mem_virt_to_phys(cbarray);
 }
 
+bool SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneConfig &tune) const {
+    if (tune.harmonic < 1 || !(tune.frequency > 0))
+        return false;
+    if (tune.sampleRate < RPITX_MIN_SAMPLE_RATE || tune.sampleRate > RPITX_MAX_SAMPLE_RATE)
+        return false;
+    const uint64_t rate64 = (uint64_t) tune.sampleRate * slotsPerSample;
+    if (rate64 > RPITX_MAX_SAMPLE_RATE)
+        return false;
+    const uint32_t rate = (uint32_t) rate64;
+    if (!SoapyRPITX_RingFitsRate(tracker.size(), rate))
+        return false;
+
+    // The crystal correction ApplyTune() would apply, computed without storing it.
+    double basePpm = 0;
+    if (tune.ppmFromNtp) {
+        double ntp;
+        if (clkgpio::ReadNtpPpm(ntp))
+            basePpm = ntp;
+    }
+    const double ppm = basePpm + tune.ppm;
+
+    bool pacingFits;
+    if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
+        pacingFits = pwm.FrequencyFitsAt(rate, pwmRange, ppm);
+    else if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm)
+        pacingFits = pcmgpio::DacFrequencyFitsAt(rate, ppm);
+    else
+        pacingFits = pcmgpio::FrequencyFitsAt(rate, ppm);
+    if (!pacingFits)
+        return false;
+
+    const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
+    const uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
+    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0;
+}
+
 bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     if (tune.harmonic < 1 || !(tune.frequency > 0))
         return false;
@@ -890,6 +926,11 @@ bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
 }
 
 SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
+    // A configuration the hardware would refuse must not cost the running transmission: the feeder pauses the DMA,
+    // turns the carrier off and rebuilds the ring before it can find that out.
+    if (!CheckTune(tune))
+        return SoapyRPITX_RetuneResult::Refused;
+
     if (!running.load()) {
         // Feeder not running: the DMA is stopped and the hardware can be reprogrammed directly.
         if (!ApplyTune(tune))
@@ -926,8 +967,12 @@ void SoapyRPITX_IQ_dmaSync::SetConstantEnvelope(bool constant) {
     constantEnvelope.store(constant);
 }
 
+bool SoapyRPITX_IQ_dmaSync::AmplitudeConfigFits(const SoapyRPITX_AmplitudeConfig &amplitude) const {
+    return SoapyRPITX_CheckAmplitudeConfig(amplitude).empty() && advanceFits(amplitude, slotsPerSample, envelopeOutput, tracker.size());
+}
+
 bool SoapyRPITX_IQ_dmaSync::SetAmplitudeConfig(const SoapyRPITX_AmplitudeConfig &amplitude) {
-    if (!SoapyRPITX_CheckAmplitudeConfig(amplitude).empty() || !advanceFits(amplitude, slotsPerSample, envelopeOutput, tracker.size()))
+    if (!AmplitudeConfigFits(amplitude))
         return false;
     {
         std::lock_guard<std::mutex> lock(modelMutex);

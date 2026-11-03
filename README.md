@@ -428,7 +428,7 @@ gain=7
 ```
 
 - Setting keys are applied in file order; a setting also given as a device argument takes precedence over the file.
-  A refused value stops the loading with an error that names the file (the earlier lines stay applied).
+  A refused value stops the loading with an error that names the file (the load is all-or-nothing: nothing is changed, and with an open stream there is at most one retune).
 - `stream.<key>` lines become the defaults of `setupStream()`; the arguments passed by the application take
   precedence.
 - `gain` sets the PAD gain (0–7).
