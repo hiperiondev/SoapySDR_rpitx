@@ -420,17 +420,17 @@ void SoapyRPITX_IQ_dmaSync::SetDmaAlgo() {
     cbp->next = mem_virt_to_phys(cbarray);
 }
 
-bool SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneConfig &tune) const {
+SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneConfig &tune) const {
     if (tune.harmonic < 1 || !(tune.frequency > 0))
-        return false;
+        return SoapyRPITX_RetuneResult::Refused;
     if (tune.sampleRate < RPITX_MIN_SAMPLE_RATE || tune.sampleRate > RPITX_MAX_SAMPLE_RATE)
-        return false;
+        return SoapyRPITX_RetuneResult::PacingRefused;
     const uint64_t rate64 = (uint64_t) tune.sampleRate * slotsPerSample;
     if (rate64 > RPITX_MAX_SAMPLE_RATE)
-        return false;
+        return SoapyRPITX_RetuneResult::PacingRefused;
     const uint32_t rate = (uint32_t) rate64;
     if (!SoapyRPITX_RingFitsRate(tracker.size(), rate))
-        return false;
+        return SoapyRPITX_RetuneResult::PacingRefused;
 
     // The crystal correction ApplyTune() would apply, computed without storing it.
     double basePpm = 0;
@@ -449,11 +449,12 @@ bool SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneConfig &tune) const {
     else
         pacingFits = pcmgpio::FrequencyFitsAt(rate, ppm);
     if (!pacingFits)
-        return false;
+        return SoapyRPITX_RetuneResult::PacingRefused;
 
     const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
     const uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
-    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0;
+    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0 ? SoapyRPITX_RetuneResult::Ok
+                                                                        : SoapyRPITX_RetuneResult::Refused;
 }
 
 bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
@@ -928,8 +929,9 @@ bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
 SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {
     // A configuration the hardware would refuse must not cost the running transmission: the feeder pauses the DMA,
     // turns the carrier off and rebuilds the ring before it can find that out.
-    if (!CheckTune(tune))
-        return SoapyRPITX_RetuneResult::Refused;
+    const SoapyRPITX_RetuneResult precheck = CheckTune(tune);
+    if (precheck != SoapyRPITX_RetuneResult::Ok)
+        return precheck;
 
     if (!running.load()) {
         // Feeder not running: the DMA is stopped and the hardware can be reprogrammed directly.
@@ -946,9 +948,9 @@ SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfi
 
     tuneCv.wait_for(lock, kRetuneTimeout, [&] { return tuneTakenSeq >= seq || !running.load(); });
     if (tuneTakenSeq < seq) {
-        // Not taken in time: withdraw the request, nothing was changed.
+        // The predicate fired because the feeder stopped, not because it took the request.
         tunePending = false;
-        return SoapyRPITX_RetuneResult::Timeout;
+        return !running.load() ? SoapyRPITX_RetuneResult::Stopped : SoapyRPITX_RetuneResult::Timeout;
     }
     tuneCv.wait(lock, [&] { return tuneDoneSeq >= seq || feederExited.load(); });
     return tuneDoneSeq >= seq && tuneResult ? SoapyRPITX_RetuneResult::Ok : SoapyRPITX_RetuneResult::Refused;

@@ -268,8 +268,8 @@ void testRefusedRetuneKeepsTransmitting() {
         CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
     }
     t = tx.GetTune();
-    t.sampleRate = 1; // out of range
-    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);
+    t.sampleRate = 1; // out of range → pacing clock / slot rate refuses
+    CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::PacingRefused);
     t = tx.GetTune();
     t.harmonic = 0;
     CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Refused);

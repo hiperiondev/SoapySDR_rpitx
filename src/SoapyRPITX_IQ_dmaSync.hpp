@@ -128,9 +128,11 @@ enum class SoapyRPITX_EnvelopeOutput {
 
 /** @brief Outcome of SoapyRPITX_IQ_dmaSync::Retune(). */
 enum class SoapyRPITX_RetuneResult {
-    Ok,      ///< The new parameters are in effect.
-    Refused, ///< The frequency or the DAC rate cannot be produced, the slot rate is out of range or the ring is too short.
-    Timeout, ///< The feeder thread did not take the request within 3 s; nothing was changed.
+    Ok,            ///< The new parameters are in effect.
+    Refused,       ///< The PLL cannot produce the requested frequency or harmonic.
+    PacingRefused, ///< The pacing clock / DAC rate or the ring length cannot support the requested slot rate.
+    Stopped,       ///< The feeder thread had already stopped; nothing was changed.
+    Timeout,       ///< The feeder thread did not take the request within 3 s; nothing was changed.
 };
 
 /**
@@ -372,10 +374,12 @@ public:
      * A request not taken by the feeder within 3 s is withdrawn; once taken, the call waits for its result.
      *
      * @param tune New parameters.
-     * @return SoapyRPITX_RetuneResult::Ok on success; SoapyRPITX_RetuneResult::Refused when the frequency or the
-     *         DAC rate cannot be produced, the slot rate is out of range or the ring is too short for the slot
-     *         rate; SoapyRPITX_RetuneResult::Timeout when the request was withdrawn. The previous configuration
-     *         stays in effect unless the result is SoapyRPITX_RetuneResult::Ok.
+     * @return SoapyRPITX_RetuneResult::Ok on success;
+     *         SoapyRPITX_RetuneResult::Refused when the PLL cannot produce the requested frequency;
+     *         SoapyRPITX_RetuneResult::PacingRefused when the pacing clock / DAC rate or the ring is too short;
+     *         SoapyRPITX_RetuneResult::Stopped when the feeder thread had already exited;
+     *         SoapyRPITX_RetuneResult::Timeout when the request was withdrawn after 3 s.
+     *         The previous configuration stays in effect unless the result is SoapyRPITX_RetuneResult::Ok.
      */
     SoapyRPITX_RetuneResult Retune(const SoapyRPITX_TuneConfig &tune);
 
@@ -518,9 +522,10 @@ private:
      * the NTP estimate) can make ApplyTune() refuse what this accepted.
      *
      * @param tune Configuration to check.
-     * @return True when ApplyTune() would succeed.
+     * @return Ok when ApplyTune() would succeed; PacingRefused when the pacing clock or ring length refuses
+     *         the slot rate; Refused when the carrier PLL cannot produce the frequency.
      */
-    bool CheckTune(const SoapyRPITX_TuneConfig &tune) const;
+    SoapyRPITX_RetuneResult CheckTune(const SoapyRPITX_TuneConfig &tune) const;
 
     /** @brief Recomputes the idle slot words for the current tune configuration. */
     void ComputeIdleWords();

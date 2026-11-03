@@ -802,7 +802,7 @@ int pcmgpio::SetFrequency(uint64_t Frequency) {
         dbg_printf(0, "PCM Frequency out of range\n");
         return -1;
     }
-    SetPrediv(Prediv);
+    SetPrediv(Prediv); // programs frame geometry; StartTx() is called by StartDma()
     return 0;
 }
 
@@ -836,13 +836,16 @@ int pcmgpio::SetDacFrequency(uint64_t Frequency) {
     usleep(100);
     gpioreg[PCM_DREQ_A] = (uint32_t) PCM_TX_DREQ_LEVEL << 24 | (uint32_t) PCM_TX_DREQ_LEVEL << 8;
     usleep(100);
-    StartTx();
+    // StartTx() is called by StartDma(); do not start the transmitter here while no DMA is feeding it.
     return 0;
 }
 
 void pcmgpio::StartTx() {
     if (!used)
         return;
+    // The clock was stopped by the matching StopTx(); restart it before enabling the FIFO.
+    cm_program_generator(clk.gpioreg, PCMCLK_CNTL, (unsigned) pllnumber, (unsigned) Mash, divInt, divFrac, true);
+    usleep(10);
     gpioreg[PCM_CS_A] = (gpioreg[PCM_CS_A] & ~(PCM_CS_TXON | PCM_CS_DMAEN)) | PCM_CS_TXCLR;
     usleep(10);
     gpioreg[PCM_CS_A] |= PCM_CS_DMAEN;
@@ -853,6 +856,9 @@ void pcmgpio::StopTx() {
     if (!used)
         return;
     gpioreg[PCM_CS_A] &= ~(PCM_CS_TXON | PCM_CS_DMAEN);
+    // Stop the PCM clock generator so that BCLK (GPIO18/19/21 in ALT0) stops toggling
+    // between DMA activations. Without this, ~3 MHz BCLK keeps running next to the RF pin.
+    cm_stop_generator(clk.gpioreg, PCMCLK_CNTL);
 }
 
 double pcmgpio::GetFrameRate() const {
@@ -875,7 +881,7 @@ int pcmgpio::SetPrediv(int predivisor) {
     usleep(100);
     gpioreg[PCM_DREQ_A] = (uint32_t) PCM_TX_DREQ_LEVEL << 24 | (uint32_t) PCM_TX_DREQ_LEVEL << 8; // TX DREQ and panic levels
     usleep(100);
-    StartTx();
+    // StartTx() is called by StartDma(); do not start the transmitter here while no DMA is feeding it.
 
     return 0;
 }

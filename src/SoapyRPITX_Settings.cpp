@@ -673,10 +673,20 @@ void SoapyRPITX::SetPpmLocked(double ppm) {
 void SoapyRPITX::ApplyTune(const SoapyRPITX_TuneConfig &t) {
     if (tx_stream) {
         SoapyRPITX_RetuneResult r = tx_stream->transmitter().Retune(t);
-        if (r == SoapyRPITX_RetuneResult::Timeout)
+        switch (r) {
+        case SoapyRPITX_RetuneResult::Ok:
+            break;
+        case SoapyRPITX_RetuneResult::Refused:
+            throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) +
+                                     " Hz with the requested harmonic and bandwidth");
+        case SoapyRPITX_RetuneResult::PacingRefused:
+            throw std::runtime_error("rpitx: the pacing clock cannot run at the slot rate for " +
+                                     formatDouble(t.sampleRate) + " S/s, or the DMA ring is too short");
+        case SoapyRPITX_RetuneResult::Stopped:
+            throw std::runtime_error("rpitx: the transmitter thread had already stopped; the change was not applied");
+        case SoapyRPITX_RetuneResult::Timeout:
             throw std::runtime_error("rpitx: the transmitter thread did not respond within 3 s; the change was not applied");
-        if (r != SoapyRPITX_RetuneResult::Ok)
-            throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) + " Hz with the requested parameters");
+        }
     }
     tune = t;
 }
