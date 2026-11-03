@@ -60,7 +60,16 @@ const char *const kSettingKeys[] = {"ppm",
 // Device arguments produced by enumeration and by SoapySDR itself; they are not settings.
 const char *const kIdentificationKeys[] = {"driver", "label", "product", "serial", "manufacturer", "tuner", "type"};
 
+bool isSettingKey(const std::string &key) {
+    for (const char *k : kSettingKeys)
+        if (key == k)
+            return true;
+    return false;
+}
+
 bool isKnownArgument(const std::string &key) {
+    if (key == "profile")
+        return true;
     for (const char *k : kSettingKeys)
         if (key == k)
             return true;
@@ -173,6 +182,9 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
         if (!isKnownArgument(arg.first))
             SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: unknown device argument '%s' ignored", arg.first.c_str());
     }
+    auto profile = args.find("profile");
+    if (profile != args.end() && !profile->second.empty())
+        LoadProfile(profile->second, &args);
     for (const char *key : kSettingKeys) {
         auto it = args.find(key);
         if (it != args.end())
@@ -336,10 +348,83 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     drive.range = SoapySDR::Range(0, 7, 1);
     setArgs.push_back(drive);
 
+    setArgs.push_back(makeArg("profile", "", "Profile file",
+                              "Loads a key=value profile (for example written by rpitx_autotune.py): settings and gain at once, stream.* lines as "
+                              "defaults of the next stream. Empty: forget the stream defaults.",
+                              SoapySDR::ArgInfo::STRING));
+
     return setArgs;
 }
 
+void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *explicitArgs) {
+    if (path.empty()) {
+        std::lock_guard<std::mutex> lock(device_mutex);
+        profilePath.clear();
+        profileStream.clear();
+        return;
+    }
+    SoapyRPITX_Profile p;
+    std::string error;
+    if (!SoapyRPITX_LoadProfile(path, p, error))
+        throw std::runtime_error("rpitx: profile '" + path + "': " + error);
+
+    auto context = [&path](const std::runtime_error &e) {
+        std::string what = e.what();
+        if (what.compare(0, 7, "rpitx: ") == 0)
+            what = what.substr(7);
+        return std::runtime_error("rpitx: profile '" + path + "': " + what);
+    };
+
+    SoapySDR::Kwargs stream;
+    SoapySDR::ArgInfoList known = getStreamArgsInfo(SOAPY_SDR_TX, 0);
+    for (const auto &kv : p.stream) {
+        bool ok = false;
+        for (const auto &info : known)
+            ok = ok || info.key == kv.first;
+        if (ok)
+            stream[kv.first] = kv.second;
+        else
+            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown stream argument '%s' ignored", path.c_str(), kv.first.c_str());
+    }
+
+    for (const auto &kv : p.settings) {
+        if (!isSettingKey(kv.first)) {
+            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown setting '%s' ignored", path.c_str(), kv.first.c_str());
+            continue;
+        }
+        if (explicitArgs && explicitArgs->count(kv.first))
+            continue;
+        try {
+            writeSetting(kv.first, kv.second);
+        } catch (const std::runtime_error &e) {
+            throw context(e);
+        }
+    }
+    if (p.hasGain) {
+        double g;
+        try {
+            g = parseDouble("gain", p.gain);
+        } catch (const std::runtime_error &e) {
+            throw context(e);
+        }
+        if (!(g >= 0 && g <= 7))
+            throw std::runtime_error("rpitx: profile '" + path + "': gain out of range [0, 7]");
+        setGain(SOAPY_SDR_TX, 0, g);
+    }
+
+    std::lock_guard<std::mutex> lock(device_mutex);
+    profilePath = path;
+    profileStream = stream;
+    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: profile '%s' loaded (%zu settings, %zu stream arguments%s)", path.c_str(), p.settings.size(), stream.size(),
+                  p.hasGain ? ", gain" : "");
+}
+
 void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) {
+    if (key == "profile") {
+        LoadProfile(value, nullptr);
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(device_mutex);
 
     if (key == "ppm") {
@@ -467,6 +552,8 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
         return formatDouble(ampCfg.eerIdle);
     if (key == "eer_drive")
         return std::to_string(ampCfg.eerDrive);
+    if (key == "profile")
+        return profilePath;
 
     throw std::runtime_error("rpitx: unknown setting '" + key + "'");
 }

@@ -169,7 +169,7 @@ Si SoapySDR se compiló desde el código fuente en `/usr/local`, configure con `
 |--------|-------------|-------------|
 | `RPITX_BUILD_DRIVER` | `ON` | Compila el módulo SoapySDR (requiere SoapySDR) |
 | `RPITX_BUILD_RESET_TOOL` | `ON` | Compila e instala `rpitx_reset` |
-| `RPITX_INSTALL_TOOLS` | `ON` | Instala `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py` y `rpitx_amp_calibrate.py` |
+| `RPITX_INSTALL_TOOLS` | `ON` | Instala `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py`, `rpitx_amp_calibrate.py` y `rpitx_autotune.py` |
 | `BUILD_TESTING` | `ON` (`OFF` en compilación cruzada) | Compila las pruebas para el host |
 | `RPITX_WERROR` | `OFF` | Trata las advertencias (`-Wall -Wextra -Wshadow`) como errores |
 
@@ -288,7 +288,7 @@ sudo cp rpitx_reset /usr/local/bin/
 |---------|---------|
 | `librpitxSupport.so` | `<libdir>/SoapySDR/modules<ABI>/` (el propio directorio de módulos de SoapySDR, p. ej. `/usr/lib/aarch64-linux-gnu/SoapySDR/modules0.8/`) |
 | `rpitx_reset` | `<prefix>/bin` |
-| `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py`, `rpitx_amp_calibrate.py` | `<prefix>/bin` |
+| `rpitx_tone_test.py`, `hpsdr_rpitx_bridge.py`, `rpitx_amp_calibrate.py`, `rpitx_autotune.py` | `<prefix>/bin` |
 
 No hace falta reiniciar ni copiar nada a mano. Verifique:
 
@@ -406,11 +406,38 @@ posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo rea
 | `eer_gain`, `eer_offset` | 1, 0 | Ganancia y desplazamiento aplicados al código de envolvente |
 | `eer_idle` | 0 | Código de envolvente mientras no se transmite (fracción del fondo de escala) |
 | `eer_drive` | 7 | Corriente de los pines de reloj mientras se usa el DAC de envolvente |
+| `profile` | vacío | Archivo de perfil: sus ajustes y `gain` se aplican de inmediato, sus líneas `stream.*` pasan a ser los valores por defecto del próximo stream (véase [Archivos de perfil](#archivos-de-perfil)); vacío olvida esos valores del stream |
 
 Ejemplo: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Los argumentos de dispositivo desconocidos se informan con
 una advertencia, salvo las claves de identificación (`driver`, `label`, `product`, `serial`, `manufacturer`, `tuner`,
 `type`) y las claves que contienen `:`. Los enteros son decimales (un cero inicial no significa octal) y los números no pueden llevar
 caracteres al final.
+
+### Archivos de perfil
+
+`profile=<archivo>` (argumento del dispositivo, o `writeSetting("profile", archivo)` en ejecución) carga un archivo
+de texto de líneas `clave=valor`, como el `profile_<path>.rpitx` que escribe [`rpitx_autotune.py`](#rpitx_autotunepy):
+
+```ini
+# comentario
+ppm=1.37
+amplitude_lut=0.12,0.27,0.42,0.56,0.69,0.8,0.9,1
+envelope_delay=0.62
+stream.slots_per_sample=2
+stream.fifo_ms=300
+gain=7
+```
+
+- Las claves de ajuste se aplican en el orden del archivo; un ajuste dado también como argumento del dispositivo tiene
+  prioridad sobre el archivo. Un valor rechazado detiene la carga con un error que nombra el archivo (las líneas
+  anteriores quedan aplicadas).
+- Las líneas `stream.<clave>` pasan a ser los valores por defecto de `setupStream()`; los argumentos que pasa la
+  aplicación tienen prioridad.
+- `gain` fija la ganancia PAD (0–7).
+- Las líneas vacías y las que empiezan con `#` se ignoran, las claves desconocidas se informan con una advertencia y se
+  ignoran, una línea sin `=` es un error, y una línea posterior reemplaza a una anterior con la misma clave.
+- `readSetting("profile")` devuelve el último archivo cargado; `writeSetting("profile", "")` olvida sus valores por
+  defecto del stream (los ajustes se mantienen).
 
 ### Sensores
 
@@ -462,6 +489,110 @@ rpitx_amp_calibrate.py self-test                                              # 
 Las tablas impresas ya tienen la forma que acepta el driver: tablas de amplitud estrictamente crecientes (un valor
 que el ruido de medición dejó fuera de orden se eleva lo mínimo, con una advertencia), fases dentro de ±180° y la fase
 del código EER 0 (sin portadora) tomada del código 1.
+
+### `rpitx_autotune.py`
+
+Prueba y ajuste en lazo cerrado sobre el aire. La herramienta transmite ráfagas de prueba conocidas en cada familia
+de modulación, las recibe con un receptor SoapySDR (basta un RTL-SDR junto a una carga fantasma y un atenuador), mide
+las degradaciones contra la forma de onda transmitida y ajusta los parámetros y argumentos de stream del driver hasta
+que cada modo seleccionado cumple sus umbrales o se agota un presupuesto. El camino del pin directo y el camino EER se
+ajustan por separado (`--path non-eer|eer|both`).
+
+```sh
+sudo rpitx_autotune.py run --freq 144.39M --confirm-dummy-load                     # pin directo, modos por defecto
+sudo rpitx_autotune.py run --freq 7.1M --path eer --envelope-output pcm \
+     --rx-args driver=rtlsdr,direct_samp=2 --confirm-dummy-load                    # camino EER en HF
+sudo rpitx_autotune.py run --freq 144.39M --path both --modes nbfm,fsk,bpsk,qpsk,usb --max-minutes 30 --confirm-dummy-load
+sudo rpitx_autotune.py run --freq 144.39M --resume rpitx_autotune_results/checkpoint.json --confirm-dummy-load
+sudo rpitx_autotune.py verify --freq 144.39M --profile rpitx_autotune_results/profile_non_eer.json --confirm-dummy-load
+rpitx_autotune.py run --simulate good --freq 144.39M                               # banco simulado, sin radio
+rpitx_autotune.py replay --out rpitx_autotune_results                              # vuelve a analizar las capturas guardadas
+rpitx_autotune.py self-test [--quick]                                              # verificación del análisis y del optimizador, sin radio
+```
+
+Cada ráfaga es una portadora inicial, un hueco, una palabra de sincronismo MSK, la carga útil, una segunda palabra de
+sincronismo y una portadora final. De cada captura la herramienta mide el error de frecuencia de la portadora y el
+error del reloj de muestreo (por el retardo entre las dos palabras de sincronismo), alinea la captura muestra a muestra
+con la señal transmitida y ajusta un filtro lineal corto que absorbe la banda pasante del receptor; el error restante
+y los demoduladores de cada modo dan las métricas.
+
+| Modos | Métricas |
+|-------|----------|
+| `cw` | tiempos de los flancos de manipulación, fuga con la llave abierta, clics de manipulación |
+| `nbfm`, `wbfm` (frecuencia de muestreo ≥ 180 kHz) | error de desviación, SINAD |
+| `fsk` (300 Bd), `afsk` (Bell 202), `mfsk` (8-FSK) | errores de bit / símbolo, error de frecuencia de los tonos |
+| `bpsk` (conformado PSK31), `qpsk`, `8psk`, `qam16`, `ofdm` | EVM, errores de bit / símbolo, deriva de fase, ACPR |
+| `am` | distorsión del tono demodulado |
+| `usb`, `lsb` | IMD3 con dos tonos, supresión de la banda lateral opuesta, portadora residual |
+| `iq_raw` | ráfaga larga de banda ancha: contadores de robustez y error de forma de onda |
+
+Todos los modos verifican además el error de frecuencia, el error del reloj de muestreo, los contadores `underflows`,
+`late`, `dma_errors` y `envelope_late` y, en modo envolvente, `envelope_clip`. Los modos por defecto son todos salvo
+`wbfm` y `ofdm`.
+
+Las etapas de ajuste se ejecutan en este orden (`--stages` las selecciona, `--stage-limit S4=40,...` limita sus
+evaluaciones):
+
+| Etapa | Parámetros | Método |
+|-------|------------|--------|
+| S0 | `rt_priority`, `cpu`, `fifo_ms`, `preroll_ms`, `ring_size` | escalados hasta que dos ráfagas largas `iq_raw` terminan con todos los contadores en cero |
+| S1 | `ppm` | error de la portadora de una ráfaga CW; con `--freq-ref tx` se ajusta en cambio la corrección del receptor, con `--freq-ref external` el receptor se calibra antes con la portadora en `--ref-freq` |
+| S2 | ganancia PAD de los modos de envolvente constante, o `eer_drive` | la excitación más baja a menos de `--drive-margin` dB de la mayor salida |
+| S3 | `amplitude_lut`, `ampm_lut` (`rfdac_lut` con `--rf-dac-available`), o `eer_lut`, `eer_ampm_lut` | medición referencia / estado de `rpitx_amp_calibrate.py`, refinada luego en lazo cerrado; el signo con el que el driver aplica la tabla AM/PM se mide, no se supone |
+| S4 | `envelope_delay` | menor IMD3 con dos tonos (rejilla y luego sección áurea) |
+| S5 | `amplitude_quantizer`, `sigma_delta_order`, `slots_per_sample` (y `rf_dac`) | todas las combinaciones, puntuadas por EVM de QPSK e IMD3 sin ceder ACPR (solo pin directo) |
+| S6 | `iq_scale` (EER: también `eer_gain`, `eer_offset`) | mejor EVM de OFDM sin `envelope_clip` |
+| S7 | `envelope_floor` (EER: también `eer_idle`) | sin ruido en las pausas y sin recortar la señal |
+
+Después se verifican todos los modos seleccionados (`--verify-repeats` ráfagas, cuenta el peor valor). Las etapas que
+pueden cambiar una métrica que falla se vuelven a ejecutar, hasta `--max-rounds` rondas. Un valor nuevo se acepta solo
+cuando supera al actual en más de `--min-delta` y de `--sigma-k` veces la dispersión medida.
+
+Cada métrica termina como `PASS`, `FAIL`, `UNVERIFIABLE` (el umbral está a menos de `--floor-margin` dB de lo que el
+banco puede resolver: el ruido del receptor y, para productos junto a una señal fuerte, `--rx-sfdr`), `HARDWARE_LIMIT`
+(todas las etapas habilitadas que podían mejorarla se ajustaron de nuevo sin éxito), `INFEASIBLE` o `INVALID`. La ejecución
+termina cuando todo pasa, al alcanzar `--max-trials`, `--max-minutes` o `--max-tx-seconds` (`BUDGET_EXHAUSTED`), o con
+Ctrl-C (`ABORTED`: la ráfaga termina con `END_BURST`, el stream se cierra y el punto de control se conserva). `--duty`
+limita el ciclo de trabajo de transmisión. El código de salida es 0 solo cuando todo pasa (`--allow-unverifiable`
+acepta también `UNVERIFIABLE`).
+
+El directorio de salida (`--out`) contiene `profile_<path>.json` (entrada de `verify`), `profile_<path>.rpitx`
+(archivo de perfil del driver, véase [Archivos de perfil](#archivos-de-perfil)), `profile_<path>.args`
+(argumentos del dispositivo, los ajustes de tablas a aplicar con `writeSetting()` — contienen comas y no pueden formar
+parte de una cadena de argumentos del dispositivo —, argumentos del stream y ganancias), `report.md`, `report.json`,
+`checkpoint.json` (para `--resume`) y `captures/` (`--save-captures fail|all`, para `replay`). Los umbrales por
+defecto están incorporados y son valores iniciales; se reemplazan con `--thresholds archivo.json`, por ejemplo
+`{"non_eer": {"qpsk": {"evm_db": -20}}, "global": {"freq_abs_hz": 2}}`.
+
+Otras opciones:
+
+| Opción | Valores (primero el predeterminado) | Efecto |
+|--------|-------------------------------------|--------|
+| `--profile-format` | `both`, `args`, `driver` | escribe `profile_<path>.args`, el perfil del driver `profile_<path>.rpitx`, o ambos |
+| `--profile-gain`, `--profile-amplitude-mode` | `envelope`, `constant`; `none`, `envelope`, `constant` | ganancia (de los modos de envolvente o de los de envolvente constante) y `amplitude_mode` guardados en el archivo `.rpitx` |
+| `--check-driver-profile` | opción | después del ajuste, vuelve a verificar cada modo con el driver abierto con `profile=<archivo .rpitx>` |
+| `verify --apply` | `settings`, `driver-profile` | aplica el perfil (`.json` o `.rpitx`) con `writeSetting()`, o mediante `profile=` |
+| `--rx-host`, `--rx-remote` | `local`, `remote`; `tcp://host:55132` | receptor en este equipo, o mediante SoapyRemote (`--rx-args` describe entonces el dispositivo remoto: `driver=rtlsdr` pasa a `remote:driver=rtlsdr`) |
+| `--rx-local-policy` | `warn`, `refuse`, `ignore` | qué hacer con un receptor USB local en una Pi Zero / 1 / 2 / 3 o CM1 / CM3 (USB compartido con Ethernet, o un solo núcleo) |
+| `--required-modes`, `--required-modes-eer` | `default`, `all`, `none`, lista | modos que deciden el resultado; los demás se informan como opcionales. `default`: en el pin directo los modos de envolvente constante, `bpsk`, `usb`, `lsb` e `iq_raw`; en el camino EER todos |
+| `--allow-hardware-limit`, `--allow-hardware-limit-eer` | lista, `all`, `none` (`qam16,ofdm` y `none`) | modos cuyo `HARDWARE_LIMIT` cuenta como aprobado |
+| `--threshold-set` | `auto`, `non-eer`, `eer` | tabla de umbrales de cada camino, o la misma tabla para todos (`eer` es la más estricta) |
+| `--tune-optional` | `yes`, `no` | si los modos opcionales que fallan también provocan un nuevo ajuste |
+| `--freqs` | lista, p. ej. `7.1M,14.2M,144.39M` | un ajuste por banda en `<out>/<banda>/`, luego `bands.md` / `bands.json` con cada parámetro por banda, clasificado `independent` o `dependent` |
+| `--band-reuse` | `none`, `start`, `skip` | cada banda desde los valores por defecto, desde el perfil de la banda anterior, o desde él omitiendo las `--band-independent-stages` (por defecto `S0,S5`) |
+| `--band-tolerance` | `0.05` | los valores coinciden entre bandas cuando difieren como mucho en esto por max(1, \|valor\|), elemento a elemento en las tablas |
+| `--budget-scope` | `band`, `run` | límites del presupuesto por banda o para toda la ejecución |
+| `--resume` | archivo, `auto` | `auto` reanuda cada directorio de salida (cada banda) desde su propio punto de control |
+
+Notas sobre el banco: siempre un filtro de banda y una carga fantasma, y la atenuación suficiente para que el receptor
+vea como mucho unos −30 dBm (un amplificador EER puede entregar vatios). El receptor puede estar en la misma Pi o en
+otro equipo a través de SoapyRemote (`--rx-host remote --rx-remote tcp://host:55132`); en una
+Pi Zero / 1 / 3 el receptor USB comparte el bus con Ethernet y puede perturbar el hilo alimentador (la etapa S0 lo
+muestra; `--rx-local-policy` avisa por defecto).
+`--rx-offset` mantiene el pico de continua y la imagen del receptor lejos de la señal. La frecuencia debe
+estar dentro del rango de ambas radios (en HF un RTL-SDR necesita muestreo directo o un conversor). `--freq-ref rx`
+(por defecto) confía en el reloj del receptor después de `--rx-ppm`: use un receptor con TCXO para precisión absoluta.
+El perfil es propio de la placa, la frecuencia, la carga y la temperatura.
 
 ### `rpitx_reset`
 
@@ -570,6 +701,10 @@ El ancho de banda de la envolvente de SSB es varias veces el ancho de banda de a
 
 Estos tiempos y secuencias de registros se verifican contra el motor DMA simulado de las pruebas; confírmelos en la
 placa de destino (osciloscopio en GPIO4 y en la salida del DAC, espectro con un SDR) antes de transmitir al aire.
+
+[`rpitx_autotune.py`](#rpitx_autotunepy) ejecuta estas calibraciones, la búsqueda del retardo y la elección del
+cuantizador, el sobremuestreo, la escala y los ajustes de silencio automáticamente en lazo cerrado con un receptor,
+y verifica el resultado en cada modo de modulación.
 
 ---
 
@@ -852,11 +987,16 @@ que sale de la FIFO).
 | `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host, motor detenido sin vueltas atribuidas); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
 | `rpitx_devicetree_tests` | Base de periféricos, límite de canales DMA clásicos y máscara DMA del kernel con la nomenclatura antigua y la actual del device tree |
 | `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta, repetición solo de las posiciones de datos (retune antes del arranque del DMA y tras un hueco inactivo), vaciado durante un retune concurrente, liberación registrada antes de liberar la memoria VideoCore |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores, archivos de perfil y `profile=` |
 
 La CI (`.github/workflows/ci.yml`) ejecuta las pruebas en una compilación normal, con AddressSanitizer +
 UndefinedBehaviorSanitizer y con ThreadSanitizer (`tests/tsan.supp` suprime solo los accesos a registros simulados),
 y verifica `clang-format`, `shellcheck` sobre `rpi-cross.sh` y `pyflakes` sobre las herramientas en Python.
+
+`rpitx_autotune.py self-test` verifica el análisis y el optimizador de la herramienta de ajuste sobre un transmisor
+y un receptor simulados (sin radio, sin root): recuperación de frecuencia, reloj, distorsión y tasas de error
+conocidas, convergencia en ambos caminos, finales `HARDWARE_LIMIT` y `UNVERIFIABLE`, los límites de presupuesto y
+`--resume`. `--quick` es la variante corta.
 
 ---
 
@@ -872,12 +1012,14 @@ src/
   SoapyRPITX_IQ_dmaSync.*        transmisor: anillo DMA, hilo alimentador, modulación, retune, cierre
   SoapyRPITX_Buffers.hpp         SpscFifo y DmaRingTracker (independientes del hardware)
   SoapyRPITX_Amplitude.hpp       estados de amplitud, sigma-delta, retardo de envolvente, correspondencia EER (independiente del hardware)
+  SoapyRPITX_Profile.hpp         lector de archivos de perfil para profile=<archivo> (independiente del hardware)
   SoapyRPITX_Session.*           archivo de bloqueo, registro de caídas y recuperación, comprobación de conflictos
 librpitx/src/                    librpitx integrada (dma, gpio/reloj/PCM/PWM/pads, mailbox, dsp, device tree)
 tools/
   rpitx_reset.cpp                herramienta de recuperación
   rpitx_tone_test.py             transmisor de prueba (tono / WAV)
   rpitx_amp_calibrate.py         calibración de amplitud, AM/PM, RF-DAC, EER y retardo de la envolvente
+  rpitx_autotune.py              prueba y ajuste en lazo cerrado sobre el aire de cada modo (pin directo y EER)
   hpsdr_rpitx_bridge.py          emulación de radio openHPSDR Protocol 1
 tests/                           pruebas unitarias, del device tree, del transmisor y del driver, simulación de hardware, supresiones de TSan
 rpi-cross.sh                     ayudante de compilación cruzada (host Fedora / derivado de Debian)

@@ -212,32 +212,38 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
     if (tx_stream)
         throw std::runtime_error("rpitx: a TX stream is already open");
 
+    // Default stream arguments of the loaded profile; the arguments of this call take precedence.
+    SoapySDR::Kwargs merged = profileStream;
+    for (const auto &kv : args)
+        merged[kv.first] = kv.second;
+    const SoapySDR::Kwargs &sargs = merged;
+
     SoapyRPITX_TxConfig cfg;
     cfg.tune = tune;
-    cfg.slotsPerSample = (uint32_t) streamArg(args, "slots_per_sample", 1, 1, RPITX_MAX_SLOTS_PER_SAMPLE);
+    cfg.slotsPerSample = (uint32_t) streamArg(sargs, "slots_per_sample", 1, 1, RPITX_MAX_SLOTS_PER_SAMPLE);
     const uint64_t slotRate = (uint64_t) tune.sampleRate * cfg.slotsPerSample;
     if (slotRate > RPITX_MAX_SAMPLE_RATE)
         throw std::runtime_error("rpitx: sample rate x slots_per_sample (" + std::to_string(slotRate) + " Hz) exceeds " +
                                  std::to_string(RPITX_MAX_SAMPLE_RATE) + " Hz");
-    cfg.ringSize = (uint32_t) streamArg(args, "ring_size", SoapyRPITX_DefaultRingSize((uint32_t) slotRate), RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE);
+    cfg.ringSize = (uint32_t) streamArg(sargs, "ring_size", SoapyRPITX_DefaultRingSize((uint32_t) slotRate), RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE);
     if (!SoapyRPITX_RingFitsRate(cfg.ringSize, (uint32_t) slotRate))
         throw std::runtime_error("rpitx: ring_size " + std::to_string(cfg.ringSize) + " is shorter than " + std::to_string(RPITX_MIN_RING_MS) + " ms at " +
                                  std::to_string(slotRate) + " slots/s");
-    std::string envOut = streamStringArg(args, "envelope_output", "none", {"none", "pcm", "pwm"});
+    std::string envOut = streamStringArg(sargs, "envelope_output", "none", {"none", "pcm", "pwm"});
     cfg.envelopeOutput = envOut == "pcm" ? SoapyRPITX_EnvelopeOutput::Pcm : envOut == "pwm" ? SoapyRPITX_EnvelopeOutput::Pwm : SoapyRPITX_EnvelopeOutput::None;
-    cfg.pwmGpio = (int) streamArg(args, "pwm_gpio", 18, 12, 18);
+    cfg.pwmGpio = (int) streamArg(sargs, "pwm_gpio", 18, 12, 18);
     if (cfg.pwmGpio != 12 && cfg.pwmGpio != 18)
         throw std::runtime_error("rpitx: stream argument pwm_gpio must be 12 or 18");
-    cfg.pwmBits = (int) streamArg(args, "pwm_bits", 8, 6, 12);
-    cfg.rfDac = streamBoolArg(args, "rf_dac", false);
+    cfg.pwmBits = (int) streamArg(sargs, "pwm_bits", 8, 6, 12);
+    cfg.rfDac = streamBoolArg(sargs, "rf_dac", false);
     cfg.amplitude = ampCfg;
-    cfg.fifoMs = (uint32_t) streamArg(args, "fifo_ms", kDefaultFifoMs, 20, 5000);
-    cfg.prerollMs = (uint32_t) streamArg(args, "preroll_ms", kDefaultPrerollMs, 0, 5000);
-    cfg.dmaChannel = (int) streamArg(args, "dma_channel", kDefaultDmaChannel, -1, 14);
-    cfg.dmaForce = streamBoolArg(args, "dma_force", false);
-    cfg.signalCleanup = streamBoolArg(args, "signal_cleanup", false);
-    cfg.rtPriority = (int) streamArg(args, "rt_priority", kDefaultRtPriority, 0, 99);
-    cfg.cpu = (int) streamArg(args, "cpu", kDefaultCpu, -1, 63);
+    cfg.fifoMs = (uint32_t) streamArg(sargs, "fifo_ms", kDefaultFifoMs, 20, 5000);
+    cfg.prerollMs = (uint32_t) streamArg(sargs, "preroll_ms", kDefaultPrerollMs, 0, 5000);
+    cfg.dmaChannel = (int) streamArg(sargs, "dma_channel", kDefaultDmaChannel, -1, 14);
+    cfg.dmaForce = streamBoolArg(sargs, "dma_force", false);
+    cfg.signalCleanup = streamBoolArg(sargs, "signal_cleanup", false);
+    cfg.rtPriority = (int) streamArg(sargs, "rt_priority", kDefaultRtPriority, 0, 99);
+    cfg.cpu = (int) streamArg(sargs, "cpu", kDefaultCpu, -1, 63);
     cfg.driveLevel = driveLevel;
     cfg.iqScale = iqScale;
     cfg.constantEnvelope = constantEnvelope;

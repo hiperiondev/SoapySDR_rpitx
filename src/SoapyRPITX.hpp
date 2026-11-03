@@ -43,6 +43,7 @@
 #include <SoapySDR/Types.hpp>
 
 #include "SoapyRPITX_IQ_dmaSync.hpp"
+#include "SoapyRPITX_Profile.hpp"
 
 /** @brief Name of the only antenna (the RF output pin). */
 #define RPITX_ANTENNA_NAME "GPIO4"
@@ -197,8 +198,13 @@ class SoapyRPITX : public SoapySDR::Device {
 public:
     /**
      * @brief Opens the device.
+     *
+     * With the argument "profile=<file>" the profile is loaded first (see LoadProfile()); setting keys given as
+     * device arguments are then applied with writeSetting() and take precedence over the same keys of the profile.
+     *
      * @param args Device arguments; known setting keys are applied with writeSetting().
-     * @throws std::runtime_error when the board is not supported or /dev/mem is not accessible.
+     * @throws std::runtime_error when the board is not supported, /dev/mem is not accessible, or the profile
+     *         cannot be read or holds an invalid value.
      */
     SoapyRPITX(const SoapySDR::Kwargs &args);
 
@@ -424,9 +430,14 @@ public:
 
     /**
      * @brief Changes a setting.
+     *
+     * The key "profile" loads a profile file (see LoadProfile()): its settings and gain are applied at once, its
+     * stream arguments become the defaults of the next setupStream(); an empty value forgets the stream defaults.
+     *
      * @param key   Setting key.
      * @param value New value.
-     * @throws std::runtime_error for an unknown key, an invalid value, or a frequency that cannot be produced.
+     * @throws std::runtime_error for an unknown key, an invalid value, a frequency that cannot be produced, or a
+     *         profile that cannot be read or holds an invalid value.
      */
     void writeSetting(const std::string &key, const std::string &value);
 
@@ -743,6 +754,21 @@ private:
      */
     void SetPpmLocked(double ppm);
 
+    /**
+     * @brief Loads a profile file (device_mutex not held).
+     *
+     * The settings of the file are applied in file order with writeSetting(), except the keys present in
+     * @p explicitArgs; the "gain" line sets the PAD gain; the "stream." lines replace the default stream arguments
+     * used by setupStream() for the keys the application does not pass. Unknown setting and stream argument keys
+     * are reported with a warning and ignored. When a value is refused, loading stops with an exception and the
+     * settings of the earlier lines stay applied. An empty @p path forgets the profile and its stream defaults.
+     *
+     * @param path         Profile file name.
+     * @param explicitArgs Device arguments that take precedence over the profile, or nullptr.
+     * @throws std::runtime_error when the file cannot be read, a line is malformed or a value is refused.
+     */
+    void LoadProfile(const std::string &path, const SoapySDR::Kwargs *explicitArgs);
+
     mutable std::mutex device_mutex;   ///< Serialises the control API.
     SoapyRPITX_TuneConfig tune;        ///< Frequency-related parameters.
     int driveLevel = 7;                ///< Pad drive level 0-7.
@@ -753,6 +779,8 @@ private:
     std::string model;                 ///< Board model string.
     std::string serial;                ///< Board serial number.
     bool pi4 = false;                  ///< BCM2711 board.
+    std::string profilePath;           ///< Profile file loaded last (empty: none).
+    SoapySDR::Kwargs profileStream;    ///< Default stream arguments of the loaded profile.
 
     std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
     std::atomic<tx_streamer *> streamHandle{nullptr}; ///< Handle of the open stream, read by writeStream() without the mutex.

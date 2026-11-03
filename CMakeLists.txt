@@ -12,7 +12,7 @@ endif()
 
 option(RPITX_BUILD_DRIVER "Build the SoapySDR module" ON)
 option(RPITX_BUILD_RESET_TOOL "Build the rpitx_reset recovery tool" ON)
-option(RPITX_INSTALL_TOOLS "Install the Python tools (tone test, HPSDR bridge, amplitude calibration)" ON)
+option(RPITX_INSTALL_TOOLS "Install the Python tools (tone test, HPSDR bridge, amplitude calibration, autotune)" ON)
 option(RPITX_WERROR "Treat compiler warnings as errors" OFF)
 # The tests run on the build machine, so they are off by default when cross-compiling.
 if(CMAKE_CROSSCOMPILING)
@@ -113,7 +113,8 @@ if(RPITX_BUILD_RESET_TOOL)
 endif()
 
 if(RPITX_INSTALL_TOOLS)
-    install(PROGRAMS tools/rpitx_tone_test.py tools/hpsdr_rpitx_bridge.py tools/rpitx_amp_calibrate.py DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(PROGRAMS tools/rpitx_tone_test.py tools/hpsdr_rpitx_bridge.py tools/rpitx_amp_calibrate.py tools/rpitx_autotune.py
+            DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 if(BUILD_TESTING)

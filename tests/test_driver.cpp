@@ -9,13 +9,16 @@
 // Test of the SoapySDR device layer (SoapyRPITX) on simulated hardware: settings parsing and ranges,
 // frequency correction, stream argument validation, CS16/CS8/CF32 scaling, END_BURST draining,
 // readStreamStatus and sensors. The build points the device tree, /dev/mem and /dev/vcio paths to files
-// generated in the build directory (see CMakeLists.txt).
+// generated in the build directory (see CMakeLists.txt). Also covers the profile file format and the
+// profile=<file> device argument / setting.
 
 #include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -327,6 +330,90 @@ void testCloseDuringDrain() {
 
 } // namespace
 
+void writeFile(const char *name, const std::string &text) {
+    std::ofstream f(name);
+    f << text;
+}
+
+void testProfileParser() {
+    SoapyRPITX_Profile p;
+    std::string err;
+    std::istringstream good("# comment\n\n  ppm = 1.5 \namplitude_lut=0.1,0.2\nstream.fifo_ms=300\ngain=3\nppm=2\nx=a=b\n");
+    CHECK(SoapyRPITX_ParseProfile(good, p, err));
+    CHECK(p.settings.size() == 3);
+    CHECK(p.settings[0].first == "ppm" && p.settings[0].second == "2"); // the last value wins, first position kept
+    CHECK(p.settings[1].second == "0.1,0.2");
+    CHECK(p.settings[2].first == "x" && p.settings[2].second == "a=b");
+    CHECK(p.stream.size() == 1 && p.stream["fifo_ms"] == "300");
+    CHECK(p.hasGain && p.gain == "3");
+    std::istringstream bad("ppm=1\njunk\n");
+    CHECK(!SoapyRPITX_ParseProfile(bad, p, err) && err.find("line 2") != std::string::npos);
+    std::istringstream emptyKey("=1\n");
+    CHECK(!SoapyRPITX_ParseProfile(emptyKey, p, err));
+    std::istringstream emptyStream("stream.=1\n");
+    CHECK(!SoapyRPITX_ParseProfile(emptyStream, p, err));
+    CHECK(!SoapyRPITX_LoadProfile("no_such_profile.rpitx", p, err));
+}
+
+void testProfileDevice() {
+    const char *name = "test_profile.rpitx";
+    writeFile(name, "# rpitx profile\nppm=2.5\niq_scale=0.8\namplitude_lut=0.1,0.2,0.3,0.4,0.5,0.6,0.7,1\nunknown_key=1\n"
+                    "stream.slots_per_sample=4\nstream.bogus=1\ngain=3\n");
+    SoapySDR::Kwargs args;
+    args["profile"] = name;
+    args["iq_scale"] = "0.9"; // an explicit device argument takes precedence over the profile
+    SoapyRPITX dev(args);
+    CHECK(dev.readSetting("ppm") == "2.5");
+    CHECK(dev.readSetting("iq_scale") == "0.9");
+    CHECK(dev.readSetting("amplitude_lut") == "0.1,0.2,0.3,0.4,0.5,0.6,0.7,1");
+    CHECK(dev.readSetting("profile") == name);
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0, "PAD") == 3);
+
+    // The profile's slots_per_sample is the default stream argument: 60 kS/s x 4 exceeds the slot rate limit.
+    dev.setSampleRate(SOAPY_SDR_TX, 0, 60000);
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32); }));
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"slots_per_sample", "1"}});
+    CHECK(st != nullptr);
+    dev.closeStream(st);
+
+    // An empty profile forgets the stream defaults.
+    dev.writeSetting("profile", "");
+    CHECK(dev.readSetting("profile").empty());
+    st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32);
+    CHECK(st != nullptr);
+    dev.closeStream(st);
+
+    // Loading at run time applies the settings at once.
+    writeFile(name, "ppm=-3\ngain=5\n");
+    dev.writeSetting("profile", name);
+    CHECK(dev.readSetting("ppm") == "-3");
+    CHECK(dev.getGain(SOAPY_SDR_TX, 0, "PAD") == 5);
+
+    // Errors: missing file, malformed line, refused value (reported with the profile name), gain out of range.
+    CHECK(throws([&] { dev.writeSetting("profile", "no_such_profile.rpitx"); }));
+    writeFile(name, "ppm=1\nnot a key value line\n");
+    CHECK(throws([&] { dev.writeSetting("profile", name); }));
+    writeFile(name, "iq_scale=500\n");
+    bool named = false;
+    try {
+        dev.writeSetting("profile", name);
+    } catch (const std::runtime_error &e) {
+        named = std::string(e.what()).find("profile 'test_profile.rpitx'") != std::string::npos;
+    }
+    CHECK(named);
+    writeFile(name, "gain=9\n");
+    CHECK(throws([&] { dev.writeSetting("profile", name); }));
+    SoapySDR::Kwargs badArgs;
+    badArgs["profile"] = "no_such_profile.rpitx";
+    CHECK(throws([&] { SoapyRPITX d(badArgs); }));
+
+    bool listed = false;
+    for (const auto &a : dev.getSettingInfo())
+        listed = listed || a.key == "profile";
+    CHECK(listed);
+    std::remove(name);
+}
+
 int main() {
     testSettings();
     testStreamArguments();
@@ -336,6 +423,8 @@ int main() {
     testAmplitudeSettings();
     testEnvelopeStreamArguments();
     testCloseDuringDrain();
+    testProfileParser();
+    testProfileDevice();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
