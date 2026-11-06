@@ -23,6 +23,7 @@ sobre una copia integrada y reforzada de [librpitx](https://github.com/F5OEO/lib
 - [Aviso legal y de radio](#aviso-legal-y-de-radio)
 - [Capacidades](#capacidades)
 - [Hardware soportado](#hardware-soportado)
+- [Limitaciones según el modelo de Raspberry Pi](#limitaciones-según-el-modelo-de-raspberry-pi)
 - [Requisitos y restricciones del sistema](#requisitos-y-restricciones-del-sistema)
 - [Compilación en la Raspberry Pi](#compilación-en-la-raspberry-pi)
 - [Compilación cruzada](#compilación-cruzada)
@@ -91,6 +92,106 @@ envolvente externo).
 - La placa se identifica con `/proc/device-tree/model` y la base de periféricos en `/proc/device-tree/soc/ranges`
   (`0x20000000`, `0x3F000000` o `0xFE000000`). `SoapySDRUtil --find` lista el dispositivo solo en placas soportadas.
 - El modo de periféricos altos de BCM2711 (`arm_peri_high=1`) no está soportado.
+
+---
+
+## Limitaciones según el modelo de Raspberry Pi
+
+El driver solo se registra en las placas que puede manejar: lee la cadena de modelo y la dirección base de los
+periféricos del device tree (`src/SoapyRPITX_Registration.cpp`, `librpitx/src/gpio.cpp`). La tabla muestra qué cambia
+de una familia de SoC a otra; "—" significa que el driver no funciona en esa placa. Los valores salen del código
+fuente (los umbrales de ancho de banda, de una réplica de su búsqueda de PLL); se agradecen los informes de placas
+reales.
+
+| | Pi 1 A/A+/B/B+, Zero, Zero W/WH, CM1 | Pi 2 B | Pi 3 B/B+/A+, CM3, Zero 2 W | Pi 4 B, Pi 400, CM4 | Pi 5, Pi 500, CM5 |
+|---|---|---|---|---|---|
+| **SoC** | BCM2835 | BCM2836 / BCM2837 | BCM2837 / BCM2837B0 / RP3A0 | BCM2711 | BCM2712 + RP1 |
+| **Estado del driver** | Soportada | Soportada | Soportada | Soportada (solo modo de periféricos bajos) | **Rechazada en la detección** |
+| **Base de periféricos** | `0x20000000` | `0x3F000000` | `0x3F000000` | `0xFE000000` | — |
+| **Cristal (XOSC)** | 19,2 MHz | 19,2 MHz | 19,2 MHz | 54 MHz | — |
+| **Rango de portadora** (`harmonic=1`) | 50 kHz – 1500 MHz | 50 kHz – 1500 MHz | 50 kHz – 1500 MHz | 50 kHz – **1000 MHz** | — |
+| **Techo nominal con `harmonic=15`** | 22,5 GHz | 22,5 GHz | 22,5 GHz | 15 GHz | — |
+| **Paso de frecuencia** (K = factor de escala del PLL) | 18,31 Hz / K | 18,31 Hz / K | 18,31 Hz / K | **51,5 Hz / K** | — |
+| **Divisor periférico de PLLC** | /1 | /1 | /1 | /2 (/1 no funciona) | — |
+| **Tasa de slots máxima (ancho de banda)** | 200 kHz | 200 kHz | 200 kHz | 200 kHz | — |
+| **Portadora desde la cual 200 kHz siempre caben en un paso del PLL** | unos 2,8 MHz | unos 2,8 MHz | unos 2,8 MHz | unos **1,1 MHz** | — |
+| **Canales DMA utilizables** | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | **0–10** (auto: 7, 8, 9, 10, 6, 5); 11–14 son DMA4 | — |
+| **Alias de memoria de VideoCore** | `0x40000000` (L1 sin asignación) | `0xC0000000` (directo) | `0xC0000000` (directo) | `0xC0000000` (directo) | — |
+| **Relojes sacados de PLLC** | VPU, EMMC | VPU, EMMC | VPU, EMMC | VPU, EMMC, **EMMC2** (tarjeta SD, divisor recalculado) | — |
+| **Núcleos de CPU** | **1** (ARMv6) | 4 | 4 | 4 | — |
+| **Hilo alimentador (SCHED_FIFO, 1 ms)** | Comparte el único núcleo con la aplicación: `preroll_ms` / `fifo_ms` mayores, aplicaciones livianas | Se puede fijar (`cpu=3`, `isolcpus=3`) | Se puede fijar | Se puede fijar | — |
+| **Receptor USB local (autotune)** | Avisa (`--rx-local-policy`) | Avisa | Avisa | Sin aviso | — |
+| **Objetivo de compilación cruzada** | Requiere toolchain ARMv6 | ARMv7 | ARMv7 / ARMv8 | ARMv8 / ARMv7 | — |
+
+Notas:
+
+- **Paso de frecuencia.** El multiplicador del PLL tiene 20 bits fraccionarios, así que el paso es `XOSC / 2²⁰ / K`.
+  Por ejemplo, 1,83 Hz a 144 MHz en una Pi 3 (K = 10) frente a 5,15 Hz en una Pi 4 (K = 10): la Pi 4 tiene una grilla
+  más gruesa, lo que importa en modos digitales de banda angosta.
+- **Techo de la Pi 4.** Como PLLC_PER debe funcionar a /2, el driver programa el VCO a cuatro veces la portadora, y
+  el límite de 4 GHz del VCO fija el máximo en 1000 MHz. Los demás SoC llegan al límite de 1500 MHz de los ajustes.
+- **Techos nominales.** El driver solo impone los números de arriba (50 kHz × `harmonic` hasta 1500 MHz × `harmonic`).
+  El nivel de la onda cuadrada cae con el número de armónico y con la frecuencia, y el PLL puede no engancharse en los
+  extremos (aviso "PLLC did not report lock"); el techo realmente utilizable de cada placa no está caracterizado en
+  este repositorio.
+- **DMA de la Pi 4.** Solo se pueden usar los canales heredados 0–10 (11–14 son motores DMA4 con otro formato de
+  bloque de control), y el kernel se queda con algunos; la elección automática prueba 7, 8, 9, 10, 6 y 5. Si la
+  máscara del kernel no se puede leer, indique `dma_channel` explícitamente.
+- **Modo de periféricos altos de la Pi 4.** Con `arm_peri_high=1` los periféricos quedan por encima del rango físico
+  de 32 bits que mapea el driver, por lo que la placa se rechaza.
+- **Placas de un solo núcleo.** Fijar el alimentador a un núcleo inexistente solo genera un aviso en el registro;
+  deje `cpu=-1` en Pi 1 / Zero / CM1. Compile con `-j1`.
+- **Familia Pi 5.** GPIO, los generadores de reloj y el DMA que manejan el conector están en el chip RP1, detrás de
+  PCIe, y no en las direcciones de registros BCM283x/BCM2711 que programa librpitx. No existe una ruta GPCLK0 / PLLC
+  que modular, así que el driver no se registra (`SoapySDRUtil --find` no lista nada) y ningún ajuste lo cambia.
+- **Compute Modules.** GPIO4 debe estar llevado a un conector en su placa portadora.
+
+### Ancho de banda según la frecuencia de portadora
+
+Toda la banda instantánea de la señal, la portadora ± 0,58 × la tasa de slots, debe quedar dentro de **un paso entero
+del multiplicador del PLL**; el paso a la salida es `XOSC / D`, donde D es el divisor de GPCLK0 elegido para la
+portadora. Con portadoras bajas D no puede ser lo bastante grande (el VCO debe quedar entre 200 MHz y 1,5 GHz), y los
+pasos se vuelven más angostos que una señal ancha. El driver no rechaza la frecuencia: registra "crosses a PLL integer
+step" y **recorta las desviaciones que pasan del paso**. Por encima de 750 MHz (375 MHz en BCM2711) se usa el
+pre-divisor del PLL, con un paso fijo de 38,4 MHz (27 MHz en BCM2711). En cualquier portadora, una banda centrada a menos de
+±0,58 × la tasa de slots de un múltiplo exacto de 19,2 MHz (27 MHz en BCM2711) cruza un paso sea cual sea el
+divisor (por ejemplo 38,4 MHz, o 54 MHz en una Pi 4); eso afecta a cerca del 1 % de las portadoras a 200 kHz y a
+menos con tasas de slots menores.
+
+Portadora desde la cual la banda completa de una tasa de slots dada siempre cabe en un paso del PLL (calculada con la
+búsqueda de divisor del propio driver; por debajo, algunas portadoras todavía caben):
+
+| Tasa de slots | Pi 1 / 2 / 3 / Zero (BCM283x) | Pi 4 / 400 / CM4 (BCM2711) |
+|---------------|-------------------------------|----------------------------|
+| 24 kHz | 0,3 MHz | 0,13 MHz |
+| 48 kHz (por defecto) | 0,6 MHz | 0,25 MHz |
+| 96 kHz | 1,2 MHz | 0,51 MHz |
+| 192 kHz | 2,7 MHz | 1,03 MHz |
+| 200 kHz (máxima) | 2,8 MHz | 1,08 MHz |
+
+En la práctica, los 200 kHz completos están disponibles desde la banda de 80 m hacia arriba en todos los modelos
+(desde 160 m en una Pi 4), y las portadoras de LF/MF requieren una tasa de muestreo menor. Elegir una portadora
+levemente distinta también evita el recorte.
+
+### Límites de uso comunes a todos los modelos soportados
+
+| Limitación | Detalle |
+|------------|---------|
+| Un único pin de RF | Solo GPIO4 (pin 7 del conector, GPCLK0); ningún otro driver debe reclamarlo (por ejemplo `w1-gpio`) |
+| Rango de frecuencia | 50 kHz – 1500 MHz (1000 MHz en BCM2711) en la fundamental; `harmonic` 1 – 15 multiplica ambos extremos (el PLL funciona a frecuencia / armónico) |
+| Ancho de banda máximo | Tasa de slots (tasa de muestreo × `slots_per_sample`) entre 10 kHz y 200 kHz, es decir, banda base compleja de como máximo 200 kHz de ancho (±100 kHz). El driver reserva ±0,58 × tasa de slots (±116 kHz a 200 kHz) en el PLL. No hay modo de banda ancha |
+| Tasas de muestreo y formatos | Cualquier tasa de 10 kHz a 200 kHz (listadas 24, 48, 96, 192 kHz; por defecto 48 kHz); `slots_per_sample` 1 – 4 interpola, pero la tasa de slots sigue ≤ 200 kHz; `CF32`, `CS16`, `CS8`; un canal TX |
+| Onda cuadrada | Armónicos impares de amplitud cercana a 1/n más espurias del PLL fraccionario: es obligatorio un filtro pasabanda o pasabajos |
+| Amplitud gruesa | 8 niveles de corriente del pad (ganancia `PAD` 0 – 7, 2 – 16 mA) en el pin directo; el registro del pad es compartido por GPIO 0–27. Mejorar la amplitud requiere calibración, sigma-delta o un DAC EER externo |
+| Nivel de salida bajo | Solo corriente del pad; cualquier potencia útil necesita un amplificador externo |
+| Exactitud de frecuencia | La fija el cristal de la placa: estimación NTP del kernel más `ppm` manual (−200 … 200); 1 ppm son 144 Hz a 144 MHz. Sin compensación de temperatura: los perfiles de ajuste son específicos de la placa, la frecuencia, la carga y la temperatura |
+| Latencia y buffers | Latencia ≈ ocupación del FIFO + ¾ del anillo DMA (unos 64 ms a 48 kHz con un anillo de 4096 slots); `fifo_ms` 20 – 5000, `preroll_ms` 0 – 5000, `ring_size` 512 – 32768 slots (al menos 10 ms a la tasa de slots). Sin transmisión temporizada |
+| El reajuste no es continuo | Cambiar frecuencia, tasa de muestreo, ppm o armónico durante la transmisión detiene el DMA, apaga la portadora, reprograma el PLL y reinicia: no es salto de frecuencia |
+| Temporización del DAC de envolvente | Con `envelope_output=pwm`, la tasa de slots × 2^`pwm_bits` debe ser como máximo la mitad de la frecuencia de PLLD: 11 o 12 bits limitan la tasa de slots a unos 122 kHz o 61 kHz con un PLLD típico de 500 MHz (183 kHz o 91 kHz a 750 MHz). `envelope_output=pcm` no tiene ese límite |
+| Hardware exclusivo | Un canal DMA, el bloque PCM/I2S (o PWM con `envelope_output=pwm`), memoria de VideoCore (140 bytes por slot del anillo), GPIO 0–9 congelados durante la transmisión, un transmisor por sistema |
+| Árbol de relojes | Mientras hay un stream abierto, el reloj de la VPU funciona desde PLLA, que el firmware debe dejar activo; mantenga `gpu_freq=250`. El mini-UART, I2C, SPI y el host SD funcionan a una velocidad distinta de la que cree el kernel |
+| Privilegios | Root: `/dev/mem` y `/dev/vcio` |
+| Solo transmisión | Sin ruta de recepción ni escrituras temporizadas (`SOAPY_SDR_HAS_TIME`) |
 
 ---
 

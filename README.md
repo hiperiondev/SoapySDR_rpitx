@@ -22,6 +22,7 @@ complex baseband samples to it and get RF out of the header pin. It is built on 
 - [Radio and legal notice](#radio-and-legal-notice)
 - [Capabilities](#capabilities)
 - [Supported hardware](#supported-hardware)
+- [Limitations by Raspberry Pi model](#limitations-by-raspberry-pi-model)
 - [System requirements and constraints](#system-requirements-and-constraints)
 - [Building on the Raspberry Pi](#building-on-the-raspberry-pi)
 - [Cross-compiling](#cross-compiling)
@@ -90,6 +91,103 @@ modulator).
 - The board is identified from `/proc/device-tree/model` and the peripheral base in `/proc/device-tree/soc/ranges`
   (`0x20000000`, `0x3F000000` or `0xFE000000`). `SoapySDRUtil --find` lists the device only on supported boards.
 - The BCM2711 high-peripheral mode (`arm_peri_high=1`) is not supported.
+
+---
+
+## Limitations by Raspberry Pi model
+
+The driver registers itself only on boards it can drive: it reads the model string and the peripheral base address
+from the device tree (`src/SoapyRPITX_Registration.cpp`, `librpitx/src/gpio.cpp`). The table below lists what changes
+from one SoC family to another; "—" means the driver does not run on that board. The values come from the source
+code (the bandwidth thresholds from a port of its PLL search); reports from real boards are welcome.
+
+| | Pi 1 A/A+/B/B+, Zero, Zero W/WH, CM1 | Pi 2 B | Pi 3 B/B+/A+, CM3, Zero 2 W | Pi 4 B, Pi 400, CM4 | Pi 5, Pi 500, CM5 |
+|---|---|---|---|---|---|
+| **SoC** | BCM2835 | BCM2836 / BCM2837 | BCM2837 / BCM2837B0 / RP3A0 | BCM2711 | BCM2712 + RP1 |
+| **Driver status** | Supported | Supported | Supported | Supported (low-peripheral mode only) | **Refused at detection** |
+| **Peripheral base** | `0x20000000` | `0x3F000000` | `0x3F000000` | `0xFE000000` | — |
+| **Crystal (XOSC)** | 19.2 MHz | 19.2 MHz | 19.2 MHz | 54 MHz | — |
+| **Carrier range** (`harmonic=1`) | 50 kHz – 1500 MHz | 50 kHz – 1500 MHz | 50 kHz – 1500 MHz | 50 kHz – **1000 MHz** | — |
+| **Nominal ceiling with `harmonic=15`** | 22.5 GHz | 22.5 GHz | 22.5 GHz | 15 GHz | — |
+| **Frequency step** (K = PLL scale factor) | 18.31 Hz / K | 18.31 Hz / K | 18.31 Hz / K | **51.5 Hz / K** | — |
+| **PLLC peripheral divider** | /1 | /1 | /1 | /2 (/1 does not work) | — |
+| **Maximum slot rate (bandwidth)** | 200 kHz | 200 kHz | 200 kHz | 200 kHz | — |
+| **Carrier above which 200 kHz always fits one PLL step** | about 2.8 MHz | about 2.8 MHz | about 2.8 MHz | about **1.1 MHz** | — |
+| **Usable DMA channels** | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | **0–10** (auto: 7, 8, 9, 10, 6, 5); 11–14 are DMA4 | — |
+| **VideoCore memory alias** | `0x40000000` (L1 non-allocating) | `0xC0000000` (direct) | `0xC0000000` (direct) | `0xC0000000` (direct) | — |
+| **Clocks moved off PLLC** | VPU, EMMC | VPU, EMMC | VPU, EMMC | VPU, EMMC, **EMMC2** (SD card, divider recomputed) | — |
+| **CPU cores** | **1** (ARMv6) | 4 | 4 | 4 | — |
+| **Feeder thread (SCHED_FIFO, 1 ms)** | Shares the only core with the application: larger `preroll_ms` / `fifo_ms`, light applications | Can be pinned (`cpu=3`, `isolcpus=3`) | Can be pinned | Can be pinned | — |
+| **Local USB receiver (autotune)** | Warns (`--rx-local-policy`) | Warns | Warns | No warning | — |
+| **Cross-compile target** | ARMv6 toolchain required | ARMv7 | ARMv7 / ARMv8 | ARMv8 / ARMv7 | — |
+
+Notes:
+
+- **Frequency step.** The PLL multiplier has 20 fractional bits, so the step is `XOSC / 2²⁰ / K`. For example 1.83 Hz
+  at 144 MHz on a Pi 3 (K = 10) against 5.15 Hz on a Pi 4 (K = 10): the Pi 4 has a coarser grid, which matters for
+  narrow digital modes.
+- **Pi 4 ceiling.** Because PLLC_PER must run at /2, the driver programs the VCO at four times the carrier, and the
+  4 GHz VCO limit caps the carrier at 1000 MHz. The other SoCs reach the 1500 MHz limit of the settings.
+- **Nominal ceilings.** The driver enforces only the numbers above (50 kHz × `harmonic` up to 1500 MHz × `harmonic`).
+  The level of the square wave falls with the harmonic number and with frequency, and the PLL may not lock at the
+  extremes (warning "PLLC did not report lock"); the usable ceiling of a board is not characterised in this
+  repository.
+- **Pi 4 DMA.** Only the legacy channels 0–10 can be used (11–14 are DMA4 engines with another control-block
+  format), and the kernel owns some of them; the automatic choice tries 7, 8, 9, 10, 6 and 5. If the kernel mask is
+  unreadable, set `dma_channel` explicitly.
+- **Pi 4 high-peripheral mode.** With `arm_peri_high=1` the peripherals are above the 32-bit physical range the
+  driver maps, so the board is refused.
+- **Single-core boards.** Pinning the feeder to a core that does not exist only logs a warning; leave `cpu=-1`
+  on Pi 1 / Zero / CM1. Build with `-j1`.
+- **Pi 5 family.** GPIO, the clock generators and the DMA that drive the header live in the RP1 chip behind PCIe,
+  not at the BCM283x/BCM2711 register addresses that librpitx programs. There is no GPCLK0 / PLLC path to modulate,
+  so the driver does not register (`SoapySDRUtil --find` lists nothing) and no setting changes that.
+- **Compute Modules.** GPIO4 must be routed to a connector on your carrier board.
+
+### Bandwidth versus carrier frequency
+
+The whole instantaneous band of the signal, the carrier ± 0.58 × the slot rate, must stay inside **one integer step
+of the PLL multiplier**; the step at the output is `XOSC / D`, where D is the GPCLK0 divider chosen for the carrier.
+At low carriers D cannot be large enough (the VCO must stay between 200 MHz and 1.5 GHz), so the steps become
+narrower than a wide signal. The driver does not refuse the frequency: it logs "crosses a PLL integer step" and
+**clips the deviations beyond the step**. Above 750 MHz (375 MHz on BCM2711) the PLL pre-divider is used, with a
+fixed step of 38.4 MHz (27 MHz on BCM2711). At any carrier, a band centred within ±0.58 × the slot rate of an exact
+multiple of 19.2 MHz (27 MHz on BCM2711) crosses a step whatever the divider (for example 38.4 MHz, or 54 MHz on a
+Pi 4); that affects roughly 1 % of the carriers at 200 kHz and fewer at lower slot rates.
+
+Carrier above which the full band of a given slot rate always fits one PLL step (computed with the driver's own
+divider search; below it, some carriers still fit):
+
+| Slot rate | Pi 1 / 2 / 3 / Zero (BCM283x) | Pi 4 / 400 / CM4 (BCM2711) |
+|-----------|-------------------------------|----------------------------|
+| 24 kHz | 0.3 MHz | 0.13 MHz |
+| 48 kHz (default) | 0.6 MHz | 0.25 MHz |
+| 96 kHz | 1.2 MHz | 0.51 MHz |
+| 192 kHz | 2.7 MHz | 1.03 MHz |
+| 200 kHz (maximum) | 2.8 MHz | 1.08 MHz |
+
+In practice the full 200 kHz is available from the 80 m band upward on every model (from 160 m on a Pi 4), and
+LF/MF carriers need a lower sample rate. Hand-picking a slightly different carrier also avoids the clipping.
+
+### Operating limits shared by every supported model
+
+| Limitation | Detail |
+|------------|--------|
+| One RF pin | GPIO4 (header pin 7, GPCLK0) only; it must not be claimed by another driver (for example `w1-gpio`) |
+| Frequency range | 50 kHz – 1500 MHz (1000 MHz on BCM2711) on the fundamental; `harmonic` 1 – 15 multiplies both ends (the PLL runs at frequency / harmonic) |
+| Maximum bandwidth | Slot rate (sample rate × `slots_per_sample`) between 10 kHz and 200 kHz, so the complex baseband is at most 200 kHz wide (±100 kHz). The driver reserves ±0.58 × slot rate (±116 kHz at 200 kHz) in the PLL. There is no wideband mode |
+| Sample rates and formats | Any rate from 10 kHz to 200 kHz (listed 24, 48, 96, 192 kHz; default 48 kHz); `slots_per_sample` 1 – 4 interpolates but the slot rate stays ≤ 200 kHz; `CF32`, `CS16`, `CS8`; one TX channel |
+| Square wave | Odd harmonics at about 1/n amplitude plus fractional-PLL spurs: a band-pass or low-pass filter is mandatory |
+| Coarse amplitude | 8 pad-drive levels (`PAD` gain 0 – 7, 2 – 16 mA) on the bare pin; the pad register is shared by GPIO 0–27. Better amplitude needs calibration, sigma-delta or an external EER DAC |
+| Low output level | Pad drive only; any useful power needs an external amplifier |
+| Frequency accuracy | Set by the board crystal: kernel NTP estimate plus manual `ppm` (−200 … 200); 1 ppm is 144 Hz at 144 MHz. No temperature compensation: tuning profiles are specific to the board, frequency, load and temperature |
+| Latency and buffering | Latency ≈ FIFO fill + ¾ of the DMA ring (about 64 ms at 48 kHz with a 4096-slot ring); `fifo_ms` 20 – 5000, `preroll_ms` 0 – 5000, `ring_size` 512 – 32768 slots (at least 10 ms at the slot rate). No timed transmission |
+| Retuning is not seamless | Changing frequency, sample rate, ppm or harmonic while streaming stops the DMA, switches the carrier off, reprograms the PLL and restarts: it is not frequency hopping |
+| Envelope DAC pacing | With `envelope_output=pwm` the slot rate × 2^`pwm_bits` must stay at or below half the PLLD frequency: 11 or 12 bits limit the slot rate to roughly 122 kHz or 61 kHz with a typical 500 MHz PLLD (183 kHz or 91 kHz at 750 MHz). `envelope_output=pcm` has no such limit |
+| Exclusive hardware | One DMA channel, the PCM/I2S block (or PWM with `envelope_output=pwm`), VideoCore memory (140 bytes per ring slot), GPIO 0–9 frozen while streaming, one transmitter per system |
+| Clock tree | While a stream is open the VPU clock runs from PLLA, which the firmware must leave running; keep `gpu_freq=250`. Mini-UART, I2C, SPI and the SD host run at a different rate than the kernel believes |
+| Privileges | Root: `/dev/mem` and `/dev/vcio` |
+| Transmit only | No receive path and no timed writes (`SOAPY_SDR_HAS_TIME`) |
 
 ---
 
