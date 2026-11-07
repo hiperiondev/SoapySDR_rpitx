@@ -42,6 +42,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <istream>
 #include <map>
 #include <sstream>
@@ -149,11 +150,62 @@ inline bool SoapyRPITX_TrustedOwner(uid_t uid) {
 }
 
 /**
+ * @brief Returns the user who started the process through sudo.
+ *
+ * Only a process whose real and effective user is root and whose environment holds a numeric SUDO_UID other than
+ * 0 has one: that user could already run the driver as root, so files and directories it owns are as trusted as
+ * the ones of root, provided nobody else can write them.
+ *
+ * @param uid Receives the user ID.
+ * @return True when the process runs as root through sudo.
+ */
+inline bool SoapyRPITX_SudoUser(uid_t &uid) {
+    if (getuid() != 0 || geteuid() != 0)
+        return false;
+    const char *text = getenv("SUDO_UID");
+    if (text == nullptr || *text == '\0')
+        return false;
+    char *end = nullptr;
+    unsigned long v = strtoul(text, &end, 10);
+    if (*end != '\0' || v == 0 || v > (unsigned long) (uid_t) -1)
+        return false;
+    uid = (uid_t) v;
+    return true;
+}
+
+/**
+ * @brief Tells whether a user is the one who started the process through sudo.
+ * @param uid User ID.
+ * @return True when the process runs as root through sudo started by @p uid.
+ */
+inline bool SoapyRPITX_IsSudoUser(uid_t uid) {
+    uid_t sudoUid;
+    return SoapyRPITX_SudoUser(sudoUid) && uid == sudoUid;
+}
+
+/**
+ * @brief Tells whether a file or directory can be trusted from its owner and its mode.
+ *
+ * Accepted: owned by root or by the effective user and not writable by others unless the sticky bit is set (the
+ * mode of a file is checked separately by the caller); or owned by the user who started the process through sudo
+ * (see SoapyRPITX_SudoUser()) and writable neither by group nor by others.
+ *
+ * @param st Status of the file or directory.
+ * @return true when trusted.
+ */
+inline bool SoapyRPITX_TrustedEntry(const struct stat &st) {
+    if (SoapyRPITX_TrustedOwner(st.st_uid))
+        return (st.st_mode & S_IWOTH) == 0 || (st.st_mode & S_ISVTX) != 0;
+    return SoapyRPITX_IsSudoUser(st.st_uid) && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/**
  * @brief Opens a profile file after walking its path from the root without following symbolic links.
  *
  * Every directory of the path must be owned by root or by the effective user and must not be writable by
  * others (a directory with the sticky bit, such as /tmp, is accepted: only the owner of an entry can replace it,
- * and the file's own owner is checked by the caller). The file is opened relative to the last directory, so the
+ * and the file's own owner is checked by the caller); a directory owned by the user who started the process
+ * through sudo is accepted when neither group nor others can write it (see SoapyRPITX_TrustedEntry()). The file is opened relative to the last directory, so the
  * directories checked are the ones the file is read from. A relative path is resolved against the current
  * directory, which is checked as well.
  *
@@ -194,14 +246,10 @@ inline int SoapyRPITX_OpenTrustedFile(const std::string &path, std::string &erro
             error = "cannot open the file";
             return -1;
         }
-        if (!SoapyRPITX_TrustedOwner(ds.st_uid)) {
+        if (!SoapyRPITX_TrustedEntry(ds)) {
             close(dirfd);
-            error = "a directory of the path is owned by another user";
-            return -1;
-        }
-        if ((ds.st_mode & S_IWOTH) != 0 && (ds.st_mode & S_ISVTX) == 0) {
-            close(dirfd);
-            error = "a directory of the path is writable by others";
+            error = SoapyRPITX_TrustedOwner(ds.st_uid) || SoapyRPITX_IsSudoUser(ds.st_uid) ? "a directory of the path is writable by others"
+                                                                                           : "a directory of the path is owned by another user";
             return -1;
         }
 
@@ -226,9 +274,9 @@ inline int SoapyRPITX_OpenTrustedFile(const std::string &path, std::string &erro
  *
  * The driver can run as root, so the file is trusted only when nobody else can change it: it is opened without
  * following symbolic links (in any component of the path) and without blocking, and is refused unless it is a
- * regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that is owned by root or by the effective user and
- * that group and others cannot write, in a path whose directories are owned by root or by the effective user and
- * are not writable by others (see @ref SoapyRPITX_OpenTrustedFile()). Devices, pipes and sockets are refused
+ * regular file of at most @ref RPITX_PROFILE_MAX_BYTES bytes that is owned by root, by the effective user or by the
+ * user who started the process through sudo, and that group and others cannot write, in a path whose directories
+ * pass SoapyRPITX_TrustedEntry() (see @ref SoapyRPITX_OpenTrustedFile()). Devices, pipes and sockets are refused
  * before anything is read from them.
  *
  * @param path  File name.
@@ -252,7 +300,7 @@ inline bool SoapyRPITX_LoadProfile(const std::string &path, SoapyRPITX_Profile &
         error = "larger than " + std::to_string(RPITX_PROFILE_MAX_BYTES) + " bytes";
         return false;
     }
-    if (!SoapyRPITX_TrustedOwner(st.st_uid)) {
+    if (!SoapyRPITX_TrustedOwner(st.st_uid) && !SoapyRPITX_IsSudoUser(st.st_uid)) {
         close(fd);
         error = "owned by another user";
         return false;

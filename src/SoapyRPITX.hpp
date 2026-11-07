@@ -31,6 +31,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <complex>
 #include <memory>
@@ -129,7 +130,8 @@ public:
      *
      * Blocks while the FIFO is full, up to @p timeoutUs. Partial writes are reported through the return value.
      * The first write after an idle period keys the transmitter; with an antenna relay it first waits for the
-     * relay delay (relay_tx_delay_ms), which is not counted in @p timeoutUs.
+     * relay delay (relay_tx_delay_ms), which is not counted in @p timeoutUs and ends at once when the stream is
+     * deactivated or closed (the call then returns SOAPY_SDR_STREAM_ERROR).
      *
      * @param buffs     One buffer (channel 0) in the stream format.
      * @param numElems  Number of complex samples in the buffer.
@@ -137,7 +139,8 @@ public:
      * @param timeNs    Ignored.
      * @param timeoutUs Maximum blocking time in microseconds.
      * @return Number of samples accepted, SOAPY_SDR_TIMEOUT when none could be queued in time,
-     *         SOAPY_SDR_STREAM_ERROR when the stream is not active, or SOAPY_SDR_NOT_SUPPORTED for timed writes.
+     *         SOAPY_SDR_STREAM_ERROR when the stream is not active (or stopped during the relay delay), or
+     *         SOAPY_SDR_NOT_SUPPORTED for timed writes.
      */
     int send(const void *const *buffs, size_t numElems, int &flags, long long timeNs, long timeoutUs);
 
@@ -193,7 +196,10 @@ public:
     void interrupt();
 
 private:
-    /** @brief Supervisor thread: unkeys the transmitter once it has been drained for the relay hang time. */
+    /**
+     * @brief Supervisor thread: unkeys the transmitter once it has been drained for the relay hang time, and prints
+     *        the messages queued by the feeder thread.
+     */
     void Supervise();
 
     rpitxStreamFormat format;                        ///< Host sample format.
@@ -215,7 +221,7 @@ private:
  * iq_scale, debug_level, the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
  * sigma_delta_order, envelope_delay, envelope_floor, rfdac_lut, eer_lut, eer_ampm_lut, eer_gain, eer_offset,
  * eer_idle, eer_drive) and the transmit/receive switching keys (relay_gpio, relay_active_low, relay_tx_delay_ms,
- * relay_hang_ms, rx_mute_tx). Other device arguments are reported with a warning, except the identification keys
+ * relay_hang_ms, rx_mute_tx, rx_mute_tail_ms). Other device arguments are reported with a warning, except the identification keys
  * produced by enumeration or by SoapySDR (driver, label, product, serial, manufacturer, tuner, type), keys
  * containing ':', and the receiver keys below.
  * Stream arguments: see getStreamArgsInfo().
@@ -225,8 +231,8 @@ private:
  * are passed to the receiver as "<key>=<value>" (for example "rx.serial=00000001"); its settings are available as
  * "rx.<key>". Every RX call (streams, frequency, gain, antennas, sample rate, bandwidth, corrections, sensors,
  * channel settings) is forwarded to it, and the device then reports one RX and one TX channel and full duplex
- * streaming (both streams may run at the same time). While the transmitter is keyed the receive samples are
- * replaced by silence (rx_mute_tx). Enumeration lists the TX-only device first and, when the "rx" argument is not
+ * streaming (both streams may run at the same time). While the transmitter is keyed, and for rx_mute_tail_ms after
+ * it was unkeyed, the receive samples are replaced by silence (rx_mute_tx). Enumeration lists the TX-only device first and, when the "rx" argument is not
  * given, one transceiver entry for every RTL-SDR found.
  *
  * Antenna relay: relay_gpio selects a GPIO that switches an external T/R relay: it is driven to the TX position
@@ -409,8 +415,11 @@ public:
     /**
      * @brief Reads samples from the receiver stream.
      *
-     * Not serialised with the control API. While the transmitter is keyed and rx_mute_tx is true the samples
-     * returned are replaced by silence (zero, or mid-scale for unsigned formats); flags and time are kept.
+     * Not serialised with the control API. While the transmitter is keyed and rx_mute_tx is true, and for
+     * rx_mute_tail_ms after the unkeying, the samples returned are replaced by silence (zero, or mid-scale for
+     * unsigned formats, packed CU4 and CU12 included); flags and time are kept. The receiver is called with
+     * timeouts of at most 100 ms until @p timeoutUs has elapsed, so closeStream() never waits longer than one such
+     * slice for a read in flight.
      *
      * @param stream    RX stream handle.
      * @param buffs     One buffer (channel 0) in the stream format.
@@ -526,7 +535,8 @@ public:
      * - relay_gpio: GPIO of the antenna relay (-1: none); relay_active_low: TX position with the pin low;
      *   relay_tx_delay_ms: relay settling time before the first sample; relay_hang_ms: time the transmitter
      *   stays keyed after the last sample.
-     * - rx_mute_tx: mute the receive samples while the transmitter is keyed.
+     * - rx_mute_tx: mute the receive samples while the transmitter is keyed; rx_mute_tail_ms: time they stay muted
+     *   after the unkeying (receiver buffering latency).
      * - rx.<key>: the settings of the receiver, when one is attached.
      *
      * @return Setting descriptions.
@@ -825,7 +835,8 @@ public:
     /**
      * @brief Sets the frequency of an element.
      *
-     * TX: applied immediately to an existing stream (the DMA restarts from the queued samples).
+     * TX: applied immediately to an existing stream (the DMA restarts from the queued samples). Without a stream
+     * the PLL configuration is checked at once for the current sample rate and harmonic.
      *
      * @param direction Direction.
      * @param channel   Channel.
@@ -897,7 +908,8 @@ public:
      * @param direction Direction.
      * @param channel   Channel.
      * @param rate      Rate in Hz, within getSampleRateRange().
-     * @throws std::runtime_error for an unsupported TX rate, a TX rate for which the slot rate of the open stream
+     * @throws std::runtime_error for an unsupported TX rate, a TX rate at which the PLL cannot produce the current
+     *         frequency, a TX rate for which the slot rate of the open stream
      *         exceeds 200 kHz or its DMA ring is shorter than 10 ms, for RX without a receiver, or when the
      *         receiver refuses the rate.
      */
@@ -1109,12 +1121,13 @@ private:
     /**
      * @brief Checks and applies the transmit/receive switching settings (device_mutex held).
      * @param relay  Antenna relay configuration.
-     * @param muteTx Mute the receive samples while the transmitter is keyed.
-     * @param dryRun Only check, change nothing.
+     * @param muteTx     Mute the receive samples while the transmitter is keyed.
+     * @param muteTailMs Time the receive samples stay muted after the unkeying, in milliseconds.
+     * @param dryRun     Only check, change nothing.
      * @throws std::runtime_error when the relay configuration is invalid, its pin or polarity changes while a TX
      *         stream is open, or the GPIO block cannot be mapped.
      */
-    void ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, bool dryRun);
+    void ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, uint32_t muteTailMs, bool dryRun);
 
     /**
      * @brief Checks that the TX stream configuration leaves the antenna relay GPIO free.
@@ -1191,7 +1204,8 @@ private:
     void ReleaseRxStreamLocked();
 
     /**
-     * @brief Replaces received samples with silence while the transmitter is keyed and rx_mute_tx is set.
+     * @brief Replaces received samples with silence while the transmitter is keyed (and for rx_mute_tail_ms after the
+     *        unkeying) and rx_mute_tx is set.
      * @param buffs    Buffers of the call.
      * @param numElems Number of samples read into each buffer.
      */
@@ -1216,8 +1230,9 @@ private:
     uintptr_t streamGeneration = 0;                ///< Last token issued; never reused, so a stale handle cannot match a new stream (device_mutex).
     std::atomic<int> streamCalls{0};               ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
 
-    std::shared_ptr<SoapyRPITX_Ptt> ptt; ///< Keyed state and antenna relay, shared with the TX stream.
-    std::atomic<bool> rxMuteTx{true};    ///< Mute the receive samples while the transmitter is keyed.
+    std::shared_ptr<SoapyRPITX_Ptt> ptt;                               ///< Keyed state and antenna relay, shared with the TX stream.
+    std::atomic<bool> rxMuteTx{true};                                  ///< Mute the receive samples while the transmitter is keyed.
+    std::atomic<uint32_t> rxMuteTailMs{RPITX_RX_MUTE_DEFAULT_TAIL_MS}; ///< Time the receive samples stay muted after the unkeying, in milliseconds.
 
     std::unique_ptr<SoapySDR::Device> rxDev;              ///< Receiver, or nullptr; set by the constructor only.
     std::string rxDriver;                                 ///< SoapySDR driver key of the receiver.
@@ -1225,6 +1240,7 @@ private:
     std::atomic<uintptr_t> rxHandle{0};                   ///< Generation token of the open RX stream (0: none).
     std::atomic<SoapySDR::Stream *> rxStreamPtr{nullptr}; ///< Receiver stream the RX token was issued for.
     std::atomic<int> rxCalls{0};                          ///< readStream() / readStreamStatus() calls in flight on the RX stream.
-    std::atomic<size_t> rxComponentBytes{0};              ///< Bytes of one I or Q component of the RX stream format.
-    std::atomic<bool> rxUnsigned{false};                  ///< The RX stream format is unsigned (silence is mid-scale).
+    size_t rxElemBytes = 0;                               ///< Bytes of one complex element of the RX stream format (set before the RX handle is published).
+    std::array<uint8_t, 16> rxSilence{};                  ///< Silence of one complex element in the RX stream format.
+    bool rxSilenceZero = true;                            ///< The silence of the RX stream format is all zero bytes.
 };

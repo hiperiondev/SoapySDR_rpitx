@@ -24,6 +24,9 @@ endif()
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
 
+# /dev/mem offsets above 2 GiB (BCM2711 peripherals, VideoCore memory on large boards) need a 64-bit off_t on armhf.
+add_compile_definitions(_FILE_OFFSET_BITS=64)
+
 set(RPITX_WARNINGS -Wall -Wextra -Wshadow)
 if(RPITX_WERROR)
     list(APPEND RPITX_WARNINGS -Werror)
@@ -117,6 +120,17 @@ endif()
 if(RPITX_INSTALL_TOOLS)
     install(PROGRAMS tools/rpitx_tone_test.py tools/hpsdr_rpitx_bridge.py tools/rpitx_amp_calibrate.py tools/rpitx_autotune.py
             DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# Source release archive from the git index only: no build trees, bytecode, binaries or local toolchain files.
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    add_custom_target(dist
+        COMMAND ${GIT_EXECUTABLE} archive --format=zip --prefix=SoapySDR_rpitx-${PROJECT_VERSION}/
+                -o "${CMAKE_CURRENT_BINARY_DIR}/SoapySDR_rpitx-${PROJECT_VERSION}.zip" HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Writing SoapySDR_rpitx-${PROJECT_VERSION}.zip from the committed sources"
+        VERBATIM)
 endif()
 
 if(BUILD_TESTING)

@@ -155,6 +155,18 @@ public:
     }
 
     /**
+     * @brief Returns the total number of elements ever popped (or discarded by clear()).
+     *
+     * Exact on the consumer side. pushedTotal() == poppedTotal() tells that every element pushed so far has left
+     * the FIFO, independently of the moment the counts were last compared.
+     *
+     * @return Absolute tail counter.
+     */
+    uint64_t poppedTotal() const {
+        return tail.load(std::memory_order_acquire);
+    }
+
+    /**
      * @brief Empties the FIFO.
      *
      * Must only be called while the consumer is not running; elements pushed concurrently may remain.

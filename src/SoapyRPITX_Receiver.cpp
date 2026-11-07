@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <thread>
@@ -98,8 +99,26 @@ SoapySDR::Stream *SoapyRPITX::SetupRxStream(const std::string &format, const std
         throw std::runtime_error("rpitx: the receiver could not create the RX stream");
 
     rxStream = inner;
-    rxComponentBytes.store(elemBytes / 2);
-    rxUnsigned.store(format.size() > 1 && format[1] == 'U');
+    // Silence of one complex element: zero for signed and float formats, mid-scale for unsigned ones (packed
+    // CU4 and CU12 included). Written before the handle is published, read by MuteRx() after it.
+    rxElemBytes = std::min<size_t>(elemBytes, rxSilence.size());
+    rxSilence.fill(0);
+    rxSilenceZero = true;
+    if (format.size() > 1 && format[1] == 'U') {
+        rxSilenceZero = false;
+        if (format == SOAPY_SDR_CU4) {
+            rxSilence[0] = 0x88;
+        } else if (format == SOAPY_SDR_CU12) {
+            // Two 12-bit values of 0x800 packed little-endian in 3 bytes.
+            rxSilence[1] = 0x08;
+            rxSilence[2] = 0x80;
+        } else {
+            // Byte-aligned components: little-endian mid-scale (only the top bit of each component set).
+            const size_t component = rxElemBytes / 2;
+            for (size_t c = 0; c < 2 && component > 0; c++)
+                rxSilence[c * component + component - 1] = 0x80;
+        }
+    }
     if (++streamGeneration == 0)
         streamGeneration = 1;
     rxStreamPtr.store(inner);
@@ -153,20 +172,14 @@ void SoapyRPITX::ReleaseRxStreamLocked() {
 }
 
 void SoapyRPITX::MuteRx(void *const *buffs, size_t numElems) const {
-    if (!rxMuteTx.load() || !ptt->IsKeyed() || numElems == 0)
+    if (!rxMuteTx.load() || numElems == 0 || !ptt->MutedNow(rxMuteTailMs.load()))
         return;
 
-    const size_t component = rxComponentBytes.load();
-    const size_t components = 2 * numElems;
-    if (!rxUnsigned.load()) {
-        memset(buffs[0], 0, components * component);
-    } else if (component == 1) {
-        memset(buffs[0], 0x80, components);
-    } else if (component == 2) {
-        uint16_t *p = static_cast<uint16_t *>(buffs[0]);
-        for (size_t i = 0; i < components; i++)
-            p[i] = 0x8000;
-    } else {
-        memset(buffs[0], 0, components * component);
+    uint8_t *p = static_cast<uint8_t *>(buffs[0]);
+    if (rxSilenceZero) {
+        memset(p, 0, numElems * rxElemBytes);
+        return;
     }
+    for (size_t i = 0; i < numElems; i++, p += rxElemBytes)
+        memcpy(p, rxSilence.data(), rxElemBytes);
 }

@@ -41,6 +41,10 @@ namespace {
 
 // Size of the conversion buffer, in samples.
 constexpr size_t kScratchSize = 4096;
+// Longest uninterrupted sleep of the relay settling wait.
+constexpr auto kRelaySlice = std::chrono::milliseconds(2);
+// Longest blocking time of one call to the receiver; longer timeouts are split into slices of this length.
+constexpr long kRxSliceUs = 100000;
 
 // Stream argument defaults (see getStreamArgsInfo()).
 constexpr long kDefaultFifoMs = 250;
@@ -413,9 +417,27 @@ int SoapyRPITX::readStream(SoapySDR::Stream *handle, void *const *buffs, const s
     if (inner == nullptr)
         return SOAPY_SDR_STREAM_ERROR;
 
+    // The receiver is called with timeouts of at most kRxSliceUs, so that closeStream() never waits longer than one
+    // slice for a read in flight; between slices the call ends when the stream was closed.
+    const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     int ret;
     try {
-        ret = rxDev->readStream(inner, buffs, numElems, flags, timeNs, timeoutUs);
+        for (;;) {
+            long slice = 0;
+            if (timeoutUs > 0) {
+                const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+                slice = (long) std::max<long long>(0, std::min<long long>(left, kRxSliceUs));
+            }
+            int sliceFlags = flags;
+            ret = rxDev->readStream(inner, buffs, numElems, sliceFlags, timeNs, slice);
+            flags = sliceFlags;
+            if (ret != SOAPY_SDR_TIMEOUT || slice == 0 || std::chrono::steady_clock::now() >= deadline)
+                break;
+            if (!IsValidRxStreamHandle(handle)) {
+                ret = SOAPY_SDR_STREAM_ERROR;
+                break;
+            }
+        }
     } catch (...) {
         LeaveRxCall();
         throw;
@@ -440,9 +462,24 @@ int SoapyRPITX::writeStream(SoapySDR::Stream *handle, const void *const *buffs, 
 int SoapyRPITX::readStreamStatus(SoapySDR::Stream *handle, size_t &chanMask, int &flags, long long &timeNs, const long timeoutUs) {
     SoapySDR::Stream *inner = EnterRxCall(handle);
     if (inner != nullptr) {
+        // Sliced like readStream(), so that closeStream() does not wait for a long status poll.
+        const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
         int ret;
         try {
-            ret = rxDev->readStreamStatus(inner, chanMask, flags, timeNs, timeoutUs);
+            for (;;) {
+                long slice = 0;
+                if (timeoutUs > 0) {
+                    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+                    slice = (long) std::max<long long>(0, std::min<long long>(left, kRxSliceUs));
+                }
+                ret = rxDev->readStreamStatus(inner, chanMask, flags, timeNs, slice);
+                if (ret != SOAPY_SDR_TIMEOUT || slice == 0 || std::chrono::steady_clock::now() >= deadline)
+                    break;
+                if (!IsValidRxStreamHandle(handle)) {
+                    ret = SOAPY_SDR_STREAM_ERROR;
+                    break;
+                }
+            }
         } catch (...) {
             LeaveRxCall();
             throw;
@@ -477,9 +514,13 @@ tx_streamer::~tx_streamer() {
 }
 
 void tx_streamer::Supervise() {
-    // A stopped transmitter counts as drained: its carrier is off.
+    // A stopped transmitter counts as drained: its carrier is off. The write sequence is read before the drain
+    // state, so a write that begins in between keeps the transmitter keyed.
     while (supervising.load()) {
-        ptt->Poll(!iqsender->IsActive() || iqsender->IsDrained());
+        const uint64_t seq = ptt->WriteSeq();
+        const bool drained = !iqsender->IsActive() || iqsender->IsDrained();
+        ptt->Poll(seq, drained);
+        iqsender->FlushLog();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -559,8 +600,18 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
             p.EndWrite();
         }
     } scope{*ptt};
-    if (relayDelayUs > 0)
-        std::this_thread::sleep_for(std::chrono::microseconds(relayDelayUs));
+    if (relayDelayUs > 0) {
+        // The relay settles in slices, so that closing or stopping the stream ends the wait at once.
+        const auto settled = std::chrono::steady_clock::now() + std::chrono::microseconds(relayDelayUs);
+        for (;;) {
+            if (closing.load() || !iqsender->IsActive())
+                return SOAPY_SDR_STREAM_ERROR;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= settled)
+                break;
+            std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(settled - now, kRelaySlice));
+        }
+    }
 
     const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;
@@ -623,11 +674,19 @@ int tx_streamer::readStatus(size_t &chanMask, int &flags, long long &, long time
             return SOAPY_SDR_STREAM_ERROR;
         SoapyRPITX_TxStats stats = iqsender->GetStats();
         uint64_t events = stats.underflows + stats.late + stats.dmaErrors;
+        // Each new event is reported to one caller only: the counter of reported events is advanced atomically.
         uint64_t reported = reportedEvents.load();
-        if (events < reported)
-            reported = 0;
-        if (events > reported) {
-            reportedEvents.store(events);
+        bool report = false;
+        for (;;) {
+            const uint64_t base = events < reported ? 0 : reported;
+            if (events <= base)
+                break;
+            if (reportedEvents.compare_exchange_weak(reported, events)) {
+                report = true;
+                break;
+            }
+        }
+        if (report) {
             chanMask = 1;
             flags = 0;
             return SOAPY_SDR_UNDERFLOW;

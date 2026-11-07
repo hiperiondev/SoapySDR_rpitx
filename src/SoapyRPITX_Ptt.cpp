@@ -47,6 +47,7 @@ std::string SoapyRPITX_CheckRelayConfig(const SoapyRPITX_RelayConfig &cfg) {
 }
 
 SoapyRPITX_Ptt::SoapyRPITX_Ptt() :
+        unkeyedAtNs(INT64_MIN / 2),
         lastBusy(clock::now()) {
 }
 
@@ -106,9 +107,21 @@ SoapyRPITX_RelayConfig SoapyRPITX_Ptt::GetConfig() const {
     return cfg;
 }
 
+void SoapyRPITX_Ptt::UnkeyLocked() {
+    keyed.store(false);
+    unkeyedAtNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count());
+    if (cfg.gpio >= 0)
+        DriveLocked(false);
+}
+
+uint64_t SoapyRPITX_Ptt::WriteSeq() const {
+    return writeSeq.load();
+}
+
 long SoapyRPITX_Ptt::BeginWrite() {
     std::lock_guard<std::mutex> lock(mutex);
     writers++;
+    writeSeq.fetch_add(1);
     lastBusy = clock::now();
     if (keyed.load())
         return 0;
@@ -128,30 +141,35 @@ void SoapyRPITX_Ptt::EndWrite() {
     lastBusy = clock::now();
 }
 
-void SoapyRPITX_Ptt::Poll(bool drained) {
+void SoapyRPITX_Ptt::Poll(uint64_t seq, bool drained) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!keyed.load())
         return;
 
+    // A write that began after the drain state was evaluated may have queued samples that state does not cover.
     const clock::time_point now = clock::now();
-    if (writers > 0 || !drained) {
+    if (writers > 0 || !drained || writeSeq.load() != seq) {
         lastBusy = now;
         return;
     }
     if (now - lastBusy < std::chrono::milliseconds(cfg.hangMs))
         return;
 
-    keyed.store(false);
-    if (cfg.gpio >= 0)
-        DriveLocked(false);
+    UnkeyLocked();
 }
 
 void SoapyRPITX_Ptt::Release() {
     std::lock_guard<std::mutex> lock(mutex);
-    if (!keyed.exchange(false))
+    if (!keyed.load())
         return;
-    if (cfg.gpio >= 0)
-        DriveLocked(false);
+    UnkeyLocked();
+}
+
+bool SoapyRPITX_Ptt::MutedNow(uint32_t tailMs) const {
+    if (keyed.load())
+        return true;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
+    return now - unkeyedAtNs.load() < (int64_t) tailMs * 1000000;
 }
 
 bool SoapyRPITX_Ptt::IsKeyed() const {

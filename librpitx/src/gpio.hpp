@@ -172,89 +172,94 @@ public:
 #define CM_MASH_SHIFT 9         ///< Clock generator CTL: MASH field shift.
 #define CLK_LEN 0x1700          ///< Size of the clock manager block (covers PLLH_STS at 0x1660 and PLLB_* up to 0x16E0).
 
-#define CORECLK_CNTL (0x08 / 4)  ///< Core (VPU) clock control.
-#define CORECLK_DIV (0x0c / 4)   ///< Core (VPU) clock divider.
-#define GPCLK_CNTL (0x70 / 4)    ///< GPCLK0 control.
-#define GPCLK_DIV (0x74 / 4)     ///< GPCLK0 divider.
-#define GPCLK_CNTL_2 (0x80 / 4)  ///< GPCLK2 control.
-#define GPCLK_DIV_2 (0x84 / 4)   ///< GPCLK2 divider.
-#define EMMCCLK_CNTL (0x1C0 / 4) ///< EMMC clock control.
-#define EMMCCLK_DIV (0x1C4 / 4)  ///< EMMC clock divider.
-#define CM_EMMC2CTL (0x1d0 / 4)  ///< EMMC2 clock control (BCM2711).
-#define CM_EMMC2DIV (0x1d4 / 4)  ///< EMMC2 clock divider (BCM2711).
+#define CORECLK_CNTL (0x08 / 4)   ///< Core (VPU) clock control.
+#define CORECLK_DIV (0x0c / 4)    ///< Core (VPU) clock divider.
+#define GPCLK_CNTL (0x70 / 4)     ///< GPCLK0 control.
+#define GPCLK_DIV (0x74 / 4)      ///< GPCLK0 divider.
+#define GPCLK_CNTL_2 (0x80 / 4)   ///< GPCLK2 control.
+#define GPCLK_DIV_2 (0x84 / 4)    ///< GPCLK2 divider.
+#define EMMCCLK_CNTL (0x1C0 / 4)  ///< EMMC clock control.
+#define EMMCCLK_DIV (0x1C4 / 4)   ///< EMMC clock divider.
+#define CM_EMMC2CTL (0x1d0 / 4)   ///< EMMC2 clock control (BCM2711).
+#define CM_EMMC2DIV (0x1d4 / 4)   ///< EMMC2 clock divider (BCM2711).
 #define EMMC2CLK_CNTL CM_EMMC2CTL ///< EMMC2 clock control (BCM2711); drives the SD card.
 #define EMMC2CLK_DIV CM_EMMC2DIV  ///< EMMC2 clock divider (BCM2711).
 
-#define CM_VPUCTL 0x008       ///< VPU clock control (byte offset).
-#define CM_VPUDIV 0x00c       ///< VPU clock divider (byte offset).
-#define CM_SYSCTL 0x010       ///< System clock control (byte offset).
-#define CM_SYSDIV 0x014       ///< System clock divider (byte offset).
-#define CM_PERIACTL 0x018     ///< PERIA clock control (byte offset).
-#define CM_PERIADIV 0x01c     ///< PERIA clock divider (byte offset).
-#define CM_PERIICTL 0x020     ///< PERII clock control (byte offset).
-#define CM_PERIIDIV 0x024     ///< PERII clock divider (byte offset).
-#define CM_H264CTL 0x028      ///< H264 clock control (byte offset).
-#define CM_H264DIV 0x02c      ///< H264 clock divider (byte offset).
-#define CM_ISPCTL 0x030       ///< ISP clock control (byte offset).
-#define CM_ISPDIV 0x034       ///< ISP clock divider (byte offset).
-#define CM_V3DCTL 0x038       ///< V3D clock control (byte offset).
-#define CM_V3DDIV 0x03c       ///< V3D clock divider (byte offset).
-#define CM_CAM0CTL 0x040      ///< CAM0 clock control (byte offset).
-#define CM_CAM0DIV 0x044      ///< CAM0 clock divider (byte offset).
-#define CM_CAM1CTL 0x048      ///< CAM1 clock control (byte offset).
-#define CM_CAM1DIV 0x04c      ///< CAM1 clock divider (byte offset).
-#define CM_CCP2CTL 0x050      ///< CCP2 clock control (byte offset).
-#define CM_CCP2DIV 0x054      ///< CCP2 clock divider (byte offset).
-#define CM_DSI0ECTL 0x058     ///< DSI0E clock control (byte offset).
-#define CM_DSI0EDIV 0x05c     ///< DSI0E clock divider (byte offset).
-#define CM_DSI0PCTL 0x060     ///< DSI0P clock control (byte offset).
-#define CM_DSI0PDIV 0x064     ///< DSI0P clock divider (byte offset).
-#define CM_DPICTL 0x068       ///< DPI clock control (byte offset).
-#define CM_DPIDIV 0x06c       ///< DPI clock divider (byte offset).
-#define CM_GP0CTL 0x070       ///< GPCLK0 control (byte offset).
-#define CM_GP0DIV 0x074       ///< GPCLK0 divider (byte offset).
-#define CM_GP1CTL 0x078       ///< GPCLK1 control (byte offset).
-#define CM_GP1DIV 0x07c       ///< GPCLK1 divider (byte offset).
-#define CM_GP2CTL 0x080       ///< GPCLK2 control (byte offset).
-#define CM_GP2DIV 0x084       ///< GPCLK2 divider (byte offset).
-#define CM_HSMCTL 0x088       ///< HSM clock control (byte offset).
-#define CM_HSMDIV 0x08c       ///< HSM clock divider (byte offset).
-#define CM_OTPCTL 0x090       ///< OTP clock control (byte offset).
-#define CM_OTPDIV 0x094       ///< OTP clock divider (byte offset).
-#define CM_PCMCTL 0x098       ///< PCM clock control (byte offset).
-#define CM_PCMDIV 0x09c       ///< PCM clock divider (byte offset).
-#define CM_PWMCTL 0x0a0       ///< PWM clock control (byte offset).
-#define CM_PWMDIV 0x0a4       ///< PWM clock divider (byte offset).
-#define CM_SLIMCTL 0x0a8      ///< SLIMbus clock control (byte offset).
-#define CM_SLIMDIV 0x0ac      ///< SLIMbus clock divider (byte offset).
-#define CM_SMICTL 0x0b0       ///< SMI clock control (byte offset).
-#define CM_SMIDIV 0x0b4       ///< SMI clock divider (byte offset).
-#define CM_TCNTCTL 0x0c0      ///< Test counter control (byte offset).
-#define CM_TCNT_SRC1_SHIFT 12 ///< Test counter source shift.
-#define CM_TCNTCNT 0x0c4      ///< Test counter value (byte offset).
-#define CM_TECCTL 0x0c8       ///< TEC clock control (byte offset).
-#define CM_TECDIV 0x0cc       ///< TEC clock divider (byte offset).
-#define CM_TD0CTL 0x0d0       ///< TD0 clock control (byte offset).
-#define CM_TD0DIV 0x0d4       ///< TD0 clock divider (byte offset).
-#define CM_TD1CTL 0x0d8       ///< TD1 clock control (byte offset).
-#define CM_TD1DIV 0x0dc       ///< TD1 clock divider (byte offset).
-#define CM_TSENSCTL 0x0e0     ///< Temperature sensor clock control (byte offset).
-#define CM_TSENSDIV 0x0e4     ///< Temperature sensor clock divider (byte offset).
-#define CM_TIMERCTL 0x0e8     ///< Timer clock control (byte offset).
-#define CM_TIMERDIV 0x0ec     ///< Timer clock divider (byte offset).
-#define CM_UARTCTL 0x0f0      ///< UART clock control (byte offset).
-#define CM_UARTDIV 0x0f4      ///< UART clock divider (byte offset).
-#define CM_VECCTL 0x0f8       ///< VEC clock control (byte offset).
-#define CM_VECDIV 0x0fc       ///< VEC clock divider (byte offset).
-#define CM_PULSECTL 0x190     ///< Pulse clock control (byte offset).
-#define CM_PULSEDIV 0x194     ///< Pulse clock divider (byte offset).
-#define CM_SDCCTL 0x1a8       ///< SDRAM controller clock control (byte offset).
-#define CM_SDCDIV 0x1ac       ///< SDRAM controller clock divider (byte offset).
-#define CM_ARMCTL 0x1b0       ///< ARM clock control (byte offset).
-#define CM_AVEOCTL 0x1b8      ///< AVEO clock control (byte offset).
-#define CM_AVEODIV 0x1bc      ///< AVEO clock divider (byte offset).
-#define CM_EMMCCTL 0x1c0      ///< EMMC clock control (byte offset).
-#define CM_EMMCDIV 0x1c4      ///< EMMC clock divider (byte offset).
+#define CM_VPUCTL 0x008          ///< VPU clock control (byte offset).
+#define CM_VPUDIV 0x00c          ///< VPU clock divider (byte offset).
+#define CM_SYSCTL 0x010          ///< System clock control (byte offset).
+#define CM_SYSDIV 0x014          ///< System clock divider (byte offset).
+#define CM_PERIACTL 0x018        ///< PERIA clock control (byte offset).
+#define CM_PERIADIV 0x01c        ///< PERIA clock divider (byte offset).
+#define CM_PERIICTL 0x020        ///< PERII clock control (byte offset).
+#define CM_PERIIDIV 0x024        ///< PERII clock divider (byte offset).
+#define CM_H264CTL 0x028         ///< H264 clock control (byte offset).
+#define CM_H264DIV 0x02c         ///< H264 clock divider (byte offset).
+#define CM_ISPCTL 0x030          ///< ISP clock control (byte offset).
+#define CM_ISPDIV 0x034          ///< ISP clock divider (byte offset).
+#define CM_V3DCTL 0x038          ///< V3D clock control (byte offset).
+#define CM_V3DDIV 0x03c          ///< V3D clock divider (byte offset).
+#define CM_CAM0CTL 0x040         ///< CAM0 clock control (byte offset).
+#define CM_CAM0DIV 0x044         ///< CAM0 clock divider (byte offset).
+#define CM_CAM1CTL 0x048         ///< CAM1 clock control (byte offset).
+#define CM_CAM1DIV 0x04c         ///< CAM1 clock divider (byte offset).
+#define CM_CCP2CTL 0x050         ///< CCP2 clock control (byte offset).
+#define CM_CCP2DIV 0x054         ///< CCP2 clock divider (byte offset).
+#define CM_DSI0ECTL 0x058        ///< DSI0E clock control (byte offset).
+#define CM_DSI0EDIV 0x05c        ///< DSI0E clock divider (byte offset).
+#define CM_DSI0PCTL 0x060        ///< DSI0P clock control (byte offset).
+#define CM_DSI0PDIV 0x064        ///< DSI0P clock divider (byte offset).
+#define CM_DPICTL 0x068          ///< DPI clock control (byte offset).
+#define CM_DPIDIV 0x06c          ///< DPI clock divider (byte offset).
+#define CM_GP0CTL 0x070          ///< GPCLK0 control (byte offset).
+#define CM_GP0DIV 0x074          ///< GPCLK0 divider (byte offset).
+#define CM_GP1CTL 0x078          ///< GPCLK1 control (byte offset).
+#define CM_GP1DIV 0x07c          ///< GPCLK1 divider (byte offset).
+#define CM_GP2CTL 0x080          ///< GPCLK2 control (byte offset).
+#define CM_GP2DIV 0x084          ///< GPCLK2 divider (byte offset).
+#define CM_HSMCTL 0x088          ///< HSM clock control (byte offset).
+#define CM_HSMDIV 0x08c          ///< HSM clock divider (byte offset).
+#define CM_OTPCTL 0x090          ///< OTP clock control (byte offset).
+#define CM_OTPDIV 0x094          ///< OTP clock divider (byte offset).
+#define CM_PCMCTL 0x098          ///< PCM clock control (byte offset).
+#define CM_PCMDIV 0x09c          ///< PCM clock divider (byte offset).
+#define CM_PWMCTL 0x0a0          ///< PWM clock control (byte offset).
+#define CM_PWMDIV 0x0a4          ///< PWM clock divider (byte offset).
+#define CM_SLIMCTL 0x0a8         ///< SLIMbus clock control (byte offset).
+#define CM_SLIMDIV 0x0ac         ///< SLIMbus clock divider (byte offset).
+#define CM_SMICTL 0x0b0          ///< SMI clock control (byte offset).
+#define CM_SMIDIV 0x0b4          ///< SMI clock divider (byte offset).
+#define CM_TCNTCTL 0x0c0         ///< Test counter control (byte offset).
+#define CM_TCNT_SRC1_SHIFT 12    ///< Test counter source shift.
+#define CM_TCNTCNT 0x0c4         ///< Test counter value (byte offset).
+#define CM_TECCTL 0x0c8          ///< TEC clock control (byte offset).
+#define CM_TECDIV 0x0cc          ///< TEC clock divider (byte offset).
+#define CM_TD0CTL 0x0d0          ///< TD0 clock control (byte offset).
+#define CM_TD0DIV 0x0d4          ///< TD0 clock divider (byte offset).
+#define CM_TD1CTL 0x0d8          ///< TD1 clock control (byte offset).
+#define CM_TD1DIV 0x0dc          ///< TD1 clock divider (byte offset).
+#define CM_TSENSCTL 0x0e0        ///< Temperature sensor clock control (byte offset).
+#define CM_TSENSDIV 0x0e4        ///< Temperature sensor clock divider (byte offset).
+#define CM_TIMERCTL 0x0e8        ///< Timer clock control (byte offset).
+#define CM_TIMERDIV 0x0ec        ///< Timer clock divider (byte offset).
+#define CM_UARTCTL 0x0f0         ///< UART clock control (byte offset).
+#define CM_UARTDIV 0x0f4         ///< UART clock divider (byte offset).
+#define CM_VECCTL 0x0f8          ///< VEC clock control (byte offset).
+#define CM_VECDIV 0x0fc          ///< VEC clock divider (byte offset).
+#define CM_DSI1ECTL 0x158        ///< DSI1E clock control (byte offset).
+#define CM_DSI1EDIV 0x15c        ///< DSI1E clock divider (byte offset).
+#define CM_DSI1PCTL 0x160        ///< DSI1P clock control (byte offset).
+#define CM_DSI1PDIV 0x164        ///< DSI1P clock divider (byte offset).
+#define CM_PULSECTL 0x190        ///< Pulse clock control (byte offset).
+#define CM_PULSEDIV 0x194        ///< Pulse clock divider (byte offset).
+#define CM_SDCCTL 0x1a8          ///< SDRAM controller clock control (byte offset).
+#define CM_SDCDIV 0x1ac          ///< SDRAM controller clock divider (byte offset).
+#define CM_ARMCTL 0x1b0          ///< ARM clock control (byte offset).
+#define CM_AVEOCTL 0x1b8         ///< AVEO clock control (byte offset).
+#define CM_AVEODIV 0x1bc         ///< AVEO clock divider (byte offset).
+#define CM_EMMCCTL 0x1c0         ///< EMMC clock control (byte offset).
+#define CM_EMMCDIV 0x1c4         ///< EMMC clock divider (byte offset).
+#define CM_EMMC2CTL_OFFSET 0x1d0 ///< EMMC2 clock control (byte offset, BCM2711).
 
 #define CM_LOCK (0x114 / 4)               ///< PLL lock status (word index).
 #define CM_LOCK_FLOCKH (1 << 12)          ///< PLLH locked.
@@ -374,6 +379,25 @@ void cm_save_tree(volatile uint32_t *cm, ClockTreeState &state, bool bcm2711 = f
  * @param state Snapshot.
  */
 void cm_restore_tree(volatile uint32_t *cm, const ClockTreeState &state);
+
+/**
+ * @brief Moves a clock generator from the PLLC peripheral channel to PLLD at the same output frequency.
+ *
+ * Does nothing when the generator is not sourced from PLLC_PER (source 5). Otherwise the generator is stopped (its
+ * BUSY flag is awaited) and reprogrammed with source 6 (PLLD_PER) and a divider recomputed from the current
+ * PLLC_PER and PLLD_PER frequencies so that the output frequency is kept (rounded to an integer divider when MASH is
+ * 0); when either frequency cannot be computed the divider is left as it was. The MASH setting and the enable state
+ * are preserved.
+ *
+ * @param cm       Mapped clock manager.
+ * @param ctlIndex Word index of the CTL register of the generator.
+ * @param divIndex Word index of the DIV register of the generator.
+ * @param name     Name of the generator used in the diagnostics.
+ * @param xosc     Crystal frequency in Hz.
+ * @param bcm2711  True on BCM2711 (PLL channel rates are computed for that SoC).
+ * @return True when the generator was moved.
+ */
+bool cm_move_generator_off_pllc(volatile uint32_t *cm, unsigned ctlIndex, unsigned divIndex, const char *name, uint64_t xosc, bool bcm2711);
 
 /**
  * @brief Moves the EMMC2 generator (SD card clock, BCM2711) from the PLLC peripheral channel to PLLD.
@@ -552,6 +576,19 @@ public:
     int CheckCenterFrequency(uint64_t Frequency, int Bandwidth) const;
 
     /**
+     * @brief Tells whether the advanced PLL mode could produce a carrier on a SoC, without any register access.
+     *
+     * Applies the divider search of SetCenterFrequency() with the nominal crystal of the SoC (54 MHz on BCM2711,
+     * 19.2 MHz otherwise), so it can be used before any peripheral is mapped.
+     *
+     * @param Frequency Carrier frequency in Hz.
+     * @param Bandwidth Half-width in Hz of the band that must not cross an integer PLL multiplier.
+     * @param bcm2711   True for BCM2711.
+     * @return Same as CheckCenterFrequency().
+     */
+    static int CheckCenterFrequencyFor(uint64_t Frequency, int Bandwidth, bool bcm2711);
+
+    /**
      * @brief Reads the kernel NTP frequency estimate (no state is changed).
      * @param ppm Receives the correction in ppm when the estimate is valid.
      * @return True when the estimate is valid and within +/-200 ppm (the value SetppmFromNTP() would apply).
@@ -586,6 +623,18 @@ public:
      * @return Same as ComputeBestLO().
      */
     int QueryBestLO(uint64_t Frequency, int Bandwidth, int &dividerOut, bool quiet) const;
+
+    /**
+     * @brief Divider search of QueryBestLO() for a given crystal and SoC.
+     * @param Frequency  Frequency (doubled by the caller on BCM2711).
+     * @param Bandwidth  Half-width of the band (doubled by the caller on BCM2711).
+     * @param xosc       Nominal crystal frequency in Hz.
+     * @param bcm2711    True for BCM2711.
+     * @param dividerOut Receives the divider found (0 when none).
+     * @param quiet      Suppress the diagnostic output.
+     * @return Same as ComputeBestLO().
+     */
+    static int QueryBestLOFor(uint64_t Frequency, int Bandwidth, uint64_t xosc, bool bcm2711, int &dividerOut, bool quiet);
 
     /**
      * @brief Programs the PLLC multiplier.
@@ -925,7 +974,7 @@ public:
     double Getppm() const;
 
     /**
-     * @brief Programs the period rate and the range and starts the channel with DMA requests.
+     * @brief Programs the period rate, the range and the DMA request levels; the channel stays off until StartTx().
      * @param Frequency Period (sample) rate in Hz.
      * @param Range     Period length in PWM clocks (the full-scale duty).
      * @return 0, or -1 when the clock divider is out of range (nothing is changed).

@@ -54,7 +54,10 @@ void *mapmem(unsigned base, unsigned size) {
         dbg_printf(0, "can't open /dev/mem: %s\n", std::generic_category().message(errno).c_str());
         return NULL;
     }
-    void *mem = mmap(0, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, base);
+    // The physical address is unsigned and may exceed 2 GiB (BCM2711 peripherals at 0xFE000000); the build uses a
+    // 64-bit off_t on every target, so the offset reaches the kernel unchanged.
+    static_assert(sizeof(off_t) >= 8, "librpitx needs a 64-bit off_t (_FILE_OFFSET_BITS=64)");
+    void *mem = mmap(0, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, (off_t) (uint64_t) base);
     int mmapErr = errno;
     close(mem_fd);
     dbg_printf(2, "base=0x%x, mem=%p\n", base, mem);

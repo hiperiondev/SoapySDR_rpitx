@@ -34,7 +34,9 @@ import json
 import math
 import os
 import signal
+import stat
 import sys
+import tempfile
 import threading
 import time
 
@@ -132,25 +134,79 @@ def next_pow2(n):
     return 1 << int(math.ceil(math.log2(max(int(n), 1))))
 
 
-def open_mode_644(path):
-    """Opens a text file for writing with mode 0644 whatever the umask (and whatever mode an old file had).
+def trusted_owners():
+    """User IDs whose files and directories this tool trusts: root, the effective user and, under sudo, the
+    user who ran sudo (the same rule the driver applies to profile files)."""
+    owners = {0, os.geteuid()}
+    sudo = os.environ.get("SUDO_UID", "")
+    if os.getuid() == 0 and sudo.isdigit() and int(sudo) != 0:
+        owners.add(int(sudo))
+    return owners
 
-    The driver refuses profile files that group or others can write, so the mode of the files this tool writes
-    must not depend on the umask (002 is common on Debian / Raspberry Pi OS and in some sudo setups)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+def trusted_output_dir(path):
+    """Creates the output directory @path if needed and checks that nobody else can redirect the files written
+    into it.
+
+    The tool runs as root to drive the transmitter: a directory owned by another user, writable by group or
+    others, or reached through a symbolic link would let another user replace a file name with a link to a
+    system file. Such a directory is refused. A directory created here gets mode 0755 whatever the umask."""
+    if not os.path.lexists(path):
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o755)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise SystemExit("output directory %s is a symbolic link or not a directory" % path)
+    if st.st_uid not in trusted_owners():
+        raise SystemExit("output directory %s is owned by another user" % path)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise SystemExit("output directory %s is writable by group or others" % path)
+    return path
+
+
+def _open_output(path, binary):
+    """Opens @path for writing with mode 0644, never through a symbolic link, and only when it is (or becomes) a
+    regular file of a trusted owner."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
     try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in trusted_owners():
+            raise OSError("%s is not a regular file of a trusted user" % path)
         os.fchmod(fd, 0o644)
-        return os.fdopen(fd, "w")
+        return os.fdopen(fd, "wb" if binary else "w")
     except BaseException:
         os.close(fd)
         raise
 
 
+def open_mode_644(path):
+    """Opens a text file for writing with mode 0644 whatever the umask (and whatever mode an old file had).
+
+    The driver refuses profile files that group or others can write, so the mode of the files this tool writes
+    must not depend on the umask (002 is common on Debian / Raspberry Pi OS and in some sudo setups). Symbolic
+    links are not followed (the call fails with ELOOP)."""
+    return _open_output(path, False)
+
+
+def open_binary_644(path):
+    """Binary variant of open_mode_644()."""
+    return _open_output(path, True)
+
+
 def write_json_atomic(path, obj):
-    tmp = path + ".tmp"
-    with open_mode_644(tmp) as f:
-        json.dump(obj, f, indent=1, sort_keys=True, default=float)
-    os.replace(tmp, path)
+    """Writes @obj as JSON to @path through a temporary file with an unpredictable name in the same directory."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1, sort_keys=True, default=float)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class AnalysisError(Exception):
@@ -1976,11 +2032,11 @@ class Context:
         mode = self.a.save_captures
         if not self.out or mode == "none" or (mode == "fail" and ok):
             return
-        d = os.path.join(self.out, "captures")
-        os.makedirs(d, exist_ok=True)
+        d = trusted_output_dir(os.path.join(self.out, "captures"))
         name = hashlib.sha1(bid.encode()).hexdigest()[:12]
-        np.savez_compressed(os.path.join(d, name + ".npz"), cap=cap, rx_rate=self.bench.rx_rate, rx_offset=self.bench.rx_offset,
-                            rx_lead=self.bench.rx_lead, sfdr=self.a.rx_sfdr, frame=json.dumps(frame.args), burst=bid, valid=ok)
+        with open_binary_644(os.path.join(d, name + ".npz")) as fz:
+            np.savez_compressed(fz, cap=cap, rx_rate=self.bench.rx_rate, rx_offset=self.bench.rx_offset,
+                                rx_lead=self.bench.rx_lead, sfdr=self.a.rx_sfdr, frame=json.dumps(frame.args), burst=bid, valid=ok)
 
 
 def metric(r, name, default=float("inf")):
@@ -2851,7 +2907,7 @@ def verdict_table(verdict, md):
 def write_outputs(ctx, results, status):
     if not ctx.out:
         return
-    os.makedirs(ctx.out, exist_ok=True)
+    trusted_output_dir(ctx.out)
     a = ctx.a
     rep = dict(tool_version=TOOL_VERSION, status=status, board=board_model() if not a.simulate else "simulated (%s)" % a.simulate,
                freq=a.freq, rate=a.rate, harmonic=a.harmonic, rx_args=rx_device_args(a), rx_host=a.rx_host, rx_rate=a.rx_rate,
@@ -2910,7 +2966,7 @@ def write_outputs(ctx, results, status):
         md += ["", "## Findings", ""] + ["- " + f for f in ctx.findings]
     md += ["", "Parameters are specific to this board, frequency, load and temperature."]
     write_json_atomic(os.path.join(ctx.out, "report.json"), rep)
-    with open(os.path.join(ctx.out, "report.md"), "w") as f:
+    with open_mode_644(os.path.join(ctx.out, "report.md")) as f:
         f.write("\n".join(md) + "\n")
     ctx.log("results written to %s" % ctx.out)
 
@@ -2993,7 +3049,7 @@ def write_band_table(a, bands, status):
         md.append("")
         rep["paths"][path] = table
     write_json_atomic(os.path.join(a.out, "bands.json"), rep)
-    with open(os.path.join(a.out, "bands.md"), "w") as f:
+    with open_mode_644(os.path.join(a.out, "bands.md")) as f:
         f.write("\n".join(md) + "\n")
     return rep
 
@@ -3088,7 +3144,7 @@ def rx_placement_check(a, log):
 
 
 def run_band(a, bench, out, log, quiet, stopper, budget=None, start=None, skip=()):
-    os.makedirs(out, exist_ok=True)
+    trusted_output_dir(out)
     ctx = Context(a, bench, out, log, budget=budget, stopper=stopper)
     ctx.results = {}
     status = "ABORTED"
@@ -3116,7 +3172,7 @@ def cmd_run(a, quiet=False):
         raise SystemExit("run: transmitting needs --confirm-dummy-load (dummy load and attenuator in place)")
     log = make_logger(quiet)
     rx_placement_check(a, log)
-    os.makedirs(a.out, exist_ok=True)
+    trusted_output_dir(a.out)
     stopper = {"stop": False}
     if not quiet:
         install_signal_handlers(stopper, log)
@@ -3171,7 +3227,7 @@ def cmd_verify(a):
         rpitx_file = os.path.splitext(a.profile)[0] + ".rpitx"
     a.path = prof["path"].replace("_", "-")
     a.path_list = [prof["path"]]
-    os.makedirs(a.out, exist_ok=True)
+    trusted_output_dir(a.out)
     stopper = {"stop": False}
     install_signal_handlers(stopper, log)
     bench = make_bench(a, log)
@@ -3241,8 +3297,6 @@ def _sim_verify_args(extra):
 
 
 def self_test(quick, keep):
-    import tempfile
-
     ok_all = True
     tmp = keep or tempfile.mkdtemp(prefix="rpitx_autotune_")
 
@@ -3363,6 +3417,41 @@ def self_test(quick, keep):
     finally:
         os.umask(old_umask)
     check("profile files are 0644 under umask 002", modes_ok)
+    victim = os.path.join(tmp, "victim.txt")
+    with open(victim, "w") as f:
+        f.write("keep")
+    link = os.path.join(tmp, "link.md")
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(victim, link)
+    try:
+        open_mode_644(link).close()
+        followed = True
+    except OSError:
+        followed = False
+    with open(victim) as f:
+        kept = f.read() == "keep"
+    open_dir = os.path.join(tmp, "open_dir")
+    os.makedirs(open_dir, exist_ok=True)
+    os.chmod(open_dir, 0o777)
+    try:
+        trusted_output_dir(open_dir)
+        open_accepted = True
+    except SystemExit:
+        open_accepted = False
+    link_dir = os.path.join(tmp, "link_dir")
+    if os.path.lexists(link_dir):
+        os.unlink(link_dir)
+    os.symlink(open_dir, link_dir)
+    try:
+        trusted_output_dir(link_dir)
+        link_accepted = True
+    except SystemExit:
+        link_accepted = False
+    check("output files and directories are never reached through symbolic links or open directories",
+          not followed and kept and not open_accepted and not link_accepted)
+    leftovers = [n for n in os.listdir(os.path.dirname(jf)) if n.endswith(".tmp")]
+    check("JSON files are written through a temporary file that is removed", not leftovers)
     back = profile_from_driver_file(pf, good.a)
     pa_, pb_ = profile_params(gprof), profile_params(back)
     same = all(same_across([pa_[k], pb_[k]], 1e-9) for k in pa_ if k not in ("gain_constant", "rx_ppm"))

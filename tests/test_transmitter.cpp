@@ -783,6 +783,8 @@ void testEerPwm() {
         CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_alt5);
         volatile uint32_t *p = MockRegisters(PWM_BASE);
         CHECK(p[PWM_RNG1] == 256 && (p[PWM_DMAC] & 0xFF) == PWM_DREQ_LEVEL && (p[PWM_DMAC] & PWM_DMAC_ENAB));
+        // The channel stays off until the DMA starts.
+        CHECK((p[PWM_CTL] & PWM_CTL_PWEN1) == 0);
         CHECK(std::fabs(tx.GetActualSampleRate() - kRate) < kRate * 1e-3);
 
         MockDmaEngine engine(14, kRate);
@@ -796,6 +798,13 @@ void testEerPwm() {
             CHECK(d[4000].dac == 256);
             checkEerAlignment(d, 2400, 100);
         }
+
+        // A retune of the stopped transmitter reprograms the PWM clock without starting the channel.
+        CHECK((p[PWM_CTL] & PWM_CTL_PWEN1) == 0);
+        SoapyRPITX_TuneConfig t = tx.GetTune();
+        t.frequency = 145.0e6;
+        CHECK(tx.Retune(t) == SoapyRPITX_RetuneResult::Ok);
+        CHECK((p[PWM_CTL] & PWM_CTL_PWEN1) == 0);
     }
     volatile uint32_t *gpio = MockRegisters(GENERAL_BASE);
     CHECK(((gpio[GPFSEL1] >> 24) & 7) == fsel_input);
@@ -1195,6 +1204,117 @@ void testDeviceTreeStatus() {
 
 } // namespace
 
+// Stop() while a producer is blocked on a full FIFO: the producer returns at once, nothing it wrote reaches the
+// next activation, and the drain state of the next activation is right.
+void testStopWhileProducerBlocked() {
+    SoapyRPITX_TxConfig cfg = baseConfig();
+    cfg.fifoMs = 20;
+    cfg.prerollMs = 5000;
+    SoapyRPITX_IQ_dmaSync tx(cfg);
+    tx.Start();
+    // No DMA engine yet: the ring is never consumed, so the FIFO fills up and the producer blocks.
+    std::vector<std::complex<float>> big(kRate, std::complex<float>(1.0f, 0.0f));
+    std::atomic<size_t> got{0};
+    auto t0 = std::chrono::steady_clock::now();
+    std::thread producer([&] { got.store(tx.Write(big.data(), big.size(), 3000000)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    tx.Stop();
+    tx.Start();
+    producer.join();
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
+    CHECK(got.load() > 0 && got.load() < big.size());
+    CHECK(tx.GetStats().fifoLevel == 0);
+    // A Write() of the stopped activation never pushes into the new one.
+    CHECK(tx.GetStats().samplesSent == 0);
+
+    MockDmaEngine engine(14, kRate);
+    auto b = level(4800, 1.0f);
+    CHECK(tx.Write(b.data(), b.size(), 1000000) == b.size());
+    tx.EndBurst();
+    CHECK(tx.WaitDrained(2000000));
+    CHECK(tx.IsDrained());
+    CHECK(tx.GetStats().samplesSent == 4800);
+    tx.Stop();
+}
+
+// Back-to-back short bursts, each closed by EndBurst(), never count an underflow.
+void testBurstEndsNoUnderflow() {
+    SoapyRPITX_IQ_dmaSync tx(baseConfig());
+    MockDmaEngine engine(14, kRate);
+    tx.Start();
+    for (int i = 0; i < 15; i++) {
+        auto b = level(480, 1.0f);
+        CHECK(tx.Write(b.data(), b.size(), 1000000) == b.size());
+        tx.EndBurst();
+        CHECK(tx.WaitDrained(1000000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    CHECK(tx.GetStats().underflows == 0);
+    tx.Stop();
+}
+
+// EMMC fed by PLLC_PER is moved to PLLD_PER at the same rate; on another source it is left alone.
+void testEmmcMovedAtSameRate() {
+    const uint32_t savedCtl = MockPeek(CLK_BASE, EMMCCLK_CNTL);
+    const uint32_t savedDiv = MockPeek(CLK_BASE, EMMCCLK_DIV);
+    volatile uint32_t *cm = MockRegisters(CLK_BASE);
+
+    MockPoke(CLK_BASE, EMMCCLK_CNTL, CM_ENAB | 5);
+    MockPoke(CLK_BASE, EMMCCLK_DIV, 8u << 12);
+    const double fc = (double) cm_pll_frequency(cm, clk_pllc, 19200000, false, 0);
+    const double fd = (double) cm_pll_frequency(cm, clk_plld, 19200000, false, 0);
+    CHECK(fc > 0 && fd > 0);
+    const uint32_t expected = (uint32_t) std::floor(8.0 * fd / fc + 0.5) << 12; // MASH 0: integer divider
+    {
+        SoapyRPITX_IQ_dmaSync tx(baseConfig());
+        CHECK((MockPeek(CLK_BASE, EMMCCLK_CNTL) & CM_SRC_MASK) == 6);
+        CHECK((MockPeek(CLK_BASE, EMMCCLK_CNTL) & CM_ENAB) != 0);
+        CHECK((MockPeek(CLK_BASE, EMMCCLK_DIV) & 0xFFFFFF) == expected);
+    }
+    // The clock tree restore puts it back on PLLC_PER with its divider.
+    CHECK((MockPeek(CLK_BASE, EMMCCLK_CNTL) & CM_SRC_MASK) == 5);
+    CHECK((MockPeek(CLK_BASE, EMMCCLK_DIV) & 0xFFFFFF) == (8u << 12));
+
+    MockPoke(CLK_BASE, EMMCCLK_CNTL, CM_ENAB | 1);
+    MockPoke(CLK_BASE, EMMCCLK_DIV, 2u << 12);
+    {
+        SoapyRPITX_IQ_dmaSync tx(baseConfig());
+        CHECK((MockPeek(CLK_BASE, EMMCCLK_CNTL) & CM_SRC_MASK) == 1);
+        CHECK((MockPeek(CLK_BASE, EMMCCLK_DIV) & 0xFFFFFF) == (2u << 12));
+    }
+    MockPoke(CLK_BASE, EMMCCLK_CNTL, savedCtl);
+    MockPoke(CLK_BASE, EMMCCLK_DIV, savedDiv);
+}
+
+// The PLLC client scan reads the right generators.
+void testPllcClients() {
+    volatile uint32_t *cm = MockRegisters(CLK_BASE);
+    const unsigned regs[] = {CM_TCNTCTL / 4, CM_TECCTL / 4, CM_TD0CTL / 4, CM_TD1CTL / 4, CM_DSI1ECTL / 4};
+    for (unsigned r : regs)
+        MockPoke(CLK_BASE, r, 0);
+    MockPoke(CLK_BASE, CM_TD1CTL / 4, CM_ENAB | 5);
+    MockPoke(CLK_BASE, CM_DSI1ECTL / 4, CM_ENAB | 5);
+    MockPoke(CLK_BASE, CM_TCNTCTL / 4, CM_ENAB | 5); // the test counter is not a clock generator
+    std::vector<std::string> c = cm_pllc_clients(cm, false);
+    auto has = [&](const char *n) { return std::find(c.begin(), c.end(), std::string(n)) != c.end(); };
+    CHECK(has("TD1") && has("DSI1E"));
+    CHECK(!has("TEC") && !has("TD0"));
+    for (unsigned r : regs)
+        MockPoke(CLK_BASE, r, 0);
+}
+
+// PLL feasibility without hardware.
+void testPllCanProduce() {
+    CHECK(SoapyRPITX_PllCanProduce(144.8e6, 1, kRate, false));
+    CHECK(SoapyRPITX_PllCanProduce(432.1e6, 3, kRate, false));
+    CHECK(SoapyRPITX_PllCanProduce(1000e6, 1, kRate, true));
+    CHECK(!SoapyRPITX_PllCanProduce(5e9, 1, kRate, false));
+    CHECK(!SoapyRPITX_PllCanProduce(2.1e9, 1, kRate, true));
+    CHECK(!SoapyRPITX_PllCanProduce(10e3, 1, kRate, false));
+    CHECK(!SoapyRPITX_PllCanProduce(144.8e6, 0, kRate, false));
+    CHECK(!SoapyRPITX_PllCanProduce(0, 1, kRate, false));
+}
+
 int main() {
     testStreaming();
     testShortBurstStarts();
@@ -1227,6 +1347,11 @@ int main() {
     testRecoveryKeepsForeignDma();
     testIncompleteRecordKeepsMemory();
     testDeviceTreeStatus();
+    testStopWhileProducerBlocked();
+    testBurstEndsNoUnderflow();
+    testEmmcMovedAtSameRate();
+    testPllcClients();
+    testPllCanProduce();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

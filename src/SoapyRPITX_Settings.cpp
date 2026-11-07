@@ -58,7 +58,7 @@ const char *const kSettingKeys[] = {"ppm",
                                     "eer_idle",
                                     "eer_drive"};
 // Transmit/receive switching keys, accepted as device arguments, settings and profile lines.
-const char *const kPttKeys[] = {"relay_gpio", "relay_active_low", "relay_tx_delay_ms", "relay_hang_ms", "rx_mute_tx"};
+const char *const kPttKeys[] = {"relay_gpio", "relay_active_low", "relay_tx_delay_ms", "relay_hang_ms", "rx_mute_tx", "rx_mute_tail_ms"};
 // Device arguments produced by enumeration and by SoapySDR itself; they are not settings.
 const char *const kIdentificationKeys[] = {"driver", "label", "product", "serial", "manufacturer", "tuner", "type"};
 
@@ -172,6 +172,7 @@ constexpr double kDegree = M_PI / 180.0;
 struct PttPending {
     SoapyRPITX_RelayConfig relay;
     bool muteTx = true;
+    uint32_t muteTailMs = RPITX_RX_MUTE_DEFAULT_TAIL_MS;
     bool touched = false;
 };
 
@@ -196,6 +197,11 @@ void parsePttSetting(const std::string &key, const std::string &value, PttPendin
         p.relay.hangMs = (uint32_t) v;
     } else if (key == "rx_mute_tx") {
         p.muteTx = parseBool(key, value);
+    } else if (key == "rx_mute_tail_ms") {
+        long v = parseInt(key, value);
+        if (v < 0 || v > RPITX_RX_MUTE_MAX_TAIL_MS)
+            throw std::runtime_error("rpitx: rx_mute_tail_ms out of range [0, " + std::to_string(RPITX_RX_MUTE_MAX_TAIL_MS) + "]");
+        p.muteTailMs = (uint32_t) v;
     } else {
         throw std::runtime_error("rpitx: unknown setting '" + key + "'");
     }
@@ -236,6 +242,7 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
     PttPending pending;
     pending.relay = ptt->GetConfig();
     pending.muteTx = rxMuteTx.load();
+    pending.muteTailMs = rxMuteTailMs.load();
     for (const char *key : kPttKeys) {
         auto it = args.find(key);
         if (it != args.end())
@@ -243,7 +250,7 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
     }
     if (pending.touched) {
         std::lock_guard<std::mutex> lock(device_mutex);
-        ApplyPttLocked(pending.relay, pending.muteTx, false);
+        ApplyPttLocked(pending.relay, pending.muteTx, pending.muteTailMs, false);
     }
 
     auto profile = args.find("profile");
@@ -453,6 +460,12 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     setArgs.push_back(relayHang);
     setArgs.push_back(makeArg("rx_mute_tx", "true", "Mute RX while keyed", "Replace the receive samples with silence while the transmitter is keyed.",
                               SoapySDR::ArgInfo::BOOL));
+    SoapySDR::ArgInfo muteTail = makeArg("rx_mute_tail_ms", std::to_string(RPITX_RX_MUTE_DEFAULT_TAIL_MS).c_str(), "RX mute tail",
+                                         "Time the receive samples stay muted after the transmitter was unkeyed, covering the buffering latency of the "
+                                         "receiver (rx_mute_tx).",
+                                         SoapySDR::ArgInfo::INT, "ms");
+    muteTail.range = SoapySDR::Range(0, RPITX_RX_MUTE_MAX_TAIL_MS, 1);
+    setArgs.push_back(muteTail);
 
     if (rxDev) {
         for (SoapySDR::ArgInfo a : rxDev->getSettingInfo()) {
@@ -524,9 +537,11 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
     pending.driveLevel = driveLevel;
     const SoapyRPITX_RelayConfig previousRelay = ptt->GetConfig();
     const bool previousMute = rxMuteTx.load();
+    const uint32_t previousTail = rxMuteTailMs.load();
     PttPending pendingPtt;
     pendingPtt.relay = previousRelay;
     pendingPtt.muteTx = previousMute;
+    pendingPtt.muteTailMs = previousTail;
 
     try {
         for (const auto &kv : p.settings) {
@@ -552,7 +567,7 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
         }
         ValidateSettings(pending);
         if (pendingPtt.touched)
-            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, true);
+            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, pendingPtt.muteTailMs, true);
 
         // Dry run of the stream arguments with the parsers of setupStream().
         SoapyRPITX_TxConfig cfg;
@@ -562,13 +577,13 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
 
         // Phase 2: apply once; the switching settings are restored when the other settings are refused.
         if (pendingPtt.touched)
-            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, false);
+            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, pendingPtt.muteTailMs, false);
         try {
             ApplySettings(pending);
         } catch (...) {
             if (pendingPtt.touched) {
                 try {
-                    ApplyPttLocked(previousRelay, previousMute, false);
+                    ApplyPttLocked(previousRelay, previousMute, previousTail, false);
                 } catch (const std::exception &restore) {
                     SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: could not restore the antenna relay settings: %s", restore.what());
                 }
@@ -723,17 +738,20 @@ void SoapyRPITX::ApplySettings(const PendingSettings &pending) {
     }
 }
 
-void SoapyRPITX::ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, bool dryRun) {
+void SoapyRPITX::ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, uint32_t muteTailMs, bool dryRun) {
     std::string why = SoapyRPITX_CheckRelayConfig(relay);
     if (!why.empty())
         throw std::runtime_error("rpitx: " + why);
     const SoapyRPITX_RelayConfig current = ptt->GetConfig();
     if (tx_stream && (relay.gpio != current.gpio || relay.activeLow != current.activeLow))
         throw std::runtime_error("rpitx: relay_gpio and relay_active_low cannot change while a TX stream is open");
+    if (muteTailMs > RPITX_RX_MUTE_MAX_TAIL_MS)
+        throw std::runtime_error("rpitx: rx_mute_tail_ms out of range [0, " + std::to_string(RPITX_RX_MUTE_MAX_TAIL_MS) + "]");
     if (dryRun)
         return;
     ptt->Configure(relay);
     rxMuteTx.store(muteTx);
+    rxMuteTailMs.store(muteTailMs);
 }
 
 void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) {
@@ -752,8 +770,9 @@ void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) 
         PttPending p;
         p.relay = ptt->GetConfig();
         p.muteTx = rxMuteTx.load();
+        p.muteTailMs = rxMuteTailMs.load();
         parsePttSetting(key, value, p);
-        ApplyPttLocked(p.relay, p.muteTx, false);
+        ApplyPttLocked(p.relay, p.muteTx, p.muteTailMs, false);
         return;
     }
 
@@ -794,6 +813,8 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
             return std::to_string(r.txDelayMs);
         if (key == "relay_hang_ms")
             return std::to_string(r.hangMs);
+        if (key == "rx_mute_tail_ms")
+            return std::to_string(rxMuteTailMs.load());
         return rxMuteTx.load() ? "true" : "false";
     }
 
@@ -868,6 +889,11 @@ void SoapyRPITX::SetPpmLocked(double ppm) {
 }
 
 void SoapyRPITX::ApplyTune(const SoapyRPITX_TuneConfig &t) {
+    // Without a stream the PLL is checked here, so that an unreachable configuration is refused when it is set
+    // rather than by a later setupStream() (the stream checks the slot rate and the pacing clock again).
+    if (!tx_stream && !SoapyRPITX_PllCanProduce(t.frequency, t.harmonic, t.sampleRate, pi4))
+        throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) + " Hz with harmonic " + std::to_string(t.harmonic) + " at " +
+                                 std::to_string(t.sampleRate) + " S/s");
     if (tx_stream) {
         SoapyRPITX_RetuneResult r = tx_stream->transmitter().Retune(t);
         switch (r) {

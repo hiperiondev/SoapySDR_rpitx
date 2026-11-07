@@ -42,6 +42,10 @@ class generalgpio;
 #define RPITX_RELAY_MAX_DELAY_MS 1000
 /** @brief Longest accepted relay hang time, in milliseconds. */
 #define RPITX_RELAY_MAX_HANG_MS 10000
+/** @brief Longest accepted receive mute tail after unkeying, in milliseconds. */
+#define RPITX_RX_MUTE_MAX_TAIL_MS 10000
+/** @brief Default receive mute tail after unkeying, in milliseconds. */
+#define RPITX_RX_MUTE_DEFAULT_TAIL_MS 50
 
 /**
  * @brief Antenna relay (T/R switch) configuration.
@@ -73,6 +77,11 @@ std::string SoapyRPITX_CheckRelayConfig(const SoapyRPITX_RelayConfig &cfg);
  * set to output only by Configure(), which the device calls while no TX stream exists: the transmitter samples
  * the GPFSEL registers when it starts and rewrites them from DMA, so the pin function must not change while it
  * runs. Destroying the object leaves the pin driving the RX position.
+ *
+ * Unkeying needs a drain state that was observed after the last write began: every BeginWrite() advances a write
+ * sequence number, the supervisor reads it with WriteSeq() before it evaluates the drain state, and Poll() keeps the
+ * transmitter keyed when a write began in between. Samples queued by such a write are therefore never played with
+ * the relay in the RX position, whatever the hang time.
  *
  * Thread model: every method is thread-safe. BeginWrite() / EndWrite() are called by the producer around each
  * write, Poll() by the supervisor thread of the TX stream, Release() after the transmitter was stopped.
@@ -121,10 +130,25 @@ public:
     void EndWrite();
 
     /**
-     * @brief Advances the unkeying timer (supervisor thread, about every millisecond).
-     * @param drained True when every queued sample has been played or the transmitter is stopped.
+     * @brief Returns the write sequence number.
+     *
+     * The number advances on every BeginWrite(). The supervisor reads it before it evaluates the drain state passed
+     * to Poll().
+     *
+     * @return Number of writes registered so far.
      */
-    void Poll(bool drained);
+    uint64_t WriteSeq() const;
+
+    /**
+     * @brief Advances the unkeying timer (supervisor thread, about every millisecond).
+     *
+     * The transmitter is unkeyed only when no write began since @p writeSeq was read, no write is in progress, the
+     * transmitter is drained and @ref SoapyRPITX_RelayConfig::hangMs has elapsed since the last activity.
+     *
+     * @param writeSeq Value of WriteSeq() read before @p drained was evaluated.
+     * @param drained  True when every queued sample has been played or the transmitter is stopped.
+     */
+    void Poll(uint64_t writeSeq, bool drained);
 
     /** @brief Unkeys at once (the transmitter has been stopped, so the carrier is already off). */
     void Release();
@@ -134,6 +158,18 @@ public:
      * @return True while keyed.
      */
     bool IsKeyed() const;
+
+    /**
+     * @brief Tells whether received samples must be muted now.
+     *
+     * Receivers deliver samples some time after they were captured; samples captured at the end of a transmission
+     * can still be read after the unkeying. The receive path stays muted for @p tailMs after the transmitter was
+     * unkeyed to cover that latency.
+     *
+     * @param tailMs Time after the unkeying during which samples are still muted, in milliseconds.
+     * @return True while keyed and during the @p tailMs that follow the last unkeying.
+     */
+    bool MutedNow(uint32_t tailMs) const;
 
     /**
      * @brief Returns how many times the transmitter has been keyed.
@@ -157,11 +193,16 @@ private:
      */
     void WriteLevel(int pin, bool level);
 
+    /** @brief Unkeys and records the unkeying time (mutex held); drives the relay pin to RX when configured. */
+    void UnkeyLocked();
+
     mutable std::mutex mutex;          ///< Protects every member below except the atomics.
     SoapyRPITX_RelayConfig cfg;        ///< Configuration in effect.
     std::unique_ptr<generalgpio> gpio; ///< GPIO block, mapped while a relay is configured.
     std::atomic<bool> keyed{false};    ///< Transmitter keyed.
     std::atomic<uint64_t> keyCount{0}; ///< Times the transmitter was keyed.
+    std::atomic<uint64_t> writeSeq{0}; ///< Writes registered by BeginWrite() so far.
+    std::atomic<int64_t> unkeyedAtNs;  ///< Steady-clock time of the last unkeying in nanoseconds (far past when never keyed).
     int writers = 0;                   ///< Writes registered by BeginWrite() and not yet ended.
     clock::time_point lastBusy;        ///< Last time a write ended or the transmitter was not drained.
 };

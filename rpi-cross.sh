@@ -60,6 +60,7 @@ PI_PACKAGES=${RPI_PI_PACKAGES:-}  # extra apt packages to install on the Pi befo
 PI_PASSWORD=${RPI_PI_PASSWORD:-}  # password of the Pi user (used for sudo on the Pi, and for ssh login if sshpass exists)
 unset RPI_PI_PASSWORD             # the build tools started by this script do not inherit the password
 ASK_PASS=0                        # 1 = prompt for the Pi password
+ASKPASS_LIFETIME_S=10800          # the sudo helper on the Pi deletes itself after this time (3 h) whatever happens here
 PREFIX=${RPI_PREFIX:-}            # toolchain prefix, e.g. aarch64-linux-gnu-
 TOOLCHAIN_DIR=${RPI_TOOLCHAIN_DIR:-}
 PROJECT_DIR=$PWD
@@ -539,8 +540,10 @@ ssh_with_password() {    # sshpass -e reads SSHPASS, which is set for this one c
 make_remote_askpass() {   # temporary SUDO_ASKPASS helper on the Pi (mode 700, in RAM, removed on exit)
   local pw=${PI_PASSWORD//\'/\'\\\'\'}     # single-quote escaping; sent via stdin, never on a command line
   # The helper holds the password in clear, so it is created on a tmpfs (the user's runtime dir or /dev/shm),
-  # never on the SD card.
-  REMOTE_ASKPASS=$("${SSH[@]}" "$RPI_HOST" 'umask 077; f=$(mktemp -p "${XDG_RUNTIME_DIR:-/dev/shm}") && chmod 700 "$f" && cat >"$f" && printf %s "$f"' \
+  # never on the SD card. A detached timer on the Pi deletes it after ASKPASS_LIFETIME_S seconds even when this
+  # script is killed (SIGKILL, lost connection) before cleanup_ssh runs.
+  REMOTE_ASKPASS=$("${SSH[@]}" "$RPI_HOST" 'umask 077; f=$(mktemp -p "${XDG_RUNTIME_DIR:-/dev/shm}") && chmod 700 "$f" && cat >"$f" &&
+    { nohup sh -c "sleep '"$ASKPASS_LIFETIME_S"'; rm -f \"$f\"" </dev/null >/dev/null 2>&1 & } && printf %s "$f"' \
     <<<"#!/bin/sh
 printf '%s\n' '$pw'") || die "could not prepare the sudo helper on $RPI_HOST"
   [[ -n $REMOTE_ASKPASS ]] || die "could not prepare the sudo helper on $RPI_HOST"
@@ -576,6 +579,10 @@ pi_connect() {
     note "(sshpass not installed: the SSH login itself will be asked interactively; the password is used for sudo only)"
   setup_ssh
   trap cleanup_ssh EXIT
+  # Interrupting signals end the script through exit, so that the EXIT trap removes the helper and the sockets.
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 pi_check_arch() {         # the Pi's userland must match the selected -b

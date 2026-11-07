@@ -1396,6 +1396,7 @@ class Bridge:
             self.tcp_listen.listen(2)
         self.tcp_clients = {}  # socket -> (address, receive buffer, HostLink), oldest first
         self.refused_hosts = set()  # addresses already reported as refused by --allow
+        self.udp_errors = set()  # errno values of UDP receive errors already reported
         self.takeover_refused = set()  # addresses already reported as refused a start while another host streams
 
         self.link = None
@@ -1979,7 +1980,15 @@ class Bridge:
                 ready, _, _ = select.select(rlist, [], [], 0.1)
                 for sock in ready:
                     if sock is self.udp:
-                        data, addr = self.udp.recvfrom(2048)
+                        try:
+                            data, addr = self.udp.recvfrom(2048)
+                        except OSError as e:
+                            # A transient socket error (ENOBUFS, an ICMP error reported on the socket, ...) must not
+                            # stop the radio: reported once per error number, then the loop goes on.
+                            if e.errno not in self.udp_errors:
+                                self.udp_errors.add(e.errno)
+                                print("UDP receive error: %s (continuing)" % e, file=sys.stderr)
+                            continue
                         if len(data) >= 3 and data[0] == 0xEF and data[1] == 0xFE and self._allowed(addr):
                             link = self.link if self.link is not None and not self.link.is_tcp and self.link.addr == addr else None
                             self.handle_command(data, link or HostLink(udp_sock=self.udp, addr=addr))

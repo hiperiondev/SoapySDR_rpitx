@@ -123,7 +123,7 @@ reales.
 | **Portadora desde la cual 200 kHz siempre caben en un paso del PLL** | unos 2,8 MHz | unos 2,8 MHz | unos 2,8 MHz | unos **1,1 MHz** | — |
 | **Canales DMA utilizables** | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | 0–14 (auto: 14 … 5) | **0–10** (auto: 7, 8, 9, 10, 6, 5); 11–14 son DMA4 | — |
 | **Alias de memoria de VideoCore** | `0x40000000` (L1 sin asignación) | `0xC0000000` (directo) | `0xC0000000` (directo) | `0xC0000000` (directo) | — |
-| **Relojes sacados de PLLC** | VPU, EMMC | VPU, EMMC | VPU, EMMC | VPU, EMMC, **EMMC2** (tarjeta SD, divisor recalculado) | — |
+| **Relojes sacados de PLLC** | VPU, EMMC (divisor recalculado) | VPU, EMMC (divisor recalculado) | VPU, EMMC (divisor recalculado) | VPU, EMMC, **EMMC2** (tarjeta SD; divisores recalculados) | — |
 | **Núcleos de CPU** | **1** (ARMv6) | 4 | 4 | 4 | — |
 | **Hilo alimentador (SCHED_FIFO, 1 ms)** | Comparte el único núcleo con la aplicación: `preroll_ms` / `fifo_ms` mayores, aplicaciones livianas | Se puede fijar (`cpu=3`, `isolcpus=3`) | Se puede fijar | Se puede fijar | — |
 | **Receptor USB local (autotune)** | Avisa (`--rx-local-policy`) | Avisa | Avisa | Sin aviso | — |
@@ -271,6 +271,10 @@ de un minuto.
 
 Si SoapySDR se compiló desde el código fuente en `/usr/local`, configure con `-DCMAKE_INSTALL_PREFIX=/usr/local`.
 
+Un archivo de fuentes con solo los archivos confirmados (sin árboles de compilación, bytecode ni archivos de toolchain
+locales) se genera con `cmake --build build --target dist` (requiere un checkout de git); se escribe como
+`build/SoapySDR_rpitx-<versión>.zip`.
+
 ### Opciones de CMake
 
 | Opción | Por defecto | Descripción |
@@ -310,7 +314,10 @@ toolchain de CMake y verifica el resultado.
   `/usr/share/pkgconfig`, `/usr/local` y `/lib` desde la Pi a `~/rpi-sysroot/<arch>` y convierte en relativos los
   enlaces simbólicos absolutos. `--pi-packages` instala antes paquetes en la Pi; `libsoapysdr-dev` es obligatorio.
   `--ask-pass` permite al script usar `sudo` en la Pi para leer archivos solo legibles por root (el ayudante que
-  contiene la contraseña se crea en un tmpfs y se elimina después).
+  contiene la contraseña se crea en un tmpfs y se elimina después, también cuando el script se interrumpe; un
+  temporizador en la Pi lo borra a las 3 horas aunque el script muera o se corte la conexión). `--pi-password` también
+  funciona, pero deja la contraseña en `ps` y en el historial del shell (el script lo advierte); prefiera
+  `--ask-pass` o `RPI_PI_PASSWORD`.
 - Pi 1 / Zero / CM1 son ARMv6: los compiladores armhf de Fedora y de Debian/Ubuntu generan código ARMv7. Use un toolchain compatible con
   ARMv6 (por ejemplo un toolchain glibc `armv6-eabihf` de Bootlin) con `--toolchain-dir <dir> --prefix arm-linux-`.
 - Los compiladores cruzados `gcc-<arch>-linux-gnu` de Fedora están pensados para compilar kernels y no incluyen
@@ -477,14 +484,18 @@ prefijo `rx.`, junto a `rx_driver` y `rx_hardware`. `rx=rpitx` se rechaza.
 cuando todas las muestras encoladas se reprodujeron y no se escribió nada durante `relay_hang_ms`, o de inmediato
 cuando el stream TX se desactiva o se cierra. Mientras está activado el sensor `ptt` lee `true` y — con
 `rx_mute_tx=true`, el valor por defecto — las muestras recibidas se reemplazan por silencio (ceros, media escala
-para formatos sin signo; los flags y las marcas de tiempo se conservan), de modo que una aplicación puede mantener
-ambos streams en marcha como con cualquier transceptor.
+para formatos sin signo, incluidos los empaquetados `CS4`/`CS12`/`CU4`/`CU12`; los flags y las marcas de tiempo se
+conservan), de modo que una aplicación puede mantener ambos streams en marcha como con cualquier transceptor. El
+receptor entrega sus muestras algo después de capturarlas (búferes USB), así que el silencio dura `rx_mute_tail_ms`
+(50 ms por defecto) más tras la desactivación; auméntelo si el final de una transmisión todavía se cuela en la señal
+recibida.
 
 **Relé de antena.** Con `relay_gpio=<n>` el driver maneja ese GPIO como salida: posición RX al abrir, posición TX
 cuando el transmisor se activa, de vuelta a RX cuando se desactiva y al cerrar el dispositivo (el pin queda como
 salida en posición RX). El primer `writeStream()` de una transmisión conmuta el relé y espera `relay_tx_delay_ms`
 antes de encolar cualquiera de sus muestras, así ninguna RF llega a los contactos en movimiento (la espera no cuenta
-en `timeoutUs`). `relay_active_low=true` es para módulos de relé con entrada activa en bajo. El pin se maneja con los
+en `timeoutUs`; desactivar o cerrar el stream la termina de inmediato, y la escritura devuelve entonces
+`SOAPY_SDR_STREAM_ERROR`). `relay_active_low=true` es para módulos de relé con entrada activa en bajo. El pin se maneja con los
 registros GPSET/GPCLR, que el DMA del transmisor nunca toca; su función se fija mientras no existe un stream TX, por
 lo que `relay_gpio` y `relay_active_low` no pueden cambiar con un stream TX abierto (los tiempos sí). Se aceptan
 GPIO2–27 salvo GPIO4, y un stream TX que usaría el pin del relé (`rf_dac` en GPIO20, `envelope_output=pcm` en
@@ -501,7 +512,8 @@ GPIO18/19/21, `pwm` en `pwm_gpio`) se rechaza.
   `LONG_MAX` sirve para "esperar indefinidamente".
 - `writeStream()` se bloquea mientras la FIFO está llena, respeta `timeoutUs`, puede aceptar menos muestras de las
   ofrecidas (el valor de retorno es la cantidad consumida) y devuelve `SOAPY_SDR_TIMEOUT` cuando no pudo encolar nada
-  a tiempo. `SOAPY_SDR_HAS_TIME` no está soportado (`SOAPY_SDR_NOT_SUPPORTED`). La MTU es `min(4096, max(FIFO/4, 256))`.
+  a tiempo. Una escritura bloqueada cuando el stream se desactiva retorna de inmediato; no se encola ninguna muestra
+  después, y ninguna de sus muestras llega a una activación posterior. `SOAPY_SDR_HAS_TIME` no está soportado (`SOAPY_SDR_NOT_SUPPORTED`). La MTU es `min(4096, max(FIFO/4, 256))`.
 - `SOAPY_SDR_END_BURST` en la última escritura (o en una escritura de longitud cero) marca el fin de la ráfaga: el DMA
   arranca de inmediato aunque no se haya alcanzado el pre-roll, y tras la última muestra la portadora queda apagada.
 - `activateStream()` sobre un stream activo no tiene efecto (los contadores siguen, no se informa ningún evento).
@@ -514,7 +526,13 @@ GPIO18/19/21, `pwm` en `pwm_gpio`) se rechaza.
   enseguida. Un `writeStream()` o `readStreamStatus()` en otro hilo se despierta y retorna antes de destruir el stream
   (las llamadas en curso se cuentan y `closeStream()` las espera), así que cerrar durante un apagado es seguro.
 - `readStreamStatus()` devuelve `SOAPY_SDR_UNDERFLOW` (máscara de canal 1) una vez por cada nuevo vaciado de la FIFO
-  dentro de una ráfaga, overrun del DMA o reinicio del DMA; si no, `SOAPY_SDR_TIMEOUT`.
+  dentro de una ráfaga, overrun del DMA o reinicio del DMA; si no, `SOAPY_SDR_TIMEOUT`; con varios hilos consultando,
+  cada evento se informa a uno solo de ellos. Las ráfagas consecutivas cerradas cada una con `END_BURST` nunca cuentan
+  como vaciado.
+- `readStream()` / `readStreamStatus()` de RX llaman al receptor con tiempos de espera de 100 ms como máximo hasta
+  agotar `timeoutUs`, así que `closeStream()` nunca espera más que eso por una lectura en curso.
+- Sin stream TX, la frecuencia, la frecuencia de muestreo, los ppm y la armónica se verifican contra el PLL de la
+  portadora al fijarlos (una combinación inalcanzable se rechaza de inmediato, no en un `setupStream()` posterior).
 - La frecuencia, la frecuencia de muestreo, los ppm y la armónica pueden cambiar durante la transmisión: el
   alimentador detiene el DMA, apaga la portadora, reprograma el PLL y el reloj de cadencia y reanuda con las muestras
   que ya estaban en el anillo DMA (ninguna se pierde; como mucho una se envía dos veces), seguidas por la FIFO. Las
@@ -571,6 +589,7 @@ posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo rea
 | `relay_tx_delay_ms` | 20 | Tiempo de asentamiento del relé antes de encolar la primera muestra de una transmisión, 0 – 1000 ms |
 | `relay_hang_ms` | 100 | Tiempo que el transmisor sigue activado (relé en TX, receptor silenciado) tras reproducirse la última muestra, 0 – 10000 ms |
 | `rx_mute_tx` | true | Reemplazar las muestras recibidas por silencio mientras el transmisor está activado |
+| `rx_mute_tail_ms` | 50 | Tiempo que las muestras recibidas siguen silenciadas tras la desactivación (latencia de los búferes del receptor), 0 – 10000 ms |
 | `rx.<clave>` | — | Un ajuste del receptor (solo con `rx=<driver>`), por ejemplo `rx.direct_samp` |
 
 Solo como argumentos de dispositivo: `rx=<driver>` agrega un receptor, `rx.<clave>=<valor>` se le pasa (véase
@@ -602,8 +621,8 @@ gain=7
 - Las líneas `stream.<clave>` pasan a ser los valores por defecto de `setupStream()`; los argumentos que pasa la
   aplicación tienen prioridad.
 - `gain` fija la ganancia PAD (0–7).
-- También se aceptan las claves del relé (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`) y
-  `rx_mute_tx`; `rx` y `rx.*` son argumentos de dispositivo y no se leen de un perfil.
+- También se aceptan las claves del relé (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`),
+  `rx_mute_tx` y `rx_mute_tail_ms`; `rx` y `rx.*` son argumentos de dispositivo y no se leen de un perfil.
 - Las líneas vacías y las que empiezan con `#` se ignoran, las claves desconocidas se informan con una advertencia y se
   ignoran, una línea sin `=` es un error, y una línea posterior reemplaza a una anterior con la misma clave.
 - `readSetting("profile")` devuelve el último archivo cargado; `writeSetting("profile", "")` olvida sus valores por
@@ -612,6 +631,11 @@ gain=7
   o más estricto); no se siguen enlaces simbólicos, y los dispositivos, tuberías y sockets se rechazan sin leerlos.
   El driver se ejecuta como root y el ajuste puede llegar desde un cliente remoto (SoapyRemote), así que no se abre
   nada más.
+- El archivo y todos los directorios de su ruta deben pertenecer a root o al usuario que ejecuta el driver; los
+  directorios no deben poder ser escritos por los demás (salvo con bit sticky). Cuando la aplicación se ejecuta como
+  root mediante `sudo`, también se aceptan archivos y directorios del usuario que ejecutó `sudo` (`SUDO_UID`), siempre
+  que ni el grupo ni los demás puedan escribirlos — así funciona
+  `sudo app profile=/home/pi/rpitx_autotune_results/profile_non_eer.rpitx`.
 
 ### Sensores
 
@@ -738,7 +762,11 @@ El directorio de salida (`--out`) contiene `profile_<path>.json` (entrada de `ve
 (archivo de perfil del driver, véase [Archivos de perfil](#archivos-de-perfil)), `profile_<path>.args`
 (argumentos del dispositivo, los ajustes de tablas a aplicar con `writeSetting()` — contienen comas y no pueden formar
 parte de una cadena de argumentos del dispositivo —, argumentos del stream y ganancias), `report.md`, `report.json`,
-`checkpoint.json` (para `--resume`) y `captures/` (`--save-captures fail|all`, para `replay`). Los umbrales por
+`checkpoint.json` (para `--resume`) y `captures/` (`--save-captures fail|all`, para `replay`). La herramienta se
+ejecuta como root, así que rechaza un directorio de salida que sea un enlace simbólico, pertenezca a otro usuario (se
+aceptan root, el usuario efectivo y el usuario que ejecutó `sudo`) o que el grupo o los demás puedan escribir; crea
+uno que falte con modo 0755, nunca escribe a través de un enlace simbólico y escribe los archivos JSON mediante un
+archivo temporal de nombre impredecible. Los umbrales por
 defecto están incorporados y son valores iniciales; se reemplazan con `--thresholds archivo.json`, por ejemplo
 `{"non_eer": {"qpsk": {"evm_db": -20}}, "global": {"freq_abs_hz": 2}}`.
 
@@ -778,7 +806,9 @@ Devuelve el hardware al reposo después de que muriera un proceso que usaba el d
 (ver [Recuperación tras una caída](#recuperación-tras-una-caída)); sin registro, apaga una salida de reloj que haya
 quedado en GPIO4 y detiene GPCLK0. `--dma-channel N` además reinicia el canal DMA N (se rechaza si pertenece al
 kernel, y también cuando la máscara de canales DMA del kernel no se puede leer del device tree, salvo que se indique
-`--force` para un canal que se sabe libre). Apto para `ExecStopPost=` en una unidad de systemd.
+`--force` para un canal que se sabe libre). Apto para `ExecStopPost=` en una unidad de systemd (por ejemplo
+`ExecStopPost=/usr/local/bin/rpitx_reset`), que además restaura el árbol de relojes tras un proceso terminado por una
+señal.
 
 ### `hpsdr_rpitx_bridge.py` — puente HPSDR Protocol 1
 
@@ -931,9 +961,9 @@ librpitx:
 1. Se guardan los registros del árbol de relojes que van a cambiar (`CORECLK_CNTL/DIV`, `EMMCCLK_CNTL/DIV`,
    `CM_GP0CTL/DIV`, `CM_PLLC`, `PLLC_CTRL/FRAC`, `PLLC_CORE0/1/2`, `PLLC_PER`, `A2W_PLLC_ANA0..3`; en BCM2711 también
    `EMMC2CLK_CNTL/DIV`) y se anotan en el archivo de sesión.
-2. El reloj del núcleo VPU se mueve a PLLA (divisor 4) y el reloj EMMC a PLLD, para que nada más dependa de PLLC.
-   En BCM2711 el generador EMMC2 (tarjeta SD) también pasa a PLLD_PER si estaba en PLLC_PER, recalculando el divisor
-   para conservar su frecuencia. Los generadores que sigan alimentados por PLLC (por ejemplo vía `PLLC_CORE1/2`) se
+2. El reloj del núcleo VPU se mueve a PLLA (divisor 4), para que no dependa de PLLC. El generador EMMC (host SD o
+   SDIO) y, en BCM2711, el generador EMMC2 (tarjeta SD) pasan a PLLD_PER si estaban en PLLC_PER, recalculando el
+   divisor para conservar su frecuencia; con cualquier otra fuente no se tocan. Los generadores que sigan alimentados por PLLC (por ejemplo vía `PLLC_CORE1/2`) se
    listan en un aviso.
 3. Se desactiva `PLLC_CORE0`, se habilita el canal de periféricos de PLLC con divisor 1 (2 en BCM2711) y GPCLK0 toma
    de él su fuente, con MASH 0 (divisor entero, sin espurias de modelado de ruido).
@@ -1071,8 +1101,9 @@ periodos del alimentador. Una petición que el PLL, el reloj de cadencia o el DA
 rechaza antes de reprogramar nada y deja vigente la configuración anterior (incluidas las correcciones del cristal).
 
 **Detección de vaciado:** el alimentador evalúa la condición de vaciado en un solo lugar al final de cada periodo
-(todas las muestras introducidas hasta ese momento consumidas de la FIFO, búfer de repetición vacío, última posición
-de datos completada) y publica el contador de muestras introducidas al que corresponde; `WaitDrained()` lo compara con
+(todas las muestras introducidas hasta ese momento consumidas de la FIFO — se comparan los contadores de inserción y
+extracción de la propia FIFO, así que ninguna instantánea puede quedar desactualizada —, búfer de repetición vacío,
+última posición de datos completada) y publica el contador de muestras introducidas al que corresponde; `WaitDrained()` lo compara con
 el contador actual. Un retune lo borra antes de reconstruir el anillo, de modo que nunca se informa una ráfaga como
 enviada mientras hay muestras en tránsito entre la FIFO, el búfer de repetición y el anillo.
 
@@ -1082,7 +1113,18 @@ enviada mientras hay muestras en tránsito entre la FIFO, el búfer de repetici�
 64 bits (acquire/release), de modo que el nivel de llenado es siempre `head − tail`. Su almacenamiento se reserva
 para `fifo_ms` a la frecuencia de muestreo máxima; la capacidad utilizable es `max(frecuencia·fifo_ms/1000, 1024)` y se
 actualiza en cada retune. Un productor bloqueado espera en una variable de condición en intervalos de 2 ms, y el
-alimentador lo despierta cuando libera espacio.
+alimentador lo despierta cuando libera espacio. Cada inserción se registra antes de que el productor compruebe que el
+transmisor está activo; `Stop()` espera las inserciones registradas antes de vaciar la FIFO, y una escritura nunca
+inserta en una activación posterior a aquella en la que empezó.
+
+El fin de ráfaga se guarda como el contador de inserciones en el momento de `END_BURST`: una ráfaga terminó cuando no
+se insertó nada después, así que una ráfaga nueva que empieza justo tras un `END_BURST` nunca se confunde con un
+vaciado de la anterior.
+
+**Higiene del hilo de tiempo real:** el alimentador (`SCHED_FIFO`) no reserva memoria en su camino de retune (los
+búferes de repetición se reservan al abrir), nunca libera un modelo de amplitud (los modelos reemplazados los libera
+el hilo de control cuando el alimentador ya no los usa) y no llama al logger de SoapySDR: sus mensajes van a una cola
+sin bloqueos que el stream TX imprime cada milisegundo (y que `Stop()` y el destructor vacían).
 
 ### Conmutación transmisión/recepción
 
@@ -1091,7 +1133,10 @@ cada escritura en él: la primera escritura tras un período inactivo activa el 
 del relé a la posición TX y espera `relay_tx_delay_ms` antes de empujar las muestras a la FIFO — el DMA solo ve datos
 que llegaron después de que el relé se asentó. Un hilo supervisor del stream TX consulta cada milisegundo si el
 transmisor se vació (el alimentador publica el contador de inserciones hasta el que todo se reprodujo, el mismo valor
-que usa `WaitDrained()`) y lo desactiva cuando lleva `relay_hang_ms` vacío y sin escrituras en curso. Desactivar,
+que usa `WaitDrained()`) y lo desactiva cuando lleva `relay_hang_ms` vacío y sin escrituras en curso. Cada escritura
+avanza un número de secuencia que el supervisor lee *antes* de evaluar el estado de vaciado; si una escritura empezó
+entre medio, el transmisor sigue activado. Así nunca se reproducen muestras con el relé en posición RX, ni siquiera
+con `relay_hang_ms=0`. El camino de recepción sigue silenciado `rx_mute_tail_ms` tras la desactivación. Desactivar,
 cerrar o destruir el stream detiene primero el transmisor (portadora apagada) y desactiva después. Como el DMA
 reescribe palabras GPFSEL0/GPFSEL2 completas con los valores tomados en `Start()`, el pin del relé se configura como
 salida antes de que exista un stream TX y su función nunca cambia con uno abierto; su nivel pasa por GPSET0/GPCLR0,
@@ -1117,7 +1162,14 @@ de cerrar el stream del receptor.
 - **Señales** (`signal_cleanup=true`): manejadores para SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL
   y SIGABRT. Cuando la disposición previa era la acción por defecto (el proceso está por morir) realizan escrituras de
   registros seguras en señales (reinicio del DMA, GPIO4 / GPIO20 a entrada, pads, GPCLK0 apagado, DAC de envolvente detenido), restauran la acción previa y
-  vuelven a lanzar la señal; las señales ignoradas y los manejadores de la aplicación pasan sin cambios.
+  vuelven a lanzar la señal; las señales ignoradas y los manejadores de la aplicación pasan sin cambios (un manejador
+  de la aplicación se ejecuta con su propia máscara de señales y, si se instaló con `SA_RESETHAND`, tras restaurar la
+  acción por defecto). El árbol de relojes no se puede restaurar desde un manejador de señales (requiere esperas y
+  enganches del PLL): la VPU queda en PLLA y PLLC conserva su última configuración hasta que la siguiente apertura del
+  driver recupera el registro, o hasta que se ejecuta `rpitx_reset` — use `ExecStopPost=/usr/local/bin/rpitx_reset`
+  en los servicios.
+- **Salida mientras otro hilo cierra el dispositivo:** el manejador de salida y el destructor del transmisor están
+  serializados, así que el destructor espera a una parada de emergencia en curso.
 
 #### Recuperación tras una caída
 
@@ -1190,13 +1242,16 @@ de hardware se convierte en un `std::runtime_error` que la aplicación recibe de
 | Portadora trabada tras una caída | `sudo rpitx_reset` (o abra cualquier stream): se recupera el registro de sesión |
 | "the PLLA peripheral channel is not running" | El firmware dejó PLLA apagado, así que el reloj de la VPU no puede salir de PLLC; la placa no puede transmitir con este driver |
 | "the transmitter thread did not respond within 3 s" | El hilo alimentador quedó sin CPU (¿otra tarea `SCHED_FIFO`?); el cambio no se aplicó, repítalo |
-| "not a regular file" / "writable by group or others" en un perfil | Use un archivo regular con modo 0644 (o más estricto) |
+| "not a regular file" / "writable by group or others" / "owned by another user" en un perfil | Use un archivo regular con modo 0644 (o más estricto), perteneciente a root, al usuario que ejecuta el driver o (con `sudo`) al usuario que ejecutó `sudo` |
+| "a directory of the path is owned by another user" / "writable by others" / "symbolic link" en un perfil | Todos los directorios de la ruta deben pertenecer a root o a ese usuario, no deben poder ser escritos por los demás (salvo con bit sticky) y no deben ser enlaces simbólicos: indique la ruta real. Con `sudo`, se aceptan los directorios del usuario que ejecutó `sudo` si ni el grupo ni los demás pueden escribirlos |
+| "output directory … is owned by another user" / "writable by group or others" (autotune) | Use un directorio `--out` propio (o de root) con modo 0755 o más estricto, que no sea un enlace simbólico |
 | Sin portadora en SSB con el puente HPSDR | Micrófono en silencio; vea las notas del puente más arriba |
 | "receiver driver 'rtlsdr' is not installed" | Instale el módulo SoapySDR del receptor (`soapysdr-module-rtlsdr`); `SoapySDRUtil --info` debe listar `rtlsdr` |
 | "cannot open the receiver 'rtlsdr'" | Falta el dongle, lo usa otro programa (rtl_tcp, dump1090…) o está cargado el driver DVB del kernel (ponga en la lista negra `dvb_usb_rtl28xxu`); revise `rx.serial` |
 | "GPIOn is the antenna relay (relay_gpio)" | El stream TX usa ese pin (`rf_dac`, `envelope_output`); mueva el relé a otro GPIO |
 | "relay_gpio and relay_active_low cannot change while a TX stream is open" | Cierre el stream TX, cambie el ajuste y vuelva a abrirlo |
-| Receptor mudo mientras se transmite | Es lo esperado con `rx_mute_tx=true` (puente: `--rx-during-tx` para mantenerlo) |
+| Receptor mudo mientras se transmite | Es lo esperado con `rx_mute_tx=true` (puente: `--rx-during-tx` para mantenerlo); sigue silenciado `rx_mute_tail_ms` tras la desactivación |
+| El final de la transmisión se oye en el receptor | El receptor acumula más que `rx_mute_tail_ms`: auméntelo (o `relay_hang_ms`) |
 
 ---
 
@@ -1215,12 +1270,13 @@ que sale de la FIFO).
 |--------|-------|
 | `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host, motor detenido sin vueltas atribuidas); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
 | `rpitx_devicetree_tests` | Base de periféricos, límite de canales DMA clásicos y máscara DMA del kernel con la nomenclatura antigua y la actual del device tree |
-| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM, máscara del kernel ilegible, marca final del registro, registro incompleto), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, nodos del device tree sin `status`, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta, repetición solo de las posiciones de datos (retune antes del arranque del DMA y tras un hueco inactivo), vaciado durante un retune concurrente, liberación registrada antes de liberar la memoria VideoCore |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores, archivos de perfil y `profile=`, comprobaciones de los archivos de perfil (dispositivos, tuberías, tamaño, permisos, enlaces simbólicos), enteros y ganancias fuera de rango, límites de los tiempos de espera; modo transceptor con un receptor simulado registrado por la prueba (apertura, reenvío de la API y los ajustes RX, streams RX/TX simultáneos, verificación de handles, entradas de enumeración, silenciado durante la transmisión en formatos con y sin signo); relé de antena sobre los registros GPIO simulados (validación, polaridad, liberación del pin, conflictos con streams TX, demora de activación, tiempo de retención, desactivación al desactivar/cerrar, pines de GPFSEL0 bajo el DMA, claves del relé en perfiles) |
+| `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM, máscara del kernel ilegible, marca final del registro, registro incompleto), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, nodos del device tree sin `status`, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta, repetición solo de las posiciones de datos (retune antes del arranque del DMA y tras un hueco inactivo), vaciado durante un retune concurrente, liberación registrada antes de liberar la memoria VideoCore, parada con un productor bloqueado (ninguna muestra llega a la activación siguiente, el vaciado se sigue detectando), ráfagas consecutivas sin falsos vaciados, canal PWM apagado hasta que arranca el DMA (también tras un retune con el transmisor detenido), EMMC pasado a PLLD a la misma frecuencia solo cuando está en PLLC, exploración de los clientes de PLLC, viabilidad del PLL sin hardware |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores, archivos de perfil y `profile=`, comprobaciones de los archivos de perfil (dispositivos, tuberías, tamaño, permisos, enlaces simbólicos), enteros y ganancias fuera de rango, límites de los tiempos de espera; modo transceptor con un receptor simulado registrado por la prueba (apertura, reenvío de la API y los ajustes RX, streams RX/TX simultáneos, verificación de handles, entradas de enumeración, silenciado durante la transmisión en formatos con y sin signo); relé de antena sobre los registros GPIO simulados (validación, polaridad, liberación del pin, conflictos con streams TX, demora de activación, tiempo de retención, desactivación al desactivar/cerrar, pines de GPFSEL0 bajo el DMA, claves del relé en perfiles); desactivación solo tras un vaciado observado después de que empezó la última escritura, cola de silencio, silencio en todos los formatos RX (incluidos los empaquetados), `closeStream()` que termina de inmediato una espera del relé y una lectura RX bloqueada (tiempos de espera del receptor por tramos), cada evento de estado informado una sola vez a consultas concurrentes, perfiles del usuario de `sudo` (ejecutando como root; si no, se omite) |
 
-La CI (`.github/workflows/ci.yml`) ejecuta las pruebas en una compilación normal, con AddressSanitizer +
+La CI (`.github/workflows/ci.yml`) ejecuta las pruebas con `-Werror` en una compilación normal, con AddressSanitizer +
 UndefinedBehaviorSanitizer y con ThreadSanitizer (`tests/tsan.supp` suprime solo los accesos a registros simulados),
-y verifica `clang-format`, `shellcheck` sobre `rpi-cross.sh` y `pyflakes` sobre las herramientas en Python.
+como root para que también corran las pruebas de propietarios, y verifica `clang-format`, `shellcheck` sobre
+`rpi-cross.sh`, `pyflakes` sobre las herramientas en Python y `rpitx_autotune.py self-test --quick`.
 
 `rpitx_autotune.py self-test` verifica el análisis y el optimizador de la herramienta de ajuste sobre un transmisor
 y un receptor simulados (sin radio, sin root): recuperación de frecuencia, reloj, distorsión y tasas de error

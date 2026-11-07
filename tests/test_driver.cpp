@@ -25,6 +25,7 @@
 #include <complex>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -40,6 +41,7 @@
 #include <SoapySDR/Registry.hpp>
 
 #include "SoapyRPITX.hpp"
+#include "SoapyRPITX_Ptt.hpp"
 #include "mock_hw.hpp"
 
 namespace {
@@ -118,12 +120,23 @@ public:
     size_t getStreamMTU(SoapySDR::Stream *) const {
         return 512;
     }
-    int readStream(SoapySDR::Stream *, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long) {
+    int readStream(SoapySDR::Stream *, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long timeoutUs) {
         if (!active)
             return SOAPY_SDR_STREAM_ERROR;
+        if (block) {
+            // No data: the call blocks for its whole timeout, as a receiver without samples does.
+            long seen = maxTimeoutUs.load();
+            while (timeoutUs > seen && !maxTimeoutUs.compare_exchange_weak(seen, timeoutUs)) {
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(std::max(0L, timeoutUs)));
+            return SOAPY_SDR_TIMEOUT;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         size_t n = std::min<size_t>(numElems, 256);
-        if (streamFormat == SOAPY_SDR_CS16) {
+        if (streamFormat != SOAPY_SDR_CS16 && streamFormat != SOAPY_SDR_CU8 && streamFormat != SOAPY_SDR_CF32) {
+            // Any other format (packed ones included): a recognisable byte pattern over the whole buffer.
+            memset(buffs[0], 0x5A, n * SoapySDR::formatToSize(streamFormat));
+        } else if (streamFormat == SOAPY_SDR_CS16) {
             int16_t *p = static_cast<int16_t *>(buffs[0]);
             for (size_t i = 0; i < 2 * n; i++)
                 p[i] = kRxValue;
@@ -207,11 +220,17 @@ public:
         return {a};
     }
     void writeSetting(const std::string &key, const std::string &value) {
+        if (key == "block") {
+            block = value == "1";
+            return;
+        }
         if (key != "direct_samp")
             throw std::runtime_error("unknown");
         directSamp = value;
     }
     std::string readSetting(const std::string &key) const {
+        if (key == "max_timeout_us")
+            return std::to_string(maxTimeoutUs.load());
         if (key != "direct_samp")
             throw std::runtime_error("unknown");
         return directSamp;
@@ -219,6 +238,8 @@ public:
 
     std::string streamFormat;
     std::atomic<bool> active{false};
+    std::atomic<bool> block{false};
+    std::atomic<long> maxTimeoutUs{0};
     int closed = 0;
     bool agc = false;
     double gain = 0, freq = 100e6, rate = 2.4e6, ppm = 0;
@@ -1088,8 +1109,12 @@ void testRelayLowBank() {
 
 void testReceiverMute() {
     for (bool mute : {true, false}) {
-        SoapyRPITX dev(SoapySDR::Kwargs{
-                {"rx", "rpitx_test_rx"}, {"relay_gpio", "17"}, {"relay_hang_ms", "20"}, {"relay_tx_delay_ms", "0"}, {"rx_mute_tx", mute ? "true" : "false"}});
+        SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"},
+                                        {"relay_gpio", "17"},
+                                        {"relay_hang_ms", "20"},
+                                        {"relay_tx_delay_ms", "0"},
+                                        {"rx_mute_tx", mute ? "true" : "false"},
+                                        {"rx_mute_tail_ms", "0"}});
         CHECK(dev.readSetting("rx_mute_tx") == (mute ? "true" : "false"));
         dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
         MockDmaEngine engine(14, kRate);
@@ -1148,6 +1173,259 @@ void testRelayProfile() {
     std::remove(path);
 }
 
+// The supervisor reads the write sequence before it evaluates the drain state: a write that began in between keeps
+// the transmitter keyed, even with no hang time.
+void testPttWriteSequence() {
+    SoapyRPITX_Ptt ptt;
+    SoapyRPITX_RelayConfig c;
+    c.gpio = -1;
+    c.hangMs = 0;
+    c.txDelayMs = 0;
+    ptt.Configure(c);
+
+    ptt.BeginWrite();
+    ptt.EndWrite();
+    const uint64_t seq = ptt.WriteSeq();
+    const bool drained = true; // evaluated by the supervisor after reading seq
+    ptt.BeginWrite();          // a second burst is queued meanwhile
+    ptt.EndWrite();
+    ptt.Poll(seq, drained);
+    CHECK(ptt.IsKeyed());
+
+    // With a fresh sequence and a drained transmitter it unkeys.
+    ptt.Poll(ptt.WriteSeq(), true);
+    CHECK(!ptt.IsKeyed());
+
+    // Mute tail: muted while keyed and for the tail after the unkeying.
+    ptt.BeginWrite();
+    ptt.EndWrite();
+    CHECK(ptt.MutedNow(0));
+    ptt.Release();
+    CHECK(!ptt.IsKeyed());
+    CHECK(!ptt.MutedNow(0));
+    CHECK(ptt.MutedNow(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    CHECK(!ptt.MutedNow(200));
+
+    // Never keyed: never muted.
+    SoapyRPITX_Ptt fresh;
+    CHECK(!fresh.MutedNow(RPITX_RX_MUTE_MAX_TAIL_MS));
+}
+
+// Samples stay muted for rx_mute_tail_ms after the unkeying.
+void testReceiverMuteTail() {
+    SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"relay_hang_ms", "0"}, {"rx_mute_tail_ms", "400"}});
+    CHECK(dev.readSetting("rx_mute_tail_ms") == "400");
+    CHECK(throws([&] { dev.writeSetting("rx_mute_tail_ms", "10001"); }));
+    CHECK(throws([&] { dev.writeSetting("rx_mute_tail_ms", "-1"); }));
+    CHECK(dev.readSetting("rx_mute_tail_ms") == "400");
+    bool listed = false;
+    for (const auto &a : dev.getSettingInfo())
+        listed = listed || (a.key == "rx_mute_tail_ms" && a.value == std::to_string(RPITX_RX_MUTE_DEFAULT_TAIL_MS));
+    CHECK(listed);
+
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+    SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(rx) == 0 && dev.activateStream(tx) == 0);
+    std::vector<std::complex<float>> buf(kRate / 20, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = SOAPY_SDR_END_BURST;
+    CHECK(dev.writeStream(tx, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(waitPtt(dev, false, 2000));
+    CHECK(readFirstI(dev, rx) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(readFirstI(dev, rx) == kRxValue);
+    dev.closeStream(tx);
+    dev.closeStream(rx);
+}
+
+// Every RX format is muted over the whole buffer, packed formats included.
+void testReceiverMutePackedFormats() {
+    struct Case {
+        const char *format;
+        std::vector<uint8_t> silence; // one complex element
+    };
+    const Case cases[] = {
+            {SOAPY_SDR_CS4, {0x00}},
+            {SOAPY_SDR_CS8, {0x00, 0x00}},
+            {SOAPY_SDR_CS12, {0x00, 0x00, 0x00}},
+            {SOAPY_SDR_CU4, {0x88}},
+            {SOAPY_SDR_CU12, {0x00, 0x08, 0x80}},
+            {SOAPY_SDR_CU16, {0x00, 0x80, 0x00, 0x80}},
+            {SOAPY_SDR_CF32, {0, 0, 0, 0, 0, 0, 0, 0}},
+    };
+    SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"relay_hang_ms", "5000"}});
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(tx) == 0);
+    std::vector<std::complex<float>> buf(480, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = 0;
+    CHECK(dev.writeStream(tx, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(dev.readSensor("ptt") == "true");
+
+    for (const Case &c : cases) {
+        const size_t elem = SoapySDR::formatToSize(c.format);
+        CHECK(elem == c.silence.size());
+        SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, c.format);
+        CHECK(dev.activateStream(rx) == 0);
+        std::vector<uint8_t> data(64 * elem + 16, 0xEE);
+        void *rbuffs[] = {data.data()};
+        long long timeNs = 0;
+        int n = dev.readStream(rx, rbuffs, 64, flags, timeNs, 100000);
+        CHECK(n == 64);
+        bool ok = true;
+        for (size_t i = 0; i < 64 * elem; i++)
+            ok = ok && data[i] == c.silence[i % elem];
+        for (size_t i = 64 * elem; i < data.size(); i++)
+            ok = ok && data[i] == 0xEE; // nothing written past the samples read
+        if (!ok)
+            std::fprintf(stderr, "format %s not muted correctly\n", c.format);
+        CHECK(ok);
+        dev.closeStream(rx);
+    }
+    dev.closeStream(tx);
+}
+
+// closeStream() ends a write waiting for the relay delay and a read blocked in the receiver promptly.
+void testCloseInterruptsWaits() {
+    {
+        SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"relay_tx_delay_ms", "1000"}});
+        MockDmaEngine engine(14, kRate);
+        SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+        CHECK(dev.activateStream(tx) == 0);
+        std::atomic<int> ret{1};
+        std::thread writer([&] {
+            std::vector<std::complex<float>> buf(480, std::complex<float>(1.0f, 0.0f));
+            const void *buffs[] = {buf.data()};
+            int flags = 0;
+            ret.store(dev.writeStream(tx, buffs, buf.size(), flags, 0, 100000));
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto t0 = std::chrono::steady_clock::now();
+        dev.closeStream(tx);
+        const auto took = std::chrono::steady_clock::now() - t0;
+        writer.join();
+        CHECK(took < std::chrono::milliseconds(300));
+        CHECK(ret.load() == SOAPY_SDR_STREAM_ERROR);
+    }
+    {
+        SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}});
+        SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+        CHECK(dev.activateStream(rx) == 0);
+        dev.writeSetting("rx.block", "1");
+        std::atomic<int> ret{1};
+        std::thread reader([&] {
+            std::vector<int16_t> data(2 * 64);
+            void *rbuffs[] = {data.data()};
+            int flags = 0;
+            long long timeNs = 0;
+            ret.store(dev.readStream(rx, rbuffs, 64, flags, timeNs, 10000000));
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const auto t0 = std::chrono::steady_clock::now();
+        dev.closeStream(rx);
+        const auto took = std::chrono::steady_clock::now() - t0;
+        reader.join();
+        CHECK(took < std::chrono::milliseconds(300));
+        CHECK(ret.load() == SOAPY_SDR_STREAM_ERROR);
+        CHECK(std::stol(dev.readSetting("rx.max_timeout_us")) <= 100000);
+
+        // A sliced read still waits for its whole timeout when nothing arrives.
+        SoapySDR::Stream *rx2 = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+        CHECK(dev.activateStream(rx2) == 0);
+        std::vector<int16_t> data(2 * 64);
+        void *rbuffs[] = {data.data()};
+        int flags = 0;
+        long long timeNs = 0;
+        const auto t1 = std::chrono::steady_clock::now();
+        CHECK(dev.readStream(rx2, rbuffs, 64, flags, timeNs, 250000) == SOAPY_SDR_TIMEOUT);
+        const auto waited = std::chrono::steady_clock::now() - t1;
+        CHECK(waited >= std::chrono::milliseconds(240) && waited < std::chrono::milliseconds(600));
+        dev.writeSetting("rx.block", "0");
+        dev.closeStream(rx2);
+    }
+}
+
+// Two threads polling the stream status: each event is reported once.
+void testStatusReportedOnce() {
+    SoapyRPITX dev(SoapySDR::Kwargs{});
+    dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+    CHECK(dev.activateStream(st) == 0);
+    std::vector<std::complex<float>> buf(4800, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = 0;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(400)); // one starvation inside the burst
+    std::atomic<int> reports{0};
+    auto poll = [&] {
+        size_t mask = 0;
+        int f = 0;
+        long long t = 0;
+        for (int i = 0; i < 20; i++)
+            if (dev.readStreamStatus(st, mask, f, t, 5000) == SOAPY_SDR_UNDERFLOW)
+                reports++;
+    };
+    std::thread a(poll), b(poll);
+    a.join();
+    b.join();
+    CHECK(reports.load() == 1);
+    dev.closeStream(st);
+}
+
+// A profile in a directory of the user who started the process through sudo is accepted when nobody else can
+// write it; without sudo it is refused.
+void testProfileSudoUser() {
+    if (geteuid() != 0) {
+        std::printf("testProfileSudoUser skipped (needs root)\n");
+        return;
+    }
+    const uid_t user = 4242;
+    const std::string dir = std::string(RPITX_LOCK_DIR) + "_sudo_profile";
+    const std::string file = dir + "/p.rpitx";
+    std::remove(file.c_str());
+    rmdir(dir.c_str());
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    writeFile(file.c_str(), "iq_scale=0.5\n");
+    CHECK(chmod(file.c_str(), 0644) == 0);
+    CHECK(chown(dir.c_str(), user, user) == 0 && chown(file.c_str(), user, user) == 0);
+
+    const char *saved = getenv("SUDO_UID");
+    const std::string savedValue = saved ? saved : "";
+    SoapyRPITX_Profile p;
+    std::string err;
+    unsetenv("SUDO_UID");
+    CHECK(!SoapyRPITX_LoadProfile(file, p, err) && err == "a directory of the path is owned by another user");
+    setenv("SUDO_UID", "4242", 1);
+    CHECK(SoapyRPITX_LoadProfile(file, p, err));
+    // Another sudo user is not trusted.
+    setenv("SUDO_UID", "4243", 1);
+    CHECK(!SoapyRPITX_LoadProfile(file, p, err));
+    setenv("SUDO_UID", "4242", 1);
+    // Group-writable directory or file of the sudo user: refused.
+    CHECK(chmod(dir.c_str(), 0775) == 0);
+    CHECK(!SoapyRPITX_LoadProfile(file, p, err) && err == "a directory of the path is writable by others");
+    CHECK(chmod(dir.c_str(), 0755) == 0);
+    CHECK(chmod(file.c_str(), 0664) == 0);
+    CHECK(!SoapyRPITX_LoadProfile(file, p, err) && err == "writable by group or others");
+    CHECK(chmod(file.c_str(), 0644) == 0);
+    // Malformed SUDO_UID values are ignored.
+    for (const char *bad : {"", "abc", "0", "42x"}) {
+        setenv("SUDO_UID", bad, 1);
+        CHECK(!SoapyRPITX_LoadProfile(file, p, err));
+    }
+
+    if (saved)
+        setenv("SUDO_UID", savedValue.c_str(), 1);
+    else
+        unsetenv("SUDO_UID");
+    std::remove(file.c_str());
+    rmdir(dir.c_str());
+}
+
 int main() {
     testSettings();
     testStreamArguments();
@@ -1170,6 +1448,12 @@ int main() {
     testRelayLowBank();
     testReceiverMute();
     testRelayProfile();
+    testPttWriteSequence();
+    testReceiverMuteTail();
+    testReceiverMutePackedFormats();
+    testCloseInterruptsWaits();
+    testStatusReportedOnce();
+    testProfileSudoUser();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

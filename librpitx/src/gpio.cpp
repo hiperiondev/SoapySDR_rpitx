@@ -194,18 +194,15 @@ void cm_restore_tree(volatile uint32_t *cm, const ClockTreeState &s) {
                          (s.gp0Ctl & CM_ENAB) != 0);
 }
 
-bool cm_move_emmc2_off_pllc(volatile uint32_t *cm, uint64_t xosc, bool bcm2711) {
-    if (!bcm2711)
-        return false;
-
-    const uint32_t ctl = cm[EMMC2CLK_CNTL];
+bool cm_move_generator_off_pllc(volatile uint32_t *cm, unsigned ctlIndex, unsigned divIndex, const char *name, uint64_t xosc, bool bcm2711) {
+    const uint32_t ctl = cm[ctlIndex];
     if ((ctl & CM_SRC_MASK) != 5) // 5 = PLLC peripheral channel
         return false;
 
     const unsigned mash = (ctl >> CM_MASH_SHIFT) & 3;
-    uint32_t div = cm[EMMC2CLK_DIV] & 0xFFFFFFu; // 12.12 fixed point
-    const uint64_t fc = cm_pll_frequency(cm, clk_pllc, xosc, true, 0);
-    const uint64_t fd = cm_pll_frequency(cm, clk_plld, xosc, true, 0);
+    uint32_t div = cm[divIndex] & 0xFFFFFFu; // 12.12 fixed point
+    const uint64_t fc = cm_pll_frequency(cm, clk_pllc, xosc, bcm2711, 0);
+    const uint64_t fd = cm_pll_frequency(cm, clk_plld, xosc, bcm2711, 0);
 
     if (fc != 0 && fd != 0 && div != 0) {
         // Same output frequency: new divider = old divider x (PLLD_PER / PLLC_PER).
@@ -219,13 +216,19 @@ bool cm_move_emmc2_off_pllc(volatile uint32_t *cm, uint64_t xosc, bool bcm2711) 
             nd = (double) 0xFFFFFF;
         div = (uint32_t) nd;
     } else {
-        dbg_printf(0, "Warning: cannot compute the EMMC2 divider for PLLD (PLLC_PER=%llu Hz, PLLD_PER=%llu Hz); keeping the divider\n", (unsigned long long) fc,
-                   (unsigned long long) fd);
+        dbg_printf(0, "Warning: cannot compute the %s divider for PLLD (PLLC_PER=%llu Hz, PLLD_PER=%llu Hz); keeping the divider\n", name,
+                   (unsigned long long) fc, (unsigned long long) fd);
     }
 
-    dbg_printf(1, "EMMC2 moved from PLLC_PER to PLLD_PER, divider %.4f\n", (double) div / 4096.0);
-    cm_program_generator(cm, EMMC2CLK_CNTL, 6, mash, (div >> 12) & 0xFFF, div & 0xFFF, (ctl & CM_ENAB) != 0);
+    dbg_printf(1, "%s moved from PLLC_PER to PLLD_PER, divider %.4f\n", name, (double) div / 4096.0);
+    cm_program_generator(cm, ctlIndex, 6, mash, (div >> 12) & 0xFFF, div & 0xFFF, (ctl & CM_ENAB) != 0);
     return true;
+}
+
+bool cm_move_emmc2_off_pllc(volatile uint32_t *cm, uint64_t xosc, bool bcm2711) {
+    if (!bcm2711)
+        return false;
+    return cm_move_generator_off_pllc(cm, EMMC2CLK_CNTL, EMMC2CLK_DIV, "EMMC2", xosc, true);
 }
 
 std::vector<std::string> cm_pllc_clients(volatile uint32_t *cm, bool bcm2711) {
@@ -234,15 +237,17 @@ std::vector<std::string> cm_pllc_clients(volatile uint32_t *cm, bool bcm2711) {
         unsigned ctl; // byte offset of the CTL register
     };
     // Clock generators of the clock manager (see drivers/clk/bcm/clk-bcm2835.c); GPCLK0 is the one of librpitx.
-    static const Gen gens[] = {{"VPU", 0x008},  {"H264", 0x028}, {"ISP", 0x030},  {"V3D", 0x038},  {"CAM0", 0x040}, {"CAM1", 0x048}, {"CCP2", 0x050},
-                               {"DSI0E", 0x058}, {"DSI0P", 0x060}, {"DPI", 0x068},  {"GPCLK1", 0x078}, {"GPCLK2", 0x080}, {"HSM", 0x088}, {"OTP", 0x090},
-                               {"PCM", 0x098},  {"PWM", 0x0a0},  {"SLIM", 0x0a8}, {"SMI", 0x0b0},  {"TEC", 0x0c0},  {"TD0", 0x0c8},  {"TD1", 0x0d0},
-                               {"TSENS", 0x0e0}, {"TIMER", 0x0e8}, {"UART", 0x0f0}, {"VEC", 0x0f8},  {"PULSE", 0x190}, {"SDC", 0x1a8}, {"ARM", 0x1b0},
-                               {"AVEO", 0x1b8}, {"EMMC", 0x1c0},  {"EMMC2", 0x1d0}};
+    static const Gen gens[] = {{"VPU", CM_VPUCTL},     {"H264", CM_H264CTL},   {"ISP", CM_ISPCTL},           {"V3D", CM_V3DCTL},     {"CAM0", CM_CAM0CTL},
+                               {"CAM1", CM_CAM1CTL},   {"CCP2", CM_CCP2CTL},   {"DSI0E", CM_DSI0ECTL},       {"DSI0P", CM_DSI0PCTL}, {"DPI", CM_DPICTL},
+                               {"GPCLK1", CM_GP1CTL},  {"GPCLK2", CM_GP2CTL},  {"HSM", CM_HSMCTL},           {"OTP", CM_OTPCTL},     {"PCM", CM_PCMCTL},
+                               {"PWM", CM_PWMCTL},     {"SLIM", CM_SLIMCTL},   {"SMI", CM_SMICTL},           {"TEC", CM_TECCTL},     {"TD0", CM_TD0CTL},
+                               {"TD1", CM_TD1CTL},     {"TSENS", CM_TSENSCTL}, {"TIMER", CM_TIMERCTL},       {"UART", CM_UARTCTL},   {"VEC", CM_VECCTL},
+                               {"DSI1E", CM_DSI1ECTL}, {"DSI1P", CM_DSI1PCTL}, {"PULSE", CM_PULSECTL},       {"SDC", CM_SDCCTL},     {"ARM", CM_ARMCTL},
+                               {"AVEO", CM_AVEOCTL},   {"EMMC", CM_EMMCCTL},   {"EMMC2", CM_EMMC2CTL_OFFSET}};
 
     std::vector<std::string> out;
     for (const Gen &g : gens) {
-        if (!bcm2711 && g.ctl == 0x1d0) // EMMC2 exists on BCM2711 only
+        if (!bcm2711 && g.ctl == CM_EMMC2CTL_OFFSET) // EMMC2 exists on BCM2711 only
             continue;
         const uint32_t ctl = cm[g.ctl / 4];
         if ((ctl & CM_ENAB) && (ctl & CM_SRC_MASK) == 5)
@@ -352,6 +357,10 @@ double clkgpio::GetMasterFracFrequency(uint32_t Frac) {
 }
 
 int clkgpio::QueryBestLO(uint64_t Frequency, int Bandwidth, int &dividerOut, bool quiet) const {
+    return QueryBestLOFor(Frequency, Bandwidth, XOSC_FREQUENCY, pi_is_2711, dividerOut, quiet);
+}
+
+int clkgpio::QueryBestLOFor(uint64_t Frequency, int Bandwidth, uint64_t xosc, bool bcm2711, int &dividerOut, bool quiet) {
     // Algorithm adapted from https://github.com/SaucySoliton/PiFmRds/blob/master/src/pi_fm_rds.c
     // Choose an integer divider for GPCLK0.
     // Constants taken https://github.com/raspberrypi/linux/blob/ffd7bf4085b09447e5db96edd74e524f118ca3fe/drivers/clk/bcm/clk-bcm2835.c#L1763
@@ -359,7 +368,7 @@ int clkgpio::QueryBestLO(uint64_t Frequency, int Bandwidth, int &dividerOut, boo
     const double MIN_PLL_RATE = 200e6;
     const double MIN_PLL_RATE_USE_PDIV = 1500e6; // above this VCO rate the PLL pre-divider is used
     const double MAX_PLL_RATE = 4e9;
-    const double xtal_freq_recip = 1.0 / (double) XOSC_FREQUENCY; // nominal crystal, without ppm correction
+    const double xtal_freq_recip = 1.0 / (double) xosc; // nominal crystal, without ppm correction
     const double f = (double) Frequency;
     int best_divider = 0;
     bool cross_boundary = false;
@@ -377,7 +386,7 @@ int clkgpio::QueryBestLO(uint64_t Frequency, int Bandwidth, int &dividerOut, boo
     }
     if (f * 2 > MIN_PLL_RATE_USE_PDIV) {
         best_divider = 1; // PLL pre-divider
-        double scale = (pi_is_2711 ? 1.0 : 0.5) * xtal_freq_recip;
+        double scale = (bcm2711 ? 1.0 : 0.5) * xtal_freq_recip;
         cross_boundary = (int) ((f + Bandwidth) * scale) != (int) ((f - Bandwidth) * scale);
     } else {
         for (int divider = 4095; divider > 1; divider--) { // 1 is allowed only for MASH=0
@@ -417,8 +426,13 @@ int clkgpio::ComputeBestLO(uint64_t Frequency, int Bandwidth) {
 int clkgpio::CheckCenterFrequency(uint64_t Frequency, int Bandwidth) const {
     if (!ModulateFromMasterPLL)
         return 0;
+    return CheckCenterFrequencyFor(Frequency, Bandwidth, pi_is_2711);
+}
+
+int clkgpio::CheckCenterFrequencyFor(uint64_t Frequency, int Bandwidth, bool bcm2711) {
     int divider = 0;
-    return pi_is_2711 ? QueryBestLO(Frequency * 2, Bandwidth * 2, divider, true) : QueryBestLO(Frequency, Bandwidth, divider, true);
+    const uint64_t xosc = bcm2711 ? 54000000 : 19200000;
+    return bcm2711 ? QueryBestLOFor(Frequency * 2, Bandwidth * 2, xosc, true, divider, true) : QueryBestLOFor(Frequency, Bandwidth, xosc, false, divider, true);
 }
 
 int clkgpio::SetCenterFrequency(uint64_t Frequency, int Bandwidth) {
@@ -598,16 +612,10 @@ void clkgpio::SetAdvancedPllMode(bool Advanced) {
         usleep(100);
         gpioreg[CORECLK_CNTL] = (0x5a << 24) | (1 << 4) | (4); // run, src=PLLA
 
-        // switch the EMMC over to PLLD
-        uint32_t clktmp = gpioreg[EMMCCLK_CNTL];
-        gpioreg[EMMCCLK_CNTL] = (0xF0F & clktmp) | (0x5a << 24); // clear run
-        usleep(100);
-        gpioreg[EMMCCLK_CNTL] = (0xF00 & clktmp) | (0x5a << 24) | (6); // src=PLLD
-        usleep(100);
-        gpioreg[EMMCCLK_CNTL] = (0xF00 & clktmp) | (0x5a << 24) | (1 << 4) | (6); // run , src=PLLD
-
-        // BCM2711: EMMC2 drives the SD card; if it is fed by PLLC_PER it would follow the modulation (and the
-        // PLLC_PER divider change below). Move it to PLLD_PER at the same output frequency.
+        // EMMC (SD host or SDIO) and, on BCM2711, EMMC2 (SD card) would follow the modulation (and the PLLC_PER
+        // divider change below) when they are fed by PLLC_PER: they are moved to PLLD_PER at the same output
+        // frequency. Generators on another source are left alone.
+        cm_move_generator_off_pllc(gpioreg, EMMCCLK_CNTL, EMMCCLK_DIV, "EMMC", XOSC_FREQUENCY, pi_is_2711);
         cm_move_emmc2_off_pllc(gpioreg, XOSC_FREQUENCY, pi_is_2711);
 
         SetPllNumber(clk_pllc, 0); // Use PLL_C , Do not USE MASH which generates spurious
@@ -953,7 +961,7 @@ int pwmgpio::SetFrequency(uint64_t Frequency, uint32_t Range) {
     gpioreg[PWM_RNG1] = range;
     usleep(10);
     gpioreg[PWM_DMAC] = PWM_DMAC_ENAB | ((uint32_t) PWM_DREQ_LEVEL << 8) | (uint32_t) PWM_DREQ_LEVEL;
-    StartTx();
+    // StartTx() is called by StartDma(); the channel stays off while no DMA is feeding it.
     return 0;
 }
 

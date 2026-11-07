@@ -35,6 +35,7 @@
 
 #include <stdint.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <complex>
@@ -118,6 +119,21 @@ struct SoapyRPITX_TuneConfig {
     bool ppmFromNtp = true;      ///< Use the kernel NTP frequency estimate as the base correction.
     int harmonic = 1;            ///< Harmonic of the clock used for transmission (the PLL runs at frequency / harmonic).
 };
+
+/**
+ * @brief Tells whether the carrier PLL of a SoC could produce a tune configuration, without any register access.
+ *
+ * Applies the divider search of the transmitter with the nominal crystal of the SoC and the band the modulation
+ * needs at @p slotRate (half the slot rate plus the largest phase correction of one slot). The pacing clock is
+ * not checked.
+ *
+ * @param frequency Output frequency in Hz.
+ * @param harmonic  Harmonic used for transmission (the PLL runs at frequency / harmonic).
+ * @param slotRate  Slot rate in Hz (IQ sample rate times slots per sample).
+ * @param bcm2711   True on BCM2711 (Pi 4, Pi 400, CM4).
+ * @return True when a PLL configuration exists.
+ */
+bool SoapyRPITX_PllCanProduce(double frequency, int harmonic, uint32_t slotRate, bool bcm2711);
 
 /** @brief Output of the envelope for Envelope Elimination and Restoration. */
 enum class SoapyRPITX_EnvelopeOutput {
@@ -286,7 +302,12 @@ protected:
  * or when queued data has been waiting for the pre-roll time.
  *
  * Thread model: Write() and EndBurst() are called from one producer thread; Start(), Stop(), Retune() and the
- * setters from the control thread; GetStats() and IsPllLocked() from any thread.
+ * setters from the control thread; GetStats(), IsPllLocked() and FlushLog() from any thread. Stop() waits for a
+ * Write() that is pushing samples, and a Write() never pushes into a later activation than the one it started in,
+ * so the samples of a stopped transmitter cannot reach the next activation.
+ *
+ * The feeder thread runs with real-time priority and does not call the SoapySDR logger: its messages are queued
+ * and printed by FlushLog(), which the TX stream calls every millisecond and Stop() and the destructor call too.
  *
  * The DMA writes the whole GPFSEL0 register (and GPFSEL2 with the RF-DAC option), so the functions of GPIO
  * 0-9 (and 20-29) are sampled when Start() is called and must not be changed by other software while the
@@ -340,16 +361,23 @@ public:
     /**
      * @brief Queues samples for transmission (producer thread).
      *
-     * Blocks while the FIFO is full, up to @p timeoutUs.
+     * Blocks while the FIFO is full, up to @p timeoutUs. The call ends early when the transmitter is stopped: no
+     * sample is pushed after Stop() has started, and the samples pushed before it are discarded with the rest of
+     * the FIFO.
      *
      * @param samples   Complex samples, full scale = magnitude 1.0.
      * @param n         Number of samples.
      * @param timeoutUs Maximum blocking time in microseconds (0 = do not block).
-     * @return Number of samples queued (less than @p n on timeout).
+     * @return Number of samples queued (less than @p n on timeout or stop; 0 when the transmitter is not active).
      */
     size_t Write(const std::complex<float> *samples, size_t n, long timeoutUs);
 
-    /** @brief Marks the end of the current burst: queued samples are sent, then the carrier stays off. */
+    /**
+     * @brief Marks the end of the current burst: queued samples are sent, then the carrier stays off.
+     *
+     * The mark covers the samples written so far; samples written afterwards start a new burst, whose own pre-roll
+     * and starvation accounting apply.
+     */
     void EndBurst();
 
     /**
@@ -488,6 +516,13 @@ public:
      */
     void SignalSafeStop();
 
+    /**
+     * @brief Prints the messages queued by the feeder thread with the SoapySDR logger (any thread except the feeder).
+     *
+     * Messages that did not fit in the queue are reported as a count.
+     */
+    void FlushLog();
+
 private:
     using clock = std::chrono::steady_clock;
 
@@ -614,8 +649,33 @@ private:
     /** @brief Value of @ref drainedPush while the transmitter is not known to be drained. */
     static constexpr uint64_t kNotDrained = UINT64_MAX;
 
+    /** @brief Value of @ref endBurstPush while no burst end applies. */
+    static constexpr uint64_t kNoBurstEnd = UINT64_MAX;
+
+    /**
+     * @brief Tells whether a burst end covers every sample written so far (any thread).
+     * @return True when EndBurst() was called after the last sample was pushed.
+     */
+    bool BurstEnded() const;
+
     /** @brief Restarts after the DMA engine stopped by itself (feeder thread). */
     void RecoverDma();
+
+    /**
+     * @brief Logs a message: queued for FlushLog() on the feeder thread, printed at once on any other thread.
+     * @param level SoapySDR log level.
+     * @param fmt   printf format.
+     */
+    void Log(int level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+    /** @brief Number of messages the feeder log queue holds. */
+    static constexpr uint32_t kLogSlots = 32;
+
+    /** @brief One queued feeder message. */
+    struct LogEntry {
+        int level = 0;    ///< SoapySDR log level.
+        char text[240]{}; ///< Formatted message.
+    };
 
     /**
      * @brief Computes the absolute position below which envelope words can no longer be written (the DMA may
@@ -686,18 +746,20 @@ private:
     SoapyRPITX_AmplitudeConfig ampCfg;                          ///< Amplitude configuration (modelMutex).
     std::shared_ptr<const SoapyRPITX_AmplitudeModel> published; ///< Latest model (std::atomic_load / std::atomic_store).
     std::shared_ptr<const SoapyRPITX_AmplitudeModel> model;     ///< Model in use (feeder thread only).
-    int envAdvance = 0;                                         ///< Slots the envelope words are written ahead of their sample (feeder thread only).
-    double envDelaySlots = 0;                                   ///< Software envelope delay in slots (feeder thread only).
-    bool envAdvancePending = false;                             ///< A new advance waits for a burst boundary (feeder thread only).
-    int pendingEnvAdvance = 0;                                  ///< Advance to apply at the boundary (feeder thread only).
-    double pendingEnvDelaySlots = 0;                            ///< Software delay that goes with @ref pendingEnvAdvance (feeder thread only).
-    SoapyRPITX_AmplitudeQuantizer quantizer;                    ///< State selection (feeder thread only).
-    SoapyRPITX_EnvelopeDelay envHistory;                        ///< Envelope history (feeder thread only).
-    double appliedPhase = 0;                                    ///< AM/PM phase of the previous slot, in radians (feeder thread only).
-    uint32_t floorCount = 0;                                    ///< Consecutive slots below the envelope floor (feeder thread only).
-    std::complex<float> prevIq{0, 0};                           ///< Previous IQ sample, start of the interpolation (feeder thread only).
-    uint64_t behindLimit = 0;                                   ///< First absolute position envelope words may still be written to (feeder thread only).
-    uint32_t idlePrefix = 0;                                    ///< Idle slots written at the start of the ring before the DMA starts (feeder thread only).
+    std::vector<std::shared_ptr<const SoapyRPITX_AmplitudeModel>>
+            retired;                         ///< Replaced models kept until the feeder released them, so they are freed outside the feeder (modelMutex).
+    int envAdvance = 0;                      ///< Slots the envelope words are written ahead of their sample (feeder thread only).
+    double envDelaySlots = 0;                ///< Software envelope delay in slots (feeder thread only).
+    bool envAdvancePending = false;          ///< A new advance waits for a burst boundary (feeder thread only).
+    int pendingEnvAdvance = 0;               ///< Advance to apply at the boundary (feeder thread only).
+    double pendingEnvDelaySlots = 0;         ///< Software delay that goes with @ref pendingEnvAdvance (feeder thread only).
+    SoapyRPITX_AmplitudeQuantizer quantizer; ///< State selection (feeder thread only).
+    SoapyRPITX_EnvelopeDelay envHistory;     ///< Envelope history (feeder thread only).
+    double appliedPhase = 0;                 ///< AM/PM phase of the previous slot, in radians (feeder thread only).
+    uint32_t floorCount = 0;                 ///< Consecutive slots below the envelope floor (feeder thread only).
+    std::complex<float> prevIq{0, 0};        ///< Previous IQ sample, start of the interpolation (feeder thread only).
+    uint64_t behindLimit = 0;                ///< First absolute position envelope words may still be written to (feeder thread only).
+    uint32_t idlePrefix = 0;                 ///< Idle slots written at the start of the ring before the DMA starts (feeder thread only).
 
     dsp mydsp;              ///< Phase/amplitude decomposition (feeder thread only).
     double phaseCarry = 0;  ///< Phase error of the PLL quantisation carried to the next slots, in radians (feeder thread only).
@@ -712,32 +774,41 @@ private:
     padgpio pads;           ///< Pad control block, used to restore @ref originalPads.
     pwmgpio pwm;            ///< PWM block (envelope output and pacing with the PWM output).
 
-    SpscFifo<std::complex<float>> fifo;      ///< Samples queued by the producer.
-    DmaRingTracker tracker;                  ///< Absolute ring positions (feeder thread only).
-    std::vector<std::complex<float>> chunk;  ///< Transfer buffer between FIFO and ring (feeder thread only).
-    std::vector<std::complex<float>> shadow; ///< Slot sample of every ring slot (zero for idle slots, feeder thread only).
-    std::vector<uint8_t> slotIsData;         ///< 1 for ring slots holding a data sample, 0 for idle slots (feeder thread only).
-    std::vector<std::complex<float>> replay; ///< Slot samples queued in the ring before a retune, sent first (feeder thread only).
-    std::vector<uint8_t> replayIsData;       ///< 1 for data entries of @ref replay, 0 for idle entries (feeder thread only).
-    size_t replayPos = 0;                    ///< Next entry of @ref replay (feeder thread only).
-    std::atomic<size_t> replayLeft{0};       ///< Entries of @ref replay not yet in the ring.
+    SpscFifo<std::complex<float>> fifo;             ///< Samples queued by the producer.
+    DmaRingTracker tracker;                         ///< Absolute ring positions (feeder thread only).
+    std::vector<std::complex<float>> chunk;         ///< Transfer buffer between FIFO and ring (feeder thread only).
+    std::vector<std::complex<float>> shadow;        ///< Slot sample of every ring slot (zero for idle slots, feeder thread only).
+    std::vector<uint8_t> slotIsData;                ///< 1 for ring slots holding a data sample, 0 for idle slots (feeder thread only).
+    std::vector<std::complex<float>> replay;        ///< Slot samples queued in the ring before a retune, sent first (feeder thread only).
+    std::vector<uint8_t> replayIsData;              ///< 1 for data entries of @ref replay, 0 for idle entries (feeder thread only).
+    std::vector<std::complex<float>> replayScratch; ///< Preallocated buffer of the next @ref replay (feeder thread only).
+    std::vector<uint8_t> replayIsDataScratch;       ///< Preallocated buffer of the next @ref replayIsData (feeder thread only).
+    size_t replayPos = 0;                           ///< Next entry of @ref replay (feeder thread only).
+    std::atomic<size_t> replayLeft{0};              ///< Entries of @ref replay not yet in the ring.
 
-    std::thread feeder;                             ///< Feeder thread.
-    std::atomic<bool> running{false};               ///< Feeder thread run flag.
-    std::atomic<bool> feederExited{true};           ///< The feeder thread is not executing its loop.
-    std::atomic<bool> active{false};                ///< True between Start() and Stop().
-    std::atomic<bool> endBurst{false};              ///< Burst end signalled by the producer.
-    std::atomic<bool> dmaRunning{false};            ///< DMA engine running (published by the feeder).
-    uint64_t lastDataPos = 0;                       ///< Absolute position after the last data slot (feeder thread only).
-    uint64_t consumedTotal = 0;                     ///< FIFO samples written to the ring, on the scale of SpscFifo::pushedTotal() (feeder thread only).
-    std::atomic<uint64_t> drainedPush{kNotDrained}; ///< SpscFifo::pushedTotal() up to which every sample has been played, or @ref kNotDrained.
-    std::atomic<double> actualSampleRate{0.0};      ///< IQ sample rate produced by the pacing clock (published by ApplyTune()).
-    std::atomic<uint64_t> underflows{0};            ///< FIFO starvation events.
-    std::atomic<uint64_t> late{0};                  ///< DMA overrun events.
-    std::atomic<uint64_t> dmaErrors{0};             ///< DMA restarts after the engine stopped by itself.
-    std::atomic<uint64_t> samplesSent{0};           ///< IQ samples taken from the FIFO into the ring.
-    std::atomic<uint64_t> envelopeClips{0};         ///< Envelope values limited to full scale.
-    std::atomic<uint64_t> envelopeLate{0};          ///< Envelope words dropped because their slot could already be executing.
+    std::thread feeder;                              ///< Feeder thread.
+    std::atomic<bool> running{false};                ///< Feeder thread run flag.
+    std::atomic<bool> feederExited{true};            ///< The feeder thread is not executing its loop.
+    std::atomic<bool> active{false};                 ///< True between Start() and Stop().
+    std::atomic<uint64_t> endBurstPush{kNoBurstEnd}; ///< SpscFifo::pushedTotal() when the last burst end was signalled, or @ref kNoBurstEnd.
+    std::atomic<uint64_t> activation{0};             ///< Advanced by Start() and Stop(); a Write() pushes only within the activation it started in.
+    std::atomic<int> pushing{0};                     ///< Write() calls between their activity check and the end of their push; Stop() waits for zero.
+    std::atomic<std::thread::id> feederId{};         ///< Thread id of the running feeder (default id when none).
+    std::array<LogEntry, kLogSlots> logRing;         ///< Messages queued by the feeder thread.
+    std::atomic<uint32_t> logHead{0};                ///< Messages queued so far (written by the feeder).
+    std::atomic<uint32_t> logTail{0};                ///< Messages printed so far (written under @ref logMutex).
+    std::atomic<uint32_t> logDropped{0};             ///< Messages lost because the queue was full.
+    std::mutex logMutex;                             ///< Serialises FlushLog().
+    std::atomic<bool> dmaRunning{false};             ///< DMA engine running (published by the feeder).
+    uint64_t lastDataPos = 0;                        ///< Absolute position after the last data slot (feeder thread only).
+    std::atomic<uint64_t> drainedPush{kNotDrained};  ///< SpscFifo::pushedTotal() up to which every sample has been played, or @ref kNotDrained.
+    std::atomic<double> actualSampleRate{0.0};       ///< IQ sample rate produced by the pacing clock (published by ApplyTune()).
+    std::atomic<uint64_t> underflows{0};             ///< FIFO starvation events.
+    std::atomic<uint64_t> late{0};                   ///< DMA overrun events.
+    std::atomic<uint64_t> dmaErrors{0};              ///< DMA restarts after the engine stopped by itself.
+    std::atomic<uint64_t> samplesSent{0};            ///< IQ samples taken from the FIFO into the ring.
+    std::atomic<uint64_t> envelopeClips{0};          ///< Envelope values limited to full scale.
+    std::atomic<uint64_t> envelopeLate{0};           ///< Envelope words dropped because their slot could already be executing.
 
     mutable std::mutex tuneMutex;   ///< Protects @ref tuneCfg, @ref pendingTune and the retune handshake.
     std::condition_variable tuneCv; ///< Signals that a retune request was taken or completed.

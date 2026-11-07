@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
@@ -61,14 +63,23 @@ const int kCleanupSignals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGSEGV, SIGBUS
 
 std::atomic<bool> g_hardwareClaimed{false};
 std::atomic<SoapyRPITX_IQ_dmaSync *> g_activeTransmitter{nullptr};
+// Serialises the exit handler with the registration and the destruction of the transmitter, so that the
+// destructor waits for an emergency stop in progress instead of freeing the object under it.
+std::mutex g_activeMutex;
 std::once_flag g_exitHandlerOnce;
 struct sigaction g_previousActions[NSIG];
-bool g_signalsInstalled = false;
+std::atomic<bool> g_signalsInstalled{false};
 
 void exitHandler() {
+    std::lock_guard<std::mutex> lock(g_activeMutex);
     SoapyRPITX_IQ_dmaSync *tx = g_activeTransmitter.exchange(nullptr);
     if (tx != nullptr)
         tx->EmergencyStop();
+}
+
+// Instantaneous frequencies stay within +/- rate / 2, plus the largest phase correction of one slot.
+int bandwidthFor(uint32_t slotRate) {
+    return (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) slotRate);
 }
 
 // Turns the carrier off only when the signal is going to terminate the process (default action); a
@@ -87,14 +98,29 @@ void cleanupSignalHandler(int sig, siginfo_t *info, void *context) {
         raise(sig);
         return;
     }
+    // The handler of the application runs as the kernel would have run it: reset to the default action first
+    // when it was installed with SA_RESETHAND, and with its own signal mask added.
+    if ((prev.sa_flags & SA_RESETHAND) != 0) {
+        struct sigaction dfl;
+        sigemptyset(&dfl.sa_mask);
+        dfl.sa_flags = 0;
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, nullptr);
+    }
+    sigset_t mask = prev.sa_mask;
+    if ((prev.sa_flags & SA_NODEFER) == 0)
+        sigaddset(&mask, sig);
+    sigset_t old;
+    pthread_sigmask(SIG_BLOCK, &mask, &old);
     if (siginfo)
         prev.sa_sigaction(sig, info, context);
     else
         prev.sa_handler(sig);
+    pthread_sigmask(SIG_SETMASK, &old, nullptr);
 }
 
 void installSignalHandlers() {
-    if (g_signalsInstalled)
+    if (g_signalsInstalled.load())
         return;
     struct sigaction sa;
     sigemptyset(&sa.sa_mask);
@@ -102,18 +128,18 @@ void installSignalHandlers() {
     sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     for (int sig : kCleanupSignals)
         sigaction(sig, &sa, &g_previousActions[sig]);
-    g_signalsInstalled = true;
+    g_signalsInstalled.store(true);
 }
 
 void uninstallSignalHandlers() {
-    if (!g_signalsInstalled)
+    if (!g_signalsInstalled.load())
         return;
     for (int sig : kCleanupSignals) {
         struct sigaction current;
         if (sigaction(sig, nullptr, &current) == 0 && (current.sa_flags & SA_SIGINFO) && current.sa_sigaction == cleanupSignalHandler)
             sigaction(sig, &g_previousActions[sig], nullptr);
     }
-    g_signalsInstalled = false;
+    g_signalsInstalled.store(false);
 }
 
 uint32_t clampRingSize(uint32_t ringSize) {
@@ -172,6 +198,13 @@ uint32_t SoapyRPITX_DefaultRingSize(uint32_t slotRate) {
     uint64_t samples = (uint64_t) slotRate * RPITX_DEFAULT_RING_MS / 1000;
     samples = (samples + 511) / 512 * 512;
     return (uint32_t) std::min<uint64_t>(std::max<uint64_t>(samples, 4096), RPITX_MAX_RING_SIZE);
+}
+
+bool SoapyRPITX_PllCanProduce(double frequency, int harmonic, uint32_t slotRate, bool bcm2711) {
+    if (harmonic < 1 || !(frequency > 0))
+        return false;
+    const uint64_t pllFrequency = (uint64_t) std::llround(frequency / harmonic);
+    return clkgpio::CheckCenterFrequencyFor(pllFrequency, bandwidthFor(slotRate), bcm2711) >= 0;
 }
 
 bool SoapyRPITX_RingFitsRate(uint32_t ringSize, uint32_t slotRate) {
@@ -369,8 +402,18 @@ SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
         throw;
     }
 
+    // The replay buffers hold at most the data slots of one ring plus the replay still pending: twice the ring.
+    const size_t replayCapacity = 2 * (size_t) tracker.size();
+    replay.reserve(replayCapacity);
+    replayIsData.reserve(replayCapacity);
+    replayScratch.reserve(replayCapacity);
+    replayIsDataScratch.reserve(replayCapacity);
+
     std::call_once(g_exitHandlerOnce, [] { std::atexit(exitHandler); });
-    g_activeTransmitter.store(this);
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        g_activeTransmitter.store(this);
+    }
     if (signalCleanup)
         installSignalHandlers();
 }
@@ -378,13 +421,17 @@ SoapyRPITX_IQ_dmaSync::SoapyRPITX_IQ_dmaSync(const SoapyRPITX_TxConfig &cfg) :
 SoapyRPITX_IQ_dmaSync::~SoapyRPITX_IQ_dmaSync() {
     if (signalCleanup)
         uninstallSignalHandlers();
-    SoapyRPITX_IQ_dmaSync *self = this;
-    g_activeTransmitter.compare_exchange_strong(self, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        SoapyRPITX_IQ_dmaSync *self = this;
+        g_activeTransmitter.compare_exchange_strong(self, nullptr);
+    }
 
     Stop();
     StopDma();
     RestoreGpio();
     RestoreEnvelopePins();
+    FlushLog();
 }
 
 void SoapyRPITX_IQ_dmaSync::WriteSessionRecord() {
@@ -452,9 +499,8 @@ SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneCo
     if (!pacingFits)
         return SoapyRPITX_RetuneResult::PacingRefused;
 
-    const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
     const uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
-    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0 ? SoapyRPITX_RetuneResult::Ok : SoapyRPITX_RetuneResult::Refused;
+    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidthFor(rate)) >= 0 ? SoapyRPITX_RetuneResult::Ok : SoapyRPITX_RetuneResult::Refused;
 }
 
 bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
@@ -501,18 +547,17 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     if (!pacingFits)
         return rollback();
 
-    // Instantaneous frequencies stay within +/- rate / 2, plus the largest phase correction of one slot.
-    const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
+    const int bandwidth = bandwidthFor(rate);
     uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
     if (clkgpio::SetCenterFrequency(pllFrequency, bandwidth) != 0)
         return rollback();
     if (!clkgpio::WaitPllcLock(2000))
-        SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: PLLC did not report lock at %.0f Hz", tune.frequency);
+        Log(SOAPY_SDR_WARNING, "rpitx: PLLC did not report lock at %.0f Hz", tune.frequency);
     if (clkgpio::CrossesBoundary())
-        SoapySDR_logf(SOAPY_SDR_WARNING,
-                      "rpitx: at %.0f Hz the band of +/-%d Hz crosses a PLL integer step; deviations beyond the step are clipped "
-                      "(a slightly different frequency or a lower sample rate avoids it)",
-                      tune.frequency, bandwidth);
+        Log(SOAPY_SDR_WARNING,
+            "rpitx: at %.0f Hz the band of +/-%d Hz crosses a PLL integer step; deviations beyond the step are clipped "
+            "(a slightly different frequency or a lower sample rate avoids it)",
+            tune.frequency, bandwidth);
 
     int pacingError;
     if (envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm)
@@ -524,13 +569,13 @@ bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
     if (pacingError != 0) {
         // Checked above with the same clock source and correction: only reached when the hardware changed.
         // The carrier PLL goes back to the configuration still in effect, so that the hardware matches it.
-        SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA pacing clock cannot run at %u Hz; the previous carrier frequency is restored", rate);
+        Log(SOAPY_SDR_ERROR, "rpitx: the DMA pacing clock cannot run at %u Hz; the previous carrier frequency is restored", rate);
         rollback();
         if (slotRate > 0) {
-            const int previousBandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) slotRate);
+            const int previousBandwidth = bandwidthFor(slotRate);
             const uint64_t previousPll = (uint64_t) std::llround(tuneCfg.frequency / tuneCfg.harmonic);
             if (clkgpio::SetCenterFrequency(previousPll, previousBandwidth) != 0)
-                SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the previous carrier frequency %.0f Hz cannot be restored", tuneCfg.frequency);
+                Log(SOAPY_SDR_ERROR, "rpitx: the previous carrier frequency %.0f Hz cannot be restored", tuneCfg.frequency);
         }
         return false;
     }
@@ -561,7 +606,13 @@ void SoapyRPITX_IQ_dmaSync::ComputeIdleWords() {
 void SoapyRPITX_IQ_dmaSync::PublishModel() {
     std::lock_guard<std::mutex> lock(modelMutex);
     auto m = std::make_shared<const SoapyRPITX_AmplitudeModel>(ampCfg, driveLevel.load(), rfDac);
-    std::atomic_store(&published, m);
+    std::shared_ptr<const SoapyRPITX_AmplitudeModel> previous = std::atomic_exchange(&published, m);
+    // The feeder may still use a replaced model: it is kept here, and freed by this thread once nothing else
+    // refers to it (the feeder only ever takes the latest published model).
+    if (previous)
+        retired.push_back(std::move(previous));
+    retired.erase(std::remove_if(retired.begin(), retired.end(), [](const std::shared_ptr<const SoapyRPITX_AmplitudeModel> &r) { return r.use_count() == 1; }),
+                  retired.end());
 }
 
 void SoapyRPITX_IQ_dmaSync::RefreshModel() {
@@ -851,14 +902,15 @@ void SoapyRPITX_IQ_dmaSync::Start() {
     fsel2Idle = base2 | ((uint32_t) fsel_input << (3 * (RPITX_TX2_GPIO % 10)));
     fsel2On = base2 | ((uint32_t) fsel_alt5 << (3 * (RPITX_TX2_GPIO % 10)));
 
+    // No Write() can be pushing: Stop() waited for them, and they push only while the transmitter is active.
+    activation.fetch_add(1);
     fifo.clear();
-    consumedTotal = fifo.pushedTotal();
     drainedPush.store(kNotDrained);
     replay.clear();
     replayIsData.clear();
     replayPos = 0;
     replayLeft.store(0);
-    endBurst.store(false);
+    endBurstPush.store(kNoBurstEnd);
     underflows.store(0);
     late.store(0);
     dmaErrors.store(0);
@@ -891,8 +943,14 @@ void SoapyRPITX_IQ_dmaSync::Stop() {
     bool wasActive = active.exchange(false);
     if (!wasActive && !feeder.joinable())
         return;
+    activation.fetch_add(1);
 
     JoinFeeder();
+    FlushLog();
+    // A Write() that saw the transmitter active is finishing its push; once it is done nothing can be pushed
+    // until the next Start(), and the FIFO is emptied below.
+    while (pushing.load() != 0)
+        std::this_thread::yield();
     drainedPush.store(kNotDrained);
     StopDma();
     RestoreGpio();
@@ -918,16 +976,22 @@ bool SoapyRPITX_IQ_dmaSync::IsActive() const {
 size_t SoapyRPITX_IQ_dmaSync::Write(const std::complex<float> *samples, size_t n, long timeoutUs) {
     if (!active.load() || n == 0)
         return 0;
-
-    // A new burst starts: the previous burst end no longer applies to the samples queued from now on.
-    endBurst.store(false);
+    const uint64_t epoch = activation.load();
 
     const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;
 
     while (done < n) {
+        // Registered before the activity check (both sequentially consistent): either Stop() sees this push and
+        // waits for it, or this call sees the stopped transmitter and pushes nothing.
+        pushing.fetch_add(1);
+        if (!active.load() || activation.load() != epoch) {
+            pushing.fetch_sub(1);
+            break;
+        }
         done += fifo.push(samples + done, n - done);
-        if (done == n || timeoutUs <= 0 || !active.load())
+        pushing.fetch_sub(1);
+        if (done == n || timeoutUs <= 0)
             break;
 
         auto now = clock::now();
@@ -947,7 +1011,12 @@ size_t SoapyRPITX_IQ_dmaSync::Write(const std::complex<float> *samples, size_t n
 }
 
 void SoapyRPITX_IQ_dmaSync::EndBurst() {
-    endBurst.store(true);
+    endBurstPush.store(fifo.pushedTotal());
+}
+
+bool SoapyRPITX_IQ_dmaSync::BurstEnded() const {
+    const uint64_t mark = endBurstPush.load();
+    return mark != kNoBurstEnd && mark == fifo.pushedTotal();
 }
 
 bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
@@ -1111,7 +1180,7 @@ void SoapyRPITX_IQ_dmaSync::SetupFeederThread() {
         sp.sched_priority = std::min(rtPriority, sched_get_priority_max(SCHED_FIFO));
         int err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
         if (err != 0)
-            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: cannot set SCHED_FIFO priority %d for the feeder thread (error %d)", sp.sched_priority, err);
+            Log(SOAPY_SDR_WARNING, "rpitx: cannot set SCHED_FIFO priority %d for the feeder thread (error %d)", sp.sched_priority, err);
     }
 
     if (cpu >= 0) {
@@ -1120,7 +1189,7 @@ void SoapyRPITX_IQ_dmaSync::SetupFeederThread() {
         CPU_SET(cpu, &set);
         int err = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
         if (err != 0)
-            SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: cannot pin the feeder thread to CPU %d (error %d)", cpu, err);
+            Log(SOAPY_SDR_WARNING, "rpitx: cannot pin the feeder thread to CPU %d (error %d)", cpu, err);
     }
 }
 
@@ -1185,7 +1254,6 @@ uint32_t SoapyRPITX_IQ_dmaSync::PumpData(uint32_t target) {
         fromFifo += m;
 
         lastDataPos = tracker.writePos();
-        consumedTotal += m;
     }
 
     if (fromFifo > 0) {
@@ -1239,15 +1307,16 @@ bool SoapyRPITX_IQ_dmaSync::FeederRetune(const SoapyRPITX_TuneConfig &request, b
     // Keep the data slots that were written to the ring but not played: they are sent first after the retune.
     // The slot that was executing is included, so at most one sample is sent twice and none is lost. Idle
     // slots before the first data slot are dropped; idle slots between data slots are kept as idle.
-    std::vector<std::complex<float>> pending;
-    std::vector<uint8_t> pendingIsData;
+    // The new replay list is built in preallocated buffers (no allocation in the feeder thread).
+    std::vector<std::complex<float>> &pending = replayScratch;
+    std::vector<uint8_t> &pendingIsData = replayIsDataScratch;
+    pending.clear();
+    pendingIsData.clear();
     uint64_t first = tracker.readPos();
     const uint64_t end = lastDataPos;
     if (end > first && end - first <= tracker.size()) {
         while (first < end && !slotIsData[tracker.slotOf(first)])
             first++;
-        pending.reserve((size_t) (end - first) + (replay.size() - replayPos));
-        pendingIsData.reserve(pending.capacity());
         for (uint64_t p = first; p < end; p++) {
             const uint32_t slot = tracker.slotOf(p);
             pending.push_back(shadow[slot]);
@@ -1273,18 +1342,19 @@ void SoapyRPITX_IQ_dmaSync::PublishDrainState() {
     // The push count is read after the FIFO was consumed in this period: equal counts mean that every sample
     // pushed so far is in the ring, and the ring position tells whether its last data slot has completed.
     const uint64_t pushed = fifo.pushedTotal();
-    const bool drained = consumedTotal == pushed && replayLeft.load() == 0 && tracker.readPos() >= lastDataPos;
+    const bool drained = fifo.poppedTotal() == pushed && replayLeft.load() == 0 && tracker.readPos() >= lastDataPos;
     drainedPush.store(drained ? pushed : kNotDrained);
 }
 
 void SoapyRPITX_IQ_dmaSync::RecoverDma() {
     dmaErrors.fetch_add(1);
-    SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: the DMA engine stopped (CS 0x%08x, DEBUG 0x%08x); restarting it", GetStatus(), GetDebugStatus());
+    Log(SOAPY_SDR_ERROR, "rpitx: the DMA engine stopped (CS 0x%08x, DEBUG 0x%08x); restarting it", GetStatus(), GetDebugStatus());
     const SoapyRPITX_TuneConfig current = tuneCfg;
     FeederRetune(current, true);
 }
 
 void SoapyRPITX_IQ_dmaSync::FeederLoop() {
+    feederId.store(std::this_thread::get_id());
     SetupFeederThread();
 
     auto next = clock::now();
@@ -1345,7 +1415,7 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
 
             uint64_t preroll = (uint64_t) rate * prerollMs / 1000;
             bool waitedLongEnough = firstQueuedValid && (now - firstQueuedTime) >= std::chrono::milliseconds(prerollMs);
-            if (running.load() && queued > 0 && (queued >= preroll || endBurst.load() || fifo.space() == 0 || waitedLongEnough)) {
+            if (running.load() && queued > 0 && (queued >= preroll || BurstEnded() || fifo.space() == 0 || waitedLongEnough)) {
                 StartDma();
                 inBurst = true;
                 firstQueuedValid = false;
@@ -1370,7 +1440,7 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
                             WriteIdleSlot(i);
                     }
                     tracker.resync(guard);
-                    SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: DMA overran the feeder");
+                    Log(SOAPY_SDR_DEBUG, "rpitx: DMA overran the feeder");
                 }
 
                 ScrubCompleted();
@@ -1384,7 +1454,7 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
 
                 if (fifo.size() == 0 && replayLeft.load() == 0 && tracker.fill() < (int64_t) low) {
                     if (inBurst) {
-                        if (!endBurst.load())
+                        if (!BurstEnded())
                             underflows.fetch_add(1);
                         inBurst = false;
                     }
@@ -1408,6 +1478,50 @@ void SoapyRPITX_IQ_dmaSync::FeederLoop() {
         }
     }
 
-    feederExited.store(true);
+    feederId.store(std::thread::id());
+    {
+        // Under the mutex, so that a Retune() evaluating its wait predicate cannot miss the notification.
+        std::lock_guard<std::mutex> lock(tuneMutex);
+        feederExited.store(true);
+    }
     tuneCv.notify_all();
+}
+
+void SoapyRPITX_IQ_dmaSync::Log(int level, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    if (feederId.load() != std::this_thread::get_id()) {
+        SoapySDR_vlogf((SoapySDRLogLevel) level, fmt, args);
+        va_end(args);
+        return;
+    }
+    // Feeder thread: the message is formatted into the queue (no allocation, no I/O) and printed by FlushLog().
+    const uint32_t head = logHead.load(std::memory_order_relaxed);
+    if (head - logTail.load(std::memory_order_acquire) >= kLogSlots) {
+        // Diagnostic (debug and trace) messages are dropped silently, the others are reported as a count.
+        if (level < SOAPY_SDR_DEBUG)
+            logDropped.fetch_add(1, std::memory_order_relaxed);
+        va_end(args);
+        return;
+    }
+    LogEntry &e = logRing[head % kLogSlots];
+    e.level = level;
+    std::vsnprintf(e.text, sizeof e.text, fmt, args);
+    va_end(args);
+    logHead.store(head + 1, std::memory_order_release);
+}
+
+void SoapyRPITX_IQ_dmaSync::FlushLog() {
+    std::lock_guard<std::mutex> lock(logMutex);
+    const uint32_t head = logHead.load(std::memory_order_acquire);
+    uint32_t tail = logTail.load(std::memory_order_relaxed);
+    while (tail != head) {
+        const LogEntry &e = logRing[tail % kLogSlots];
+        SoapySDR_log((SoapySDRLogLevel) e.level, e.text);
+        tail++;
+        logTail.store(tail, std::memory_order_release);
+    }
+    const uint32_t dropped = logDropped.exchange(0, std::memory_order_relaxed);
+    if (dropped != 0)
+        SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: %u message(s) of the feeder thread were dropped (log queue full)", dropped);
 }
