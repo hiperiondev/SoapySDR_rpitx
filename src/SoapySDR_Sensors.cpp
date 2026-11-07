@@ -31,7 +31,7 @@
 // ******************** Sensor API ********************
 
 std::vector<std::string> SoapyRPITX::listSensors(void) const {
-    return {"pll_locked", "dma_running", "fifo_fill", "underflows", "late", "dma_errors", "sample_rate", "envelope_clip", "envelope_late"};
+    return {"pll_locked", "dma_running", "fifo_fill", "underflows", "late", "dma_errors", "sample_rate", "envelope_clip", "envelope_late", "ptt", "ptt_count"};
 }
 
 SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
@@ -85,6 +85,16 @@ SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
         info.description = "Envelope words that could not be written ahead of their sample because the DMA ring was nearly empty.";
         info.type = SoapySDR::ArgInfo::INT;
         info.value = "0";
+    } else if (key == "ptt") {
+        info.name = "PTT";
+        info.description = "True while the transmitter is keyed: antenna relay in the TX position and, with rx_mute_tx, receiver muted.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+        info.value = "false";
+    } else if (key == "ptt_count") {
+        info.name = "PTT count";
+        info.description = "Times the transmitter has been keyed since the device was opened.";
+        info.type = SoapySDR::ArgInfo::INT;
+        info.value = "0";
     } else {
         throw std::runtime_error("rpitx: unknown sensor '" + key + "'");
     }
@@ -97,6 +107,11 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
 
     // Validates the key.
     SoapySDR::ArgInfo info = getSensorInfo(key);
+
+    if (key == "ptt")
+        return ptt->IsKeyed() ? "true" : "false";
+    if (key == "ptt_count")
+        return std::to_string(ptt->KeyCount());
 
     if (!tx_stream)
         return info.value;
@@ -129,4 +144,22 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
         return buf;
     }
     return std::to_string(stats.late);
+}
+
+std::vector<std::string> SoapyRPITX::listSensors(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listSensors(SOAPY_SDR_RX, channel);
+    return std::vector<std::string>();
+}
+
+SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const int direction, const size_t channel, const std::string &key) const {
+    if (!ForwardRx(direction))
+        throw std::runtime_error("rpitx: channel sensors exist only on the RX channel of a receiver");
+    return rxDev->getSensorInfo(SOAPY_SDR_RX, channel, key);
+}
+
+std::string SoapyRPITX::readSensor(const int direction, const size_t channel, const std::string &key) const {
+    if (!ForwardRx(direction))
+        throw std::runtime_error("rpitx: channel sensors exist only on the RX channel of a receiver");
+    return rxDev->readSensor(SOAPY_SDR_RX, channel, key);
 }

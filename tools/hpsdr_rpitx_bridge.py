@@ -7,18 +7,27 @@
 # the Free Software Foundation; either version 3, or (at your option)
 # any later version.
 #
-# HPSDR -> rpitx bridge.
+# HPSDR <-> rpitx bridge.
 #
 # Emulates an openHPSDR Protocol 1 radio (Metis, Hermes, Hermes II, Angelia, Orion, Orion II or Hermes-Lite 2)
 # so that SDR host programs (piHPSDR, Thetis, PowerSDR mRX, linHPSDR, Quisk, SparkSDR, ...) discover it and use
-# it as a radio. The TX I/Q stream of the host is transmitted with the SoapySDR rpitx driver (GPIO4).
+# it as a radio. The TX I/Q stream of the host is transmitted with the SoapySDR rpitx driver (GPIO4). With --rx
+# (for example --rx rtlsdr) the driver opens the receiver as its RX channel and the bridge works as a transceiver:
+# the receiver follows the host RX frequencies, its samples are down-converted and decimated to the host receive
+# sample rate and sent as the receiver I/Q of EP6; with --relay-gpio the driver switches an antenna T/R relay and
+# mutes the receiver while transmitting.
 #
 # Protocol coverage:
 #   - discovery over UDP (broadcast and directed) and over TCP, with the board specific reply layout;
 #   - start/stop of the receive I/Q stream (EP6) and of the wideband stream (EP4), over UDP or TCP;
 #   - decoding of every command and control (C&C) address of the host stream (EP2);
 #   - EP6 status words: PTT/dot/dash, IO inputs (all inactive), firmware version, forward/reverse power,
-#     supply voltage, ADC overloads, Hermes-Lite 2 temperature, TX FIFO state and request acknowledges;
+#     supply voltage, ADC overload (clipping of the receiver), Hermes-Lite 2 temperature, TX FIFO state and request
+#     acknowledges;
+#   - receiver I/Q (with --rx): every host receiver is a digital down-converter of the receiver capture, centred
+#     on its own frequency (receivers outside the capture bandwidth send zeros); the capture is retuned only when
+#     RX1 leaves it, and is offset from RX1 to keep the receiver DC spur out of the band; optional host control
+#     of the receiver gain (attenuator / LNA gain);
 #   - transmission of the host TX I/Q while the host asserts MOX, on the TX NCO frequency (or on the RX1
 #     frequency when the host clears the duplex bit);
 #   - radio side CW: internal iambic/straight keyer fed by optional GPIO paddles, Hermes-Lite 2 CWX keying
@@ -32,8 +41,9 @@
 # Firmware programming, flash erase and IP address change requests are recognised and ignored.
 #
 # Protocol 1 hosts pace their TX stream on the receive stream of the radio (one microphone sample per receive
-# sample at 48 kHz), so the bridge sends EP6 packets (noise or zeros as receiver I/Q, silent microphone) at the
-# receive sample rate requested by the host.
+# sample at 48 kHz), so the bridge sends EP6 packets (silent microphone) at the receive sample rate requested by
+# the host: paced by the receiver clock with --rx, otherwise paced by the system clock with noise or zeros as
+# receiver I/Q.
 #
 # Run as root on the Raspberry Pi, into a dummy load or through a band filter, on a frequency you are licensed for.
 
@@ -166,6 +176,16 @@ def address_allowed(allow, host):
         elif ip.version == item.version and ip in item:
             return True
     return False
+
+
+def parse_gain(text):
+    """Parses --rx-gain: 'auto' or a gain in dB."""
+    if text.strip().lower() == "auto":
+        return "auto"
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid gain '%s' (a value in dB or 'auto')" % text)
 
 
 def parse_mac(text):
@@ -408,12 +428,430 @@ class ControlState:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Radio device (rpitx transmitter, optionally with its receiver)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class Radio:
+    """Opens the SoapySDR device shared by the transmitter and the receiver.
+
+    Normally the rpitx driver is opened, with the receiver of --rx attached as its RX channel ("rx=<driver>",
+    "rx.<key>=<value>" for --rx-args) and the antenna relay settings. With --dry-run nothing is transmitted: only
+    the receiver of --rx, if any, is opened on its own. `sdr` is None when no device is needed.
+    """
+
+    def __init__(self, args):
+        self.sdr = None
+        self.SoapySDR = None
+        self.has_tx = False
+        self.has_rx = False
+        rx_args = parse_kwargs(args.rx_args, "--rx-args")
+        if args.dry_run and not args.rx:
+            return
+
+        import SoapySDR
+
+        self.SoapySDR = SoapySDR
+        if args.dry_run:
+            dev_args = dict(rx_args)
+            dev_args["driver"] = args.rx
+        else:
+            dev_args = dict(driver="rpitx", amplitude_mode=args.amplitude_mode)
+            if args.ppm is not None:
+                dev_args["ppm"] = str(args.ppm)
+            if args.relay_gpio is not None:
+                dev_args["relay_gpio"] = str(args.relay_gpio)
+                dev_args["relay_active_low"] = "true" if args.relay_active_low else "false"
+                dev_args["relay_tx_delay_ms"] = str(args.relay_tx_delay_ms)
+                dev_args["relay_hang_ms"] = str(args.relay_hang_ms)
+            if args.rx:
+                dev_args["rx_mute_tx"] = "false" if args.rx_during_tx else "true"
+                dev_args["rx"] = args.rx
+                for key, value in rx_args.items():
+                    dev_args["rx." + key] = value
+        self.sdr = SoapySDR.Device(dev_args)
+        self.has_tx = not args.dry_run
+        self.has_rx = bool(args.rx) and self.sdr.getNumChannels(SoapySDR.SOAPY_SDR_RX) > 0
+        if args.rx and not self.has_rx:
+            raise SystemExit("the receiver '%s' has no RX channel" % args.rx)
+        if self.has_rx:
+            info = self.sdr.getHardwareInfo()
+            print("receiver %s (%s)%s" % (args.rx, info.get("rx_hardware", self.sdr.getHardwareKey()),
+                                          ", full duplex" if self.sdr.getFullDuplex(SoapySDR.SOAPY_SDR_RX, 0) else ""))
+
+    def close(self):
+        """Drops the device (the streams must be closed first)."""
+        self.sdr = None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Receiver: capture, down-conversion and decimation to the host receivers
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def lowpass_taps(num_taps, cutoff):
+    """Blackman-windowed sinc low-pass; @cutoff is the -6 dB frequency relative to the input rate (0 < cutoff < 0.5)."""
+    n = np.arange(num_taps, dtype=np.float64) - (num_taps - 1) / 2.0
+    h = 2.0 * cutoff * np.sinc(2.0 * cutoff * n) * np.blackman(num_taps)
+    return (h / np.sum(h)).astype(np.float32)
+
+
+def decimation_stages(factor):
+    """Splits a decimation factor into stages of at most 10, largest first (for example 50 -> [10, 5])."""
+    stages = []
+    rest = factor
+    while rest > 1:
+        for d in range(min(10, rest), 1, -1):
+            if rest % d == 0:
+                stages.append(d)
+                rest //= d
+                break
+        else:
+            stages.append(rest)  # a prime above 10
+            rest = 1
+    return stages
+
+
+class Decimator:
+    """FIR low-pass filter and decimation by an integer factor, with state carried across blocks."""
+
+    def __init__(self, factor, final):
+        self.factor = factor
+        # The last stage defines the band edge (transition from 0.4 to 0.6 of the output rate); the earlier stages
+        # only have to keep their aliases away from that band, so they get wider transitions and fewer taps.
+        num_taps = (28 if final else 12) * factor + 1
+        self.taps = lowpass_taps(num_taps, 0.5 / factor)[::-1].copy()
+        self.history = np.zeros(num_taps - 1, dtype=np.complex64)
+
+    def process(self, x):
+        buf = np.concatenate((self.history, x))
+        n = len(self.taps)
+        if len(buf) < n:
+            self.history = buf
+            return np.zeros(0, dtype=np.complex64)
+        count = (len(buf) - n) // self.factor + 1
+        windows = np.lib.stride_tricks.sliding_window_view(buf, n)[: count * self.factor : self.factor]
+        out = (windows @ self.taps).astype(np.complex64)
+        self.history = buf[count * self.factor :]
+        return out
+
+
+class DownConverter:
+    """One host receiver: mixes its frequency down to 0 Hz and decimates the capture to the host rate."""
+
+    def __init__(self, capture_rate, factor):
+        self.capture_rate = capture_rate
+        self.shift = 0.0
+        self.phase = 0.0
+        self.enabled = True
+        stages = decimation_stages(factor)
+        self.stages = [Decimator(d, i == len(stages) - 1) for i, d in enumerate(stages)]
+
+    def process(self, x):
+        if self.shift != 0.0:
+            step = -2.0 * math.pi * self.shift / self.capture_rate
+            ph = self.phase + step * np.arange(len(x), dtype=np.float64)
+            x = x * np.exp(1j * ph).astype(np.complex64)
+            self.phase = float((self.phase + step * len(x)) % (2.0 * math.pi))
+        for stage in self.stages:
+            x = stage.process(x)
+        return x
+
+
+def ep6_payload(iq):
+    """Packs receiver samples (spf x num_rx complex, full scale 1.0) and a silent microphone into one EP6 frame payload."""
+    spf, num_rx = iq.shape
+    bps = 6 * num_rx + 2
+    vals = np.empty((spf, num_rx, 2), dtype=np.float64)
+    vals[:, :, 0] = iq.real
+    vals[:, :, 1] = iq.imag
+    vals = np.clip(np.rint(vals * 8388607.0), -8388608, 8388607).astype(">i4")
+    out = np.zeros((spf, bps), dtype=np.uint8)
+    out[:, : num_rx * 6] = vals.view(np.uint8).reshape(spf, num_rx * 2, 4)[:, :, 1:].reshape(spf, num_rx * 6)
+    payload = out.tobytes()
+    return payload + bytes(FRAME_LEN - 8 - len(payload))
+
+
+class Receiver:
+    """Owns the RX stream of the radio and turns the capture into host receiver samples.
+
+    One reader thread reads the capture (CF32), follows the host configuration (receive rate, number of
+    receivers, their frequencies and, with --follow-rx-gain, the attenuator / LNA gain), and queues blocks of
+    decimated samples (n x num_rx) that the EP6 sender takes with take(). The capture runs at an integer multiple
+    of the host rate accepted by the receiver; its centre is RX1 plus an offset that keeps the receiver DC spur out
+    of the RX1 band, and it is retuned only when RX1 leaves the usable bandwidth (90 % of the capture).
+    """
+
+    READ_TIMEOUT_US = 100000
+    MAX_BUFFER_S = 0.25
+    OVERLOAD_HOLD_S = 0.2
+
+    def __init__(self, args, radio, bridge):
+        self.args = args
+        self.bridge = bridge
+        self.control = bridge.control
+        self.sdr = radio.sdr
+        S = radio.SoapySDR
+        self.S = S
+        self.RX = S.SOAPY_SDR_RX
+        self.cond = threading.Condition()
+        self.blocks = collections.deque()
+        self.available = 0
+        self.layout = None  # (host rate, num_rx) of the queued samples
+        self.running = True
+        self.overflows = 0
+        self.errors = 0
+        self.retunes = 0
+        self.dropped = 0
+        self.overload_until = 0.0
+        self.rate = None
+        self.capture_rate = None
+        self.num_rx = 0
+        self.center = None
+        self.converters = []
+        self.outside = set()
+        self.gain_state = None
+        self.wideband = np.zeros(EP4_SAMPLES, dtype=np.float32)
+        self.freq_offset = args.rx_freq_offset if args.rx_freq_offset is not None else args.freq_offset
+
+        if args.rx_antenna:
+            self.sdr.setAntenna(self.RX, 0, args.rx_antenna)
+        if args.rx_ppm:
+            self.sdr.setFrequencyCorrection(self.RX, 0, args.rx_ppm)
+        self._set_gain(args.rx_gain)
+        self._configure(self.control.rx_rate, 1)
+        self._retune(self._host_freqs(1)[0])
+        self.stream = self.sdr.setupStream(self.RX, S.SOAPY_SDR_CF32, [0], parse_kwargs(args.rx_stream_args, "--rx-stream-args"))
+        try:
+            self.mtu = max(1024, int(self.sdr.getStreamMTU(self.stream)))
+            self.sdr.activateStream(self.stream)
+        except BaseException:
+            self.sdr.closeStream(self.stream)
+            raise
+        self.thread = threading.Thread(target=self._reader, name="rx-reader", daemon=True)
+        self.thread.start()
+
+    # ---- configuration (reader thread, and the constructor) ----
+
+    def _set_gain(self, gain):
+        if gain == "auto":
+            if self.sdr.hasGainMode(self.RX, 0):
+                self.sdr.setGainMode(self.RX, 0, True)
+            else:
+                print("the receiver has no automatic gain; set --rx-gain", file=sys.stderr)
+        else:
+            if self.sdr.hasGainMode(self.RX, 0):
+                self.sdr.setGainMode(self.RX, 0, False)
+            r = self.sdr.getGainRange(self.RX, 0)
+            self.sdr.setGain(self.RX, 0, max(r.minimum(), min(r.maximum(), float(gain))))
+
+    def _follow_gain(self):
+        """Maps the host attenuator (Hermes family) or LNA gain (Hermes-Lite 2) to the receiver gain."""
+        s = self.control.snapshot(("lna_gain", "adc1_attenuator"))
+        state = (s["lna_gain"], s["adc1_attenuator"])
+        if state == self.gain_state:
+            return
+        self.gain_state = state
+        r = self.sdr.getGainRange(self.RX, 0)
+        if self.bridge.board.hl2:
+            gain = s["lna_gain"] - 12.0  # HL2 LNA gain code 0..60 is -12..+48 dB
+        else:
+            gain = r.maximum() - s["adc1_attenuator"]
+        self._set_gain(max(r.minimum(), min(r.maximum(), gain)))
+        print("RX gain %.1f dB (host %s)" % (self.sdr.getGain(self.RX, 0), "LNA" if self.bridge.board.hl2 else "attenuator"))
+
+    def _capture_rate(self, rate):
+        """Smallest integer multiple of @rate the receiver accepts (or --rx-rate when it is a multiple)."""
+        ranges = self.sdr.getSampleRateRange(self.RX, 0)
+
+        def accepted(fs):
+            return any(r.minimum() - 0.5 <= fs <= r.maximum() + 0.5 for r in ranges)
+
+        if self.args.rx_rate:
+            fs = self.args.rx_rate
+            if fs % rate == 0 and accepted(fs):
+                return fs
+            print("--rx-rate %.0f is not a multiple of %d accepted by the receiver: choosing the capture rate" % (fs, rate),
+                  file=sys.stderr)
+        for factor in range(1, 257):
+            if accepted(rate * factor):
+                return rate * factor
+        raise RuntimeError("the receiver accepts no integer multiple of %d S/s" % rate)
+
+    def _configure(self, rate, num_rx):
+        """Sets the capture rate for a host rate and builds the down-converters; queued samples are dropped."""
+        if rate != self.rate:
+            fs = self._capture_rate(rate)
+            self.sdr.setSampleRate(self.RX, 0, fs)
+            self.capture_rate = fs
+            self.rate = rate
+            self.center = None  # the usable bandwidth changed: recentre on RX1
+            print("RX capture %.0f S/s, decimation %d to %d S/s" % (fs, fs // rate, rate))
+        factor = self.capture_rate // self.rate
+        self.converters = [DownConverter(self.capture_rate, factor) for _ in range(num_rx)]
+        self.num_rx = num_rx
+        self.outside.clear()
+        with self.cond:
+            self.blocks.clear()
+            self.available = 0
+            self.layout = (self.rate, num_rx)
+
+    def _limit(self):
+        """Highest |shift| + half the host band that stays in the usable part of the capture."""
+        return 0.45 * self.capture_rate
+
+    def _offset(self):
+        """Distance between the capture centre and RX1 (keeps the DC spur of the receiver out of the RX1 band)."""
+        if self.args.rx_offset is not None:
+            return self.args.rx_offset
+        offset = self._limit() / 2.0
+        return offset if offset > 0.55 * self.rate else 0.0
+
+    def _retune(self, rx1):
+        self.center = rx1 + self._offset()
+        self.sdr.setFrequency(self.RX, 0, self.center)
+        self.retunes += 1
+
+    def _host_freqs(self, num_rx):
+        s = self.control.snapshot(("common_frequency",))
+        default = self.args.initial_freq
+        freqs = []
+        for i in range(num_rx):
+            f = self.control.rx_freq[0 if s["common_frequency"] else i] or (self.control.rx_freq[0] or default)
+            freqs.append(float(f) + self.freq_offset)
+        return freqs
+
+    def _follow_host(self):
+        s = self.control.snapshot(("rx_rate", "num_rx"))
+        num_rx = max(1, min(s["num_rx"], 12))
+        if s["rx_rate"] != self.rate or num_rx != self.num_rx:
+            self._configure(s["rx_rate"], num_rx)
+        if self.args.follow_rx_gain:
+            self._follow_gain()
+        freqs = self._host_freqs(num_rx)
+        half = self.rate / 2.0
+        shift = freqs[0] - self.center if self.center is not None else None
+        offset_mode = self._offset() > 0
+        if shift is None or abs(shift) + half > self._limit() or (offset_mode and abs(shift) < half):
+            try:
+                self._retune(freqs[0])
+            except Exception as e:
+                print("cannot tune the receiver to %.0f Hz: %s" % (freqs[0], e), file=sys.stderr)
+                return
+        for i, (conv, f) in enumerate(zip(self.converters, freqs)):
+            conv.shift = f - self.center
+            conv.enabled = abs(conv.shift) + half <= self._limit()
+            if not conv.enabled and i not in self.outside:
+                self.outside.add(i)
+                print("RX%d %.6f MHz is outside the receiver capture (%.6f MHz +/- %.0f kHz): sending zeros"
+                      % (i + 1, f / 1e6, self.center / 1e6, self._limit() / 1e3))
+            elif conv.enabled:
+                self.outside.discard(i)
+
+    # ---- reader thread ----
+
+    def _reader(self):
+        buf = np.empty(self.mtu, dtype=np.complex64)
+        was_streaming = False
+        while self.running:
+            try:
+                self._follow_host()
+            except Exception as e:
+                self.errors += 1
+                print("receiver configuration failed: %s" % e, file=sys.stderr)
+                time.sleep(0.1)
+                continue
+            sr = self.sdr.readStream(self.stream, [buf], len(buf), timeoutUs=self.READ_TIMEOUT_US)
+            if sr.ret == self.S.SOAPY_SDR_TIMEOUT:
+                continue
+            if sr.ret == self.S.SOAPY_SDR_OVERFLOW:
+                self.overflows += 1
+                continue
+            if sr.ret < 0:
+                self.errors += 1
+                time.sleep(0.01)
+                continue
+            x = buf[: sr.ret]
+            peak = float(np.max(np.maximum(np.abs(x.real), np.abs(x.imag)))) if sr.ret else 0.0
+            if peak >= 0.99:
+                self.overload_until = time.monotonic() + self.OVERLOAD_HOLD_S
+            streaming = self.bridge.streaming
+            if streaming and not was_streaming:
+                # A new host stream starts with fresh samples.
+                with self.cond:
+                    self.blocks.clear()
+                    self.available = 0
+            was_streaming = streaming
+            if not streaming:
+                continue
+            if len(x) >= EP4_SAMPLES:
+                self.wideband = (x[-EP4_SAMPLES:].real * 0.5).astype(np.float32)
+            outs = []
+            for conv in self.converters:
+                y = conv.process(x)
+                outs.append(y if conv.enabled else np.zeros_like(y))
+            if not outs or len(outs[0]) == 0:
+                continue
+            block = np.stack(outs, axis=1)
+            with self.cond:
+                self.blocks.append(block)
+                self.available += len(block)
+                limit = int(self.rate * self.MAX_BUFFER_S)
+                while self.available > limit and len(self.blocks) > 1:
+                    old = self.blocks.popleft()
+                    self.available -= len(old)
+                    self.dropped += len(old)
+                self.cond.notify_all()
+
+    # ---- EP6 sender ----
+
+    def take(self, count, rate, num_rx, timeout):
+        """Returns @count samples (count x num_rx complex64) of the given layout, or None after @timeout seconds."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while self.running:
+                if self.layout == (rate, num_rx) and self.available >= count:
+                    parts = []
+                    need = count
+                    while need > 0:
+                        b = self.blocks[0]
+                        if len(b) <= need:
+                            parts.append(self.blocks.popleft())
+                            need -= len(b)
+                        else:
+                            parts.append(b[:need])
+                            self.blocks[0] = b[need:]
+                            need = 0
+                    self.available -= count
+                    return np.concatenate(parts) if len(parts) > 1 else parts[0]
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.cond.wait(left)
+        return None
+
+    def overload(self):
+        return time.monotonic() < self.overload_until
+
+    def close(self):
+        self.running = False
+        with self.cond:
+            self.cond.notify_all()
+        self.thread.join()
+        try:
+            self.sdr.deactivateStream(self.stream)
+            self.sdr.closeStream(self.stream)
+        except Exception as e:
+            print("closing RX stream: %s" % e, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Transmitter
 # ---------------------------------------------------------------------------------------------------------------
 
 
 class Transmitter:
-    """Owns the rpitx SoapySDR stream. Samples, frequency and drive changes are applied by one writer thread.
+    """Owns the rpitx SoapySDR TX stream. Samples, frequency and drive changes are applied by one writer thread.
 
     The request fields (pending_freq, pending_gain) and the statistics are plain attributes shared between
     threads; single attribute reads and writes are atomic under the CPython GIL.
@@ -421,7 +859,7 @@ class Transmitter:
 
     WRITE_TIMEOUT_US = 20000
 
-    def __init__(self, args):
+    def __init__(self, args, radio):
         self.args = args
         self.queue = queue.Queue()
         self.max_queued = max(1, int(TX_RATE * args.queue_ms / 1000))
@@ -442,21 +880,20 @@ class Transmitter:
         self.underflows = 0
         self.late = 0
         self.envelope = 0.0
+        self.ptt = False
         stream_args = parse_kwargs(args.stream_args, "--stream-args")
 
-        if args.dry_run:
+        if not radio.has_tx:
             print("dry run: nothing is transmitted")
             self.current_gain = args.gain
         else:
-            import SoapySDR
-            from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_TX
+            SoapySDR = radio.SoapySDR
+            SOAPY_SDR_CF32 = SoapySDR.SOAPY_SDR_CF32
+            SOAPY_SDR_TX = SoapySDR.SOAPY_SDR_TX
 
             self.SoapySDR = SoapySDR
             self.SOAPY_SDR_TX = SOAPY_SDR_TX
-            dev_args = dict(driver="rpitx", amplitude_mode=args.amplitude_mode)
-            if args.ppm is not None:
-                dev_args["ppm"] = str(args.ppm)
-            self.sdr = SoapySDR.Device(dev_args)
+            self.sdr = radio.sdr
             try:
                 self.sdr.setSampleRate(SOAPY_SDR_TX, 0, TX_RATE)
                 self.sdr.setGain(SOAPY_SDR_TX, 0, args.gain)
@@ -466,7 +903,7 @@ class Transmitter:
                 self.stream = self.sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [0], stream_args)
                 self.sdr.activateStream(self.stream)
             except BaseException:
-                # Release the transmitter before the error propagates: nothing else holds the device yet.
+                # Release the TX stream before the error propagates.
                 if self.stream is not None:
                     try:
                         self.sdr.closeStream(self.stream)
@@ -558,6 +995,7 @@ class Transmitter:
             self.fifo_fill = float(self.sdr.readSensor("fifo_fill"))
             self.underflows = int(float(self.sdr.readSensor("underflows")))
             self.late = int(float(self.sdr.readSensor("late")))
+            self.ptt = self.sdr.readSensor("ptt") == "true"
         except Exception:
             pass
 
@@ -930,8 +1368,14 @@ class Bridge:
         # whatever was opened is released when the construction fails or is interrupted.
         self.udp = None
         self.tcp_listen = None
+        self.radio = None
         self.tx = None
+        self.rx = None
         self.keys = None
+        self.streaming = False
+        used = [p for p in (args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio) if p is not None]
+        if args.relay_gpio is not None and args.relay_gpio in used:
+            raise SystemExit("GPIO%d cannot be both the antenna relay and a key or PTT input" % args.relay_gpio)
         inputs = KeyInputs(args.gpio_chip, args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio)
         try:
             self._open(args, inputs)
@@ -977,12 +1421,16 @@ class Bridge:
         self.cwx_hang = 0
         self.cwx_ptt = False
 
+        self.rx_stalls = 0
         self.requests = collections.deque(maxlen=16)  # Hermes-Lite 2 acknowledges to send
         self.stop = threading.Event()
         self.sender = None
         self._payload_cache = {}
 
-        self.tx = Transmitter(args)
+        self.radio = Radio(args)
+        self.tx = Transmitter(args, self.radio)
+        if self.radio.has_rx:
+            self.rx = Receiver(args, self.radio, self)
         if inputs.enabled:
             if args.key_dot_gpio is not None or args.key_dash_gpio is not None:
                 self.keys = Keyer(self, inputs, args.cw_ramp_ms)
@@ -995,6 +1443,10 @@ class Bridge:
             self.keys.stop()
         if self.tx is not None:
             self.tx.close()
+        if self.rx is not None:
+            self.rx.close()
+        if self.radio is not None:
+            self.radio.close()
         if self.tcp_listen is not None:
             self.tcp_listen.close()
         if self.udp is not None:
@@ -1306,8 +1758,9 @@ class Bridge:
         addr = k % rotation
         c1 = c2 = c3 = c4 = 0
         if addr == 0:
-            # IO1..IO4 inputs are active low: all inactive (no TX inhibit, no auto tune request).
-            c1 = 0x1E
+            # IO1..IO4 inputs are active low: all inactive (no TX inhibit, no auto tune request); bit 0 is the
+            # ADC overload, reported while the receiver clips.
+            c1 = 0x1E | (1 if self.rx is not None and self.rx.overload() else 0)
             c4 = self.firmware & 0xFF
             if self.board.metis:
                 c2 = self.args.mercury_version & 0xFF
@@ -1339,12 +1792,19 @@ class Bridge:
         wb_period = 1.0 / self.args.wideband_rate if self.args.wideband_rate > 0 else 0
         next_wb = time.perf_counter()
         rng = np.random.default_rng(99)
+        # With a receiver the packets are paced by its samples; while it delivers nothing (reconfiguration, stall)
+        # the system clock paces packets of noise, so that the host keeps sending its TX stream.
+        rx_paced = self.rx is not None
+        reconfig_since = None
         while gen == self.stream_gen and not self.stop.is_set() and not link.closed:
             now = time.perf_counter()
             if self.wideband and wb_period and now >= next_wb:
                 next_wb = now + wb_period
                 for _ in range(EP4_PACKETS_PER_BLOCK):
-                    wb = np.clip(rng.normal(0, max(self.args.rx_noise, 1e-6) * 32767, EP4_SAMPLES), -32768, 32767)
+                    if self.rx is not None:
+                        wb = np.clip(self.rx.wideband * 32767, -32768, 32767)
+                    else:
+                        wb = np.clip(rng.normal(0, max(self.args.rx_noise, 1e-6) * 32767, EP4_SAMPLES), -32768, 32767)
                     link.send(bytes([0xEF, 0xFE, 0x01, 0x04]) + struct.pack(">I", seq4) + wb.astype("<i2").tobytes())
                     seq4 = (seq4 + 1) & 0xFFFFFFFF
             if not self.streaming:
@@ -1358,17 +1818,42 @@ class Bridge:
                 sent_samples = 0
             num_rx = max(1, min(self.control.num_rx, 12))
             payloads, spf = self._payloads(num_rx)
-            due = (time.perf_counter() - t0) * rate
-            if sent_samples > due:
-                time.sleep(min(0.002, (sent_samples - due) / rate))
-                continue
+            data = None
+            if self.rx is not None:
+                data = self.rx.take(2 * spf, rate, num_rx, 0.2 if rx_paced else 0.0)
+                if data is not None:
+                    reconfig_since = None
+                    if not rx_paced:
+                        rx_paced = True
+                        print("receiver samples flowing")
+                elif rx_paced and self.streaming and gen == self.stream_gen:
+                    # A new rate or number of receivers takes the reader one capture block to apply; only a
+                    # receiver that stays silent with the requested layout (or fails to apply it) is a stall.
+                    now = time.perf_counter()
+                    if self.rx.layout != (rate, num_rx) and (reconfig_since is None or now - reconfig_since < 1.0):
+                        reconfig_since = reconfig_since or now
+                        continue
+                    reconfig_since = None
+                    rx_paced = False
+                    self.rx_stalls += 1
+                    print("receiver delivers no samples: sending noise", file=sys.stderr)
+                    t0 = time.perf_counter()
+                    sent_samples = 0
+            if data is None:
+                due = (time.perf_counter() - t0) * rate
+                if sent_samples > due:
+                    time.sleep(min(0.002, (sent_samples - due) / rate))
+                    continue
             frames = []
-            for _ in range(2):
-                frames.append(SYNC + self._status(k) + payloads[k % len(payloads)])
+            for j in range(2):
+                body = ep6_payload(data[j * spf : (j + 1) * spf]) if data is not None else payloads[k % len(payloads)]
+                frames.append(SYNC + self._status(k) + body)
                 k += 1
             if not link.send(bytes([0xEF, 0xFE, 0x01, 0x06]) + struct.pack(">I", seq6) + b"".join(frames)):
                 time.sleep(0.01)
             seq6 = (seq6 + 1) & 0xFFFFFFFF
+            if data is not None:
+                continue
             sent_samples += 2 * spf
             # After a long stall do not burst to catch up: restart the pacing clock.
             if due - sent_samples > rate * 0.2:
@@ -1454,7 +1939,12 @@ class Bridge:
         host_freq = "%.6f MHz" % (s["tx_freq"] / 1e6) if s["tx_freq"] else "-"
         sensors = ""
         if self.tx.sdr is not None:
-            sensors = " | fifo %.0f%% underflows %d late %d" % (self.tx.fifo_fill, self.tx.underflows, self.tx.late)
+            sensors = " | fifo %.0f%% underflows %d late %d%s" % (self.tx.fifo_fill, self.tx.underflows, self.tx.late,
+                                                                 " | PTT/relay TX" if self.tx.ptt else "")
+        if self.rx is not None:
+            sensors += " | rx %s MHz capture %.0f kS/s overflows %d dropped %d stalls %d%s" % (
+                "%.6f" % (self.rx.center / 1e6) if self.rx.center else "-", (self.rx.capture_rate or 0) / 1e3,
+                self.rx.overflows, self.rx.dropped, self.rx_stalls, " OVERLOAD" if self.rx.overload() else "")
         print("%s | rx %d kHz x%d | host TX %s%s | MOX %s | PTT %s | TX %s | ep2 %d lost %d reordered %d | tx %d samples dropped %d%s" % (
             self.link.describe() if self.link else "no host",
             s["rx_rate"] // 1000,
@@ -1473,9 +1963,9 @@ class Bridge:
         ))
 
     def serve(self):
-        print("HPSDR Protocol 1 %s emulation on %s:%d UDP%s (MAC %s, firmware %d)" % (
+        print("HPSDR Protocol 1 %s emulation on %s:%d UDP%s (MAC %s, firmware %d), %s" % (
             self.board.name, self.args.bind, self.args.port, "/TCP" if self.tcp_listen else "", self.mac.hex(":"),
-            self.firmware))
+            self.firmware, "transceiver (receiver %s)" % self.args.rx if self.rx is not None else "transmitter only"))
         if self.args.freq is not None:
             print("fixed TX frequency %.6f MHz (host frequency ignored)" % (self.args.freq / 1e6))
         else:
@@ -1514,6 +2004,9 @@ class Bridge:
             if self.keys is not None:
                 self.keys.stop()
             self.tx.close()
+            if self.rx is not None:
+                self.rx.close()
+            self.radio.close()
             for sock in list(self.tcp_clients):
                 self._close_tcp(sock)
             if self.tcp_listen is not None:
@@ -1575,8 +2068,40 @@ def main():
     p.add_argument("--port", type=int, default=HPSDR_PORT, help="UDP and TCP port")
     p.add_argument("--report", type=float, default=2.0, help="status report period in seconds (0 = off)")
     p.add_argument("--verbose", action="store_true", help="print every change of the host C&C settings")
-    p.add_argument("--dry-run", action="store_true", help="speak the protocol but do not open the transmitter")
+    p.add_argument("--dry-run", action="store_true",
+                   help="speak the protocol but do not open the transmitter (the receiver of --rx is still opened, on its own)")
+    rx = p.add_argument_group("receiver (transceiver operation)")
+    rx.add_argument("--rx", default=None, metavar="DRIVER",
+                    help="SoapySDR driver of the receiver attached to rpitx, e.g. 'rtlsdr'; without it the receiver I/Q is noise")
+    rx.add_argument("--rx-args", default="", help="receiver device arguments, e.g. 'serial=00000001,direct_samp=2'")
+    rx.add_argument("--rx-stream-args", default="", help="receiver stream arguments, e.g. 'buffers=8,bufflen=16384'")
+    rx.add_argument("--rx-gain", type=parse_gain, default="auto", help="receiver gain in dB, or 'auto' for its AGC")
+    rx.add_argument("--follow-rx-gain", action="store_true",
+                    help="set the receiver gain from the host attenuator (Hermes family) or LNA gain (Hermes-Lite 2)")
+    rx.add_argument("--rx-antenna", default=None, help="receiver antenna (default: the receiver default)")
+    rx.add_argument("--rx-ppm", type=float, default=0.0, help="receiver crystal correction in ppm")
+    rx.add_argument("--rx-rate", type=parse_frequency, default=None,
+                    help="receiver capture rate; must be a multiple of the host rate (default: smallest accepted multiple)")
+    rx.add_argument("--rx-offset", type=parse_frequency, default=None,
+                    help="capture centre minus RX1, keeps the receiver DC spur out of the band (default: a quarter of the "
+                         "usable capture when it fits, else 0)")
+    rx.add_argument("--rx-freq-offset", type=parse_frequency, default=None,
+                    help="offset added to the host RX frequencies (up/down-converter; default: --freq-offset)")
+    rx.add_argument("--rx-during-tx", action="store_true",
+                    help="keep the receiver samples while transmitting (default: the driver mutes them while keyed)")
+    relay = p.add_argument_group("antenna relay (T/R switching by the driver)")
+    relay.add_argument("--relay-gpio", type=int, default=None,
+                       help="GPIO of the antenna relay: TX position while the transmitter is keyed")
+    relay.add_argument("--relay-active-low", action="store_true", help="the relay is in the TX position with the pin low")
+    relay.add_argument("--relay-tx-delay-ms", type=int, default=20, help="relay settling time before the first TX sample")
+    relay.add_argument("--relay-hang-ms", type=int, default=100,
+                       help="time the relay stays in TX (and the receiver muted) after the last TX sample")
     args = p.parse_args()
+
+    if args.relay_gpio is not None and args.relay_gpio == 4:
+        p.error("--relay-gpio cannot be GPIO4, the rpitx RF output")
+    if args.relay_gpio is not None and args.dry_run:
+        print("warning: --relay-gpio has no effect with --dry-run (the driver is not opened)", file=sys.stderr)
 
     if not bind_is_loopback(args.bind):
         print("warning: listening on %s: Protocol 1 has no authentication, any host allowed by --allow (%s) that can reach "

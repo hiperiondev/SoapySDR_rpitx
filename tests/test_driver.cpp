@@ -10,7 +10,9 @@
 // frequency correction, stream argument validation, CS16/CS8/CF32 scaling, END_BURST draining,
 // readStreamStatus and sensors. The build points the device tree, /dev/mem and /dev/vcio paths to files
 // generated in the build directory (see CMakeLists.txt). Also covers the profile file format, the checks of
-// profile files, the profile=<file> device argument / setting and the limits of numeric inputs and timeouts.
+// profile files, the profile=<file> device argument / setting and the limits of numeric inputs and timeouts,
+// the transceiver mode with a simulated SoapySDR receiver registered by this test (forwarding of the RX API,
+// enumeration, receive muting while keyed) and the antenna relay GPIO on the simulated GPIO registers.
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -24,6 +26,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +36,8 @@
 
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Errors.hpp>
+#include <SoapySDR/Formats.hpp>
+#include <SoapySDR/Registry.hpp>
 
 #include "SoapyRPITX.hpp"
 #include "mock_hw.hpp"
@@ -49,6 +55,192 @@ int failures = 0;
     } while (0)
 
 constexpr uint32_t kRate = 48000;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Simulated receiver: a SoapySDR driver registered as "rpitx_test_rx" that streams a constant CS16 / CF32 value.
+// ---------------------------------------------------------------------------------------------------------------
+
+constexpr int16_t kRxValue = 1000;
+
+std::mutex g_rxLock;
+SoapySDR::Kwargs g_rxMakeArgs;
+int g_rxAlive = 0;
+
+class FakeRx : public SoapySDR::Device {
+public:
+    FakeRx(const SoapySDR::Kwargs &args) {
+        std::lock_guard<std::mutex> lock(g_rxLock);
+        g_rxMakeArgs = args;
+        if (args.count("fail"))
+            throw std::runtime_error("simulated open failure");
+        g_rxAlive++;
+    }
+    ~FakeRx() {
+        std::lock_guard<std::mutex> lock(g_rxLock);
+        g_rxAlive--;
+    }
+    std::string getDriverKey() const {
+        return "rpitx_test_rx";
+    }
+    std::string getHardwareKey() const {
+        return "FakeRx";
+    }
+    SoapySDR::Kwargs getHardwareInfo() const {
+        return {{"tuner", "R820T"}};
+    }
+    size_t getNumChannels(const int direction) const {
+        return direction == SOAPY_SDR_RX ? 1 : 0;
+    }
+    std::vector<std::string> getStreamFormats(const int, const size_t) const {
+        return {SOAPY_SDR_CS16, SOAPY_SDR_CF32, SOAPY_SDR_CU8};
+    }
+    std::string getNativeStreamFormat(const int, const size_t, double &fullScale) const {
+        fullScale = 32768;
+        return SOAPY_SDR_CS16;
+    }
+    SoapySDR::Stream *setupStream(const int direction, const std::string &format, const std::vector<size_t> &, const SoapySDR::Kwargs &) {
+        if (direction != SOAPY_SDR_RX)
+            throw std::runtime_error("RX only");
+        streamFormat = format;
+        return reinterpret_cast<SoapySDR::Stream *>(&streamFormat);
+    }
+    void closeStream(SoapySDR::Stream *) {
+        closed++;
+    }
+    int activateStream(SoapySDR::Stream *, const int, const long long, const size_t) {
+        active = true;
+        return 0;
+    }
+    int deactivateStream(SoapySDR::Stream *, const int, const long long) {
+        active = false;
+        return 0;
+    }
+    size_t getStreamMTU(SoapySDR::Stream *) const {
+        return 512;
+    }
+    int readStream(SoapySDR::Stream *, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long) {
+        if (!active)
+            return SOAPY_SDR_STREAM_ERROR;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        size_t n = std::min<size_t>(numElems, 256);
+        if (streamFormat == SOAPY_SDR_CS16) {
+            int16_t *p = static_cast<int16_t *>(buffs[0]);
+            for (size_t i = 0; i < 2 * n; i++)
+                p[i] = kRxValue;
+        } else if (streamFormat == SOAPY_SDR_CU8) {
+            uint8_t *p = static_cast<uint8_t *>(buffs[0]);
+            for (size_t i = 0; i < 2 * n; i++)
+                p[i] = 200;
+        } else {
+            float *p = static_cast<float *>(buffs[0]);
+            for (size_t i = 0; i < 2 * n; i++)
+                p[i] = 0.25f;
+        }
+        flags = SOAPY_SDR_HAS_TIME;
+        timeNs = 1234;
+        return (int) n;
+    }
+    std::vector<std::string> listAntennas(const int, const size_t) const {
+        return {"RX"};
+    }
+    std::string getAntenna(const int, const size_t) const {
+        return "RX";
+    }
+    std::vector<std::string> listGains(const int, const size_t) const {
+        return {"TUNER"};
+    }
+    bool hasGainMode(const int, const size_t) const {
+        return true;
+    }
+    void setGainMode(const int, const size_t, const bool automatic) {
+        agc = automatic;
+    }
+    bool getGainMode(const int, const size_t) const {
+        return agc;
+    }
+    void setGain(const int, const size_t, const std::string &, const double value) {
+        gain = value;
+    }
+    double getGain(const int, const size_t, const std::string &) const {
+        return gain;
+    }
+    SoapySDR::Range getGainRange(const int, const size_t, const std::string &) const {
+        return SoapySDR::Range(0, 49.6);
+    }
+    void setFrequency(const int, const size_t, const std::string &, const double frequency, const SoapySDR::Kwargs &) {
+        freq = frequency;
+    }
+    double getFrequency(const int, const size_t, const std::string &) const {
+        return freq;
+    }
+    std::vector<std::string> listFrequencies(const int, const size_t) const {
+        return {"RF"};
+    }
+    SoapySDR::RangeList getFrequencyRange(const int, const size_t, const std::string &) const {
+        return {SoapySDR::Range(24e6, 1766e6)};
+    }
+    void setSampleRate(const int, const size_t, const double r) {
+        if (r < 225001 || r > 3200000)
+            throw std::runtime_error("rate out of range");
+        rate = r;
+    }
+    double getSampleRate(const int, const size_t) const {
+        return rate;
+    }
+    SoapySDR::RangeList getSampleRateRange(const int, const size_t) const {
+        return {SoapySDR::Range(225001, 300000), SoapySDR::Range(900001, 3200000)};
+    }
+    bool hasFrequencyCorrection(const int, const size_t) const {
+        return true;
+    }
+    void setFrequencyCorrection(const int, const size_t, const double value) {
+        ppm = value;
+    }
+    double getFrequencyCorrection(const int, const size_t) const {
+        return ppm;
+    }
+    SoapySDR::ArgInfoList getSettingInfo() const {
+        SoapySDR::ArgInfo a;
+        a.key = "direct_samp";
+        a.name = "Direct sampling";
+        a.value = "0";
+        return {a};
+    }
+    void writeSetting(const std::string &key, const std::string &value) {
+        if (key != "direct_samp")
+            throw std::runtime_error("unknown");
+        directSamp = value;
+    }
+    std::string readSetting(const std::string &key) const {
+        if (key != "direct_samp")
+            throw std::runtime_error("unknown");
+        return directSamp;
+    }
+
+    std::string streamFormat;
+    std::atomic<bool> active{false};
+    int closed = 0;
+    bool agc = false;
+    double gain = 0, freq = 100e6, rate = 2.4e6, ppm = 0;
+    std::string directSamp = "0";
+};
+
+SoapySDR::KwargsList findFakeRx(const SoapySDR::Kwargs &args) {
+    SoapySDR::KwargsList out;
+    for (const char *serial : {"RX0001", "RX0002"}) {
+        auto it = args.find("serial");
+        if (it != args.end() && it->second != serial)
+            continue;
+        out.push_back({{"label", std::string("Fake RTL ") + serial}, {"serial", serial}, {"tuner", "R820T"}});
+    }
+    return out;
+}
+
+SoapySDR::Device *makeFakeRx(const SoapySDR::Kwargs &args) {
+    return new FakeRx(args);
+}
+
+SoapySDR::Registry registerFakeRx("rpitx_test_rx", &findFakeRx, &makeFakeRx, SOAPY_SDR_ABI_VERSION);
 
 template <typename F>
 bool throws(F f) {
@@ -615,6 +807,347 @@ void testProfileFileChecks() {
     std::remove(target);
 }
 
+int rxAlive() {
+    std::lock_guard<std::mutex> lock(g_rxLock);
+    return g_rxAlive;
+}
+
+SoapySDR::Kwargs rxMakeArgs() {
+    std::lock_guard<std::mutex> lock(g_rxLock);
+    return g_rxMakeArgs;
+}
+
+// Reads one block from the RX stream and returns its first I value (or INT32_MIN on error).
+int32_t readFirstI(SoapyRPITX &dev, SoapySDR::Stream *rx) {
+    std::vector<int16_t> buf(2 * 256, -1);
+    void *buffs[] = {buf.data()};
+    int flags = 0;
+    long long timeNs = 0;
+    int n = dev.readStream(rx, buffs, 256, flags, timeNs, 100000);
+    if (n <= 0)
+        return INT32_MIN;
+    CHECK(flags == SOAPY_SDR_HAS_TIME && timeNs == 1234);
+    for (int i = 1; i < 2 * n; i++)
+        if (buf[i] != buf[0])
+            return INT32_MIN;
+    return buf[0];
+}
+
+void testReceiverForwarding() {
+    {
+        // Without a receiver the device stays TX only.
+        SoapyRPITX dev(SoapySDR::Kwargs{});
+        CHECK(dev.getNumChannels(SOAPY_SDR_RX) == 0);
+        CHECK(!dev.getFullDuplex(SOAPY_SDR_TX, 0));
+        CHECK(dev.listAntennas(SOAPY_SDR_RX, 0).empty());
+        CHECK(throws([&] { dev.setFrequency(SOAPY_SDR_RX, 0, 100e6); }));
+        CHECK(throws([&] { dev.writeSetting("rx.direct_samp", "1"); }));
+        CHECK(dev.getHardwareInfo().count("rx_driver") == 0);
+    }
+
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "no_such_driver"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"rx.fail", "1"}}); }));
+    CHECK(rxAlive() == 0);
+    {
+        SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "none"}});
+        CHECK(dev.getNumChannels(SOAPY_SDR_RX) == 0);
+    }
+
+    {
+        SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"rx.serial", "RX0002"}, {"rx.direct_samp", "2"}});
+        CHECK(rxAlive() == 1);
+        SoapySDR::Kwargs made = rxMakeArgs();
+        CHECK(made["driver"] == "rpitx_test_rx" && made["serial"] == "RX0002" && made["direct_samp"] == "2" && made.count("rx") == 0);
+
+        CHECK(dev.getNumChannels(SOAPY_SDR_RX) == 1 && dev.getNumChannels(SOAPY_SDR_TX) == 1);
+        CHECK(dev.getFullDuplex(SOAPY_SDR_RX, 0) && dev.getFullDuplex(SOAPY_SDR_TX, 0));
+        SoapySDR::Kwargs info = dev.getHardwareInfo();
+        CHECK(info["rx_driver"] == "rpitx_test_rx" && info["rx_hardware"] == "FakeRx" && info["rx.tuner"] == "R820T");
+
+        // Control API forwarded for RX, TX unchanged.
+        dev.setFrequency(SOAPY_SDR_RX, 0, 145.5e6);
+        CHECK(dev.getFrequency(SOAPY_SDR_RX, 0) == 145.5e6);
+        CHECK(dev.getFrequency(SOAPY_SDR_RX, 0, "RF") == 145.5e6);
+        dev.setFrequency(SOAPY_SDR_TX, 0, 144.8e6);
+        CHECK(dev.getFrequency(SOAPY_SDR_TX, 0) == 144.8e6 && dev.getFrequency(SOAPY_SDR_RX, 0) == 145.5e6);
+        CHECK(dev.getFrequencyRange(SOAPY_SDR_RX, 0).front().minimum() == 24e6);
+        CHECK(dev.listAntennas(SOAPY_SDR_RX, 0) == std::vector<std::string>{"RX"});
+        CHECK(dev.getAntenna(SOAPY_SDR_RX, 0) == "RX" && dev.getAntenna(SOAPY_SDR_TX, 0) == RPITX_ANTENNA_NAME);
+        CHECK(dev.listGains(SOAPY_SDR_RX, 0) == std::vector<std::string>{"TUNER"});
+        dev.setGain(SOAPY_SDR_RX, 0, "TUNER", 30);
+        CHECK(dev.getGain(SOAPY_SDR_RX, 0, "TUNER") == 30);
+        CHECK(dev.hasGainMode(SOAPY_SDR_RX, 0) && !dev.hasGainMode(SOAPY_SDR_TX, 0));
+        dev.setGainMode(SOAPY_SDR_RX, 0, true);
+        CHECK(dev.getGainMode(SOAPY_SDR_RX, 0));
+        dev.setGain(SOAPY_SDR_TX, 0, 3);
+        CHECK(dev.getGain(SOAPY_SDR_TX, 0) == 3);
+        CHECK(throws([&] { dev.setSampleRate(SOAPY_SDR_RX, 0, 100000); }));
+        dev.setSampleRate(SOAPY_SDR_RX, 0, 240000);
+        CHECK(dev.getSampleRate(SOAPY_SDR_RX, 0) == 240000 && dev.getSampleRateRange(SOAPY_SDR_RX, 0).size() == 2);
+        CHECK(dev.hasFrequencyCorrection(SOAPY_SDR_RX, 0));
+        dev.setFrequencyCorrection(SOAPY_SDR_RX, 0, 55);
+        CHECK(dev.getFrequencyCorrection(SOAPY_SDR_RX, 0) == 55);
+        dev.setFrequencyCorrection(SOAPY_SDR_TX, 0, 1.5);
+        CHECK(dev.getFrequencyCorrection(SOAPY_SDR_TX, 0) == 1.5);
+        CHECK(dev.getStreamFormats(SOAPY_SDR_RX, 0).size() == 3);
+        double fullScale = 0;
+        CHECK(dev.getNativeStreamFormat(SOAPY_SDR_RX, 0, fullScale) == SOAPY_SDR_CS16 && fullScale == 32768);
+
+        // Receiver settings with the rx. prefix.
+        CHECK(dev.readSetting("rx.direct_samp") == "0");
+        dev.writeSetting("rx.direct_samp", "1");
+        CHECK(dev.readSetting("rx.direct_samp") == "1");
+        bool listed = false;
+        for (const auto &a : dev.getSettingInfo())
+            listed = listed || a.key == "rx.direct_samp";
+        CHECK(listed);
+        CHECK(throws([&] { dev.writeSetting("rx.nope", "1"); }));
+
+        // RX and TX streams at the same time; handles are distinct and not interchangeable.
+        CHECK(throws([&] { dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {1}); }));
+        SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+        CHECK(rx != nullptr);
+        CHECK(throws([&] { dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16); }));
+        SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+        CHECK(tx != nullptr && tx != rx);
+        CHECK(dev.getStreamMTU(rx) == 512);
+        CHECK(dev.activateStream(rx) == 0);
+        CHECK(readFirstI(dev, rx) == kRxValue);
+        std::vector<std::complex<float>> buf(16);
+        const void *wbuffs[] = {buf.data()};
+        int flags = 0;
+        CHECK(dev.writeStream(rx, wbuffs, buf.size(), flags, 0, 1000) == SOAPY_SDR_STREAM_ERROR);
+        std::vector<int16_t> rbuf(32);
+        void *rbuffs[] = {rbuf.data()};
+        long long timeNs = 0;
+        CHECK(dev.readStream(tx, rbuffs, 16, flags, timeNs, 1000) == SOAPY_SDR_STREAM_ERROR);
+        CHECK(dev.deactivateStream(rx) == 0);
+        dev.closeStream(rx);
+        CHECK(dev.readStream(rx, rbuffs, 16, flags, timeNs, 1000) == SOAPY_SDR_STREAM_ERROR);
+        dev.closeStream(tx);
+
+        // An RX stream left open is closed with the device.
+        SoapySDR::Stream *again = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+        CHECK(again != nullptr && again != rx);
+        CHECK(dev.activateStream(again) == 0);
+    }
+    CHECK(rxAlive() == 0);
+}
+
+void testReceiverEnumeration() {
+    SoapySDR::FindFunctions finders = SoapySDR::Registry::listFindFunctions();
+    CHECK(finders.count("rpitx") == 1);
+    if (finders.count("rpitx") == 0)
+        return;
+    SoapySDR::FindFunction find = finders["rpitx"];
+
+    // The TX-only entry stays first; the transceiver entries name the receiver to open.
+    SoapySDR::KwargsList plain = find(SoapySDR::Kwargs{});
+    CHECK(!plain.empty() && plain.front().count("rx") == 0);
+
+    SoapySDR::KwargsList trx = find(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}});
+    CHECK(trx.size() == 2);
+    if (trx.size() == 2) {
+        CHECK(trx[0]["rx"] == "rpitx_test_rx" && trx[0]["rx.serial"] == "RX0001" && trx[1]["rx.serial"] == "RX0002");
+        CHECK(trx[0]["label"].find("transceiver") != std::string::npos && trx[0]["tuner"] == "R820T");
+    }
+    SoapySDR::KwargsList one = find(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"rx.serial", "RX0002"}});
+    CHECK(one.size() == 1 && one.front()["rx.serial"] == "RX0002");
+    CHECK(find(SoapySDR::Kwargs{{"rx", "none"}}).size() == 1);
+    // A missing receiver still yields one entry: opening it reports the reason.
+    SoapySDR::KwargsList missing = find(SoapySDR::Kwargs{{"rx", "no_such_driver"}});
+    CHECK(missing.size() == 1 && missing.front()["rx"] == "no_such_driver");
+
+    // An entry opens the transceiver it describes.
+    if (trx.size() == 2) {
+        SoapyRPITX dev(trx[1]);
+        CHECK(dev.getNumChannels(SOAPY_SDR_RX) == 1 && rxMakeArgs()["serial"] == "RX0002");
+    }
+}
+
+constexpr int kRelayPin = 17;
+constexpr uint32_t kRelayBit = 1u << kRelayPin;
+constexpr unsigned kGpset0 = 0x1C / 4;
+constexpr unsigned kGpclr0 = 0x28 / 4;
+
+void clearSetClr() {
+    if (MockRegisters(GENERAL_BASE) == nullptr)
+        return; // not mapped yet: nothing written
+    MockPoke(GENERAL_BASE, kGpset0, 0);
+    MockPoke(GENERAL_BASE, kGpclr0, 0);
+}
+
+// Waits until the ptt sensor reads @p keyed; returns false on timeout.
+bool waitPtt(SoapyRPITX &dev, bool keyed, int timeoutMs) {
+    for (int i = 0; i < timeoutMs; i++) {
+        if ((dev.readSensor("ptt") == "true") == keyed)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+void testRelaySettings() {
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "4"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "28"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "1"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_tx_delay_ms", "5000"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_active_low", "maybe"}}); }));
+
+    // Opening drives the RX level first and then makes the pin an output.
+    MockPokeBits(GENERAL_BASE, GPFSEL1, 7u << 21, 0);
+    clearSetClr();
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"relay_hang_ms", "30"}, {"relay_tx_delay_ms", "40"}});
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL1) >> 21) & 7) == fsel_output);
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0 && (MockPeek(GENERAL_BASE, kGpset0) & kRelayBit) == 0);
+    CHECK(dev.readSetting("relay_gpio") == "17" && dev.readSetting("relay_hang_ms") == "30" && dev.readSetting("relay_active_low") == "false");
+    CHECK(dev.getHardwareInfo()["relay_gpio"] == "GPIO17");
+    CHECK(dev.readSensor("ptt") == "false" && dev.readSensor("ptt_count") == "0");
+
+    // Polarity: active low drives the pin high in RX.
+    clearSetClr();
+    dev.writeSetting("relay_active_low", "true");
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & kRelayBit) != 0);
+    dev.writeSetting("relay_active_low", "false");
+
+    // Streams that would use the relay pin are refused; the pin cannot change while a stream is open.
+    dev.writeSetting("relay_gpio", "20");
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL1) >> 21) & 7) == fsel_input); // released
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rf_dac", "true"}}); }));
+    dev.writeSetting("relay_gpio", "17");
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+    CHECK(throws([&] { dev.writeSetting("relay_gpio", "22"); }));
+    CHECK(throws([&] { dev.writeSetting("relay_active_low", "true"); }));
+    dev.writeSetting("relay_hang_ms", "30"); // timing may change at any time
+    dev.closeStream(st);
+    dev.writeSetting("relay_gpio", "-1");
+    CHECK(dev.getHardwareInfo()["relay_gpio"] == "none");
+}
+
+void testRelaySequencing() {
+    clearSetClr();
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"relay_hang_ms", "30"}, {"relay_tx_delay_ms", "40"}});
+    dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(st) == 0);
+    CHECK(dev.readSensor("ptt") == "false");
+
+    // The first write switches the relay to TX and waits for it before queueing.
+    clearSetClr();
+    std::vector<std::complex<float>> buf(kRate / 10, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = SOAPY_SDR_END_BURST;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(40));
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & kRelayBit) != 0);
+    CHECK(dev.readSensor("ptt") == "true" && dev.readSensor("ptt_count") == "1");
+
+    // Back to RX once the burst has been played and the hang time has elapsed.
+    CHECK(waitPtt(dev, false, 2000));
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+    CHECK(carrierOn(engine.Take()) == buf.size());
+
+    // A second burst keys again; deactivating unkeys at once.
+    clearSetClr();
+    flags = 0;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(dev.readSensor("ptt") == "true" && dev.readSensor("ptt_count") == "2");
+    CHECK(dev.deactivateStream(st) == 0);
+    CHECK(dev.readSensor("ptt") == "false" && (MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+
+    // Closing a keyed stream returns the relay to RX.
+    CHECK(dev.activateStream(st) == 0);
+    flags = 0;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    clearSetClr();
+    dev.closeStream(st);
+    CHECK(dev.readSensor("ptt") == "false" && (MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+}
+
+void testRelayLowBank() {
+    // A relay pin in GPFSEL0 keeps its output function while the DMA rewrites that register.
+    clearSetClr();
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "5"}, {"relay_hang_ms", "0"}, {"relay_tx_delay_ms", "0"}});
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL0) >> 15) & 7) == fsel_output);
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(st) == 0);
+    std::vector<std::complex<float>> buf(kRate / 20, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = SOAPY_SDR_END_BURST;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & (1u << 5)) != 0);
+    CHECK(dev.deactivateStream(st) == 0);
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL0) >> 15) & 7) == fsel_output);
+    CHECK(carrierOn(engine.Take()) == buf.size());
+    dev.closeStream(st);
+}
+
+void testReceiverMute() {
+    for (bool mute : {true, false}) {
+        SoapyRPITX dev(SoapySDR::Kwargs{
+                {"rx", "rpitx_test_rx"}, {"relay_gpio", "17"}, {"relay_hang_ms", "20"}, {"relay_tx_delay_ms", "0"}, {"rx_mute_tx", mute ? "true" : "false"}});
+        CHECK(dev.readSetting("rx_mute_tx") == (mute ? "true" : "false"));
+        dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+        MockDmaEngine engine(14, kRate);
+        SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
+        SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+        CHECK(dev.activateStream(rx) == 0 && dev.activateStream(tx) == 0);
+        CHECK(readFirstI(dev, rx) == kRxValue);
+
+        std::vector<std::complex<float>> buf(kRate / 5, std::complex<float>(1.0f, 0.0f));
+        const void *buffs[] = {buf.data()};
+        int flags = SOAPY_SDR_END_BURST;
+        CHECK(dev.writeStream(tx, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+        CHECK(readFirstI(dev, rx) == (mute ? 0 : kRxValue));
+        CHECK(waitPtt(dev, false, 2000));
+        CHECK(readFirstI(dev, rx) == kRxValue);
+        dev.closeStream(tx);
+        dev.closeStream(rx);
+    }
+
+    // Unsigned formats are muted to mid-scale.
+    SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"relay_hang_ms", "1000"}});
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *rx = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CU8);
+    SoapySDR::Stream *tx = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(rx) == 0 && dev.activateStream(tx) == 0);
+    std::vector<std::complex<float>> buf(480, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = 0;
+    CHECK(dev.writeStream(tx, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    std::vector<uint8_t> u8(2 * 64, 0);
+    void *rbuffs[] = {u8.data()};
+    long long timeNs = 0;
+    int n = dev.readStream(rx, rbuffs, 64, flags, timeNs, 100000);
+    CHECK(n == 64 && u8[0] == 0x80 && u8[2 * 64 - 1] == 0x80);
+    dev.closeStream(tx);
+    dev.closeStream(rx);
+}
+
+void testRelayProfile() {
+    const char *path = "test_profile_relay.rpitx";
+    {
+        std::ofstream out(path);
+        out << "relay_gpio=22\nrelay_active_low=true\nrelay_hang_ms=250\nrx_mute_tx=false\n";
+    }
+    chmod(path, 0644);
+    SoapyRPITX dev(SoapySDR::Kwargs{{"profile", path}, {"relay_hang_ms", "60"}});
+    CHECK(dev.readSetting("relay_gpio") == "22" && dev.readSetting("relay_active_low") == "true");
+    CHECK(dev.readSetting("relay_hang_ms") == "60"); // the device argument takes precedence
+    CHECK(dev.readSetting("rx_mute_tx") == "false");
+    {
+        std::ofstream out(path);
+        out << "relay_gpio=4\n";
+    }
+    CHECK(throws([&] { dev.writeSetting("profile", path); }));
+    CHECK(dev.readSetting("relay_gpio") == "22");
+    std::remove(path);
+}
+
 int main() {
     testSettings();
     testStreamArguments();
@@ -630,6 +1163,13 @@ int main() {
     testProfileDevice();
     testInputLimits();
     testProfileFileChecks();
+    testReceiverForwarding();
+    testReceiverEnumeration();
+    testRelaySettings();
+    testRelaySequencing();
+    testRelayLowBank();
+    testReceiverMute();
+    testRelayProfile();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

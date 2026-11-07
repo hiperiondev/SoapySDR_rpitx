@@ -1,6 +1,7 @@
 /**
  * @file SoapyRPITX.hpp
- * @brief SoapySDR device driver for the librpitx GPIO transmitter (TX only, one channel).
+ * @brief SoapySDR device driver for the librpitx GPIO transmitter (one TX channel), optionally combined with a
+ *        SoapySDR receiver (RTL-SDR) as RX channel and an antenna relay GPIO into a half-duplex transceiver.
  *
  * @copyright Copyright 2023 Emiliano Augusto Gonzalez (egonzalez . hiperion @ gmail . com)
  *
@@ -35,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <SoapySDR/Device.hpp>
@@ -44,11 +46,16 @@
 
 #include "SoapyRPITX_IQ_dmaSync.hpp"
 #include "SoapyRPITX_Profile.hpp"
+#include "SoapyRPITX_Ptt.hpp"
 
 /** @brief Name of the only antenna (the RF output pin). */
 #define RPITX_ANTENNA_NAME "GPIO4"
 /** @brief Name of the only gain element (pad drive strength). */
 #define RPITX_GAIN_NAME "PAD"
+/** @brief Device argument selecting the SoapySDR driver of the receiver ("rtlsdr"; "none" or empty: TX only). */
+#define RPITX_RX_ARG "rx"
+/** @brief Prefix of the device arguments and settings forwarded to the receiver (for example "rx.serial"). */
+#define RPITX_RX_PREFIX "rx."
 
 /**
  * @brief Identification of the running board.
@@ -103,14 +110,15 @@ typedef enum rpitxStreamFormat {
 class tx_streamer {
 public:
     /**
-     * @brief Creates the stream and the transmitter hardware object.
+     * @brief Creates the stream, the transmitter hardware object and the keying supervisor thread.
      * @param format Host sample format.
      * @param cfg    Transmitter configuration.
+     * @param ptt    Keyed state and antenna relay of the device, shared with the receive path.
      * @throws std::runtime_error when the hardware cannot be initialised.
      */
-    tx_streamer(rpitxStreamFormat format, const SoapyRPITX_TxConfig &cfg);
+    tx_streamer(rpitxStreamFormat format, const SoapyRPITX_TxConfig &cfg, std::shared_ptr<SoapyRPITX_Ptt> ptt);
 
-    /** @brief Stops transmission and releases the hardware. */
+    /** @brief Stops transmission, unkeys and releases the hardware. */
     ~tx_streamer();
 
     tx_streamer(const tx_streamer &) = delete;
@@ -120,6 +128,8 @@ public:
      * @brief Queues samples for transmission.
      *
      * Blocks while the FIFO is full, up to @p timeoutUs. Partial writes are reported through the return value.
+     * The first write after an idle period keys the transmitter; with an antenna relay it first waits for the
+     * relay delay (relay_tx_delay_ms), which is not counted in @p timeoutUs.
      *
      * @param buffs     One buffer (channel 0) in the stream format.
      * @param numElems  Number of complex samples in the buffer.
@@ -157,7 +167,7 @@ public:
     long drainTimeoutUs();
 
     /**
-     * @brief Stops the transmitter (samples still queued are discarded).
+     * @brief Stops the transmitter (samples still queued are discarded) and unkeys.
      * @return 0.
      */
     int deactivate();
@@ -175,13 +185,17 @@ public:
     SoapyRPITX_IQ_dmaSync &transmitter();
 
     /**
-     * @brief Starts closing: stops the transmitter and makes send() and readStatus() running in other threads return.
+     * @brief Starts closing: stops the transmitter, unkeys and makes send() and readStatus() running in other
+     *        threads return.
      *
      * Thread-safe; after this call readStatus() returns SOAPY_SDR_STREAM_ERROR.
      */
     void interrupt();
 
 private:
+    /** @brief Supervisor thread: unkeys the transmitter once it has been drained for the relay hang time. */
+    void Supervise();
+
     rpitxStreamFormat format;                        ///< Host sample format.
     std::unique_ptr<SoapyRPITX_IQ_dmaSync> iqsender; ///< Transmitter.
     std::vector<std::complex<float>> scratch;        ///< Conversion buffer.
@@ -189,34 +203,55 @@ private:
     bool timeWarningShown = false;                   ///< SOAPY_SDR_HAS_TIME warning already logged (producer thread only).
     std::atomic<uint64_t> reportedEvents{0};         ///< Underflow, overrun and DMA error events already reported.
     std::atomic<bool> closing{false};                ///< interrupt() was called: the stream is being closed.
+    std::shared_ptr<SoapyRPITX_Ptt> ptt;             ///< Keyed state and antenna relay.
+    std::atomic<bool> supervising{true};             ///< The supervisor thread keeps running.
+    std::thread supervisor;                          ///< Keying supervisor thread.
 };
 
 /**
- * @brief SoapySDR device for the Raspberry Pi GPIO transmitter.
+ * @brief SoapySDR device for the Raspberry Pi GPIO transmitter, optionally a half-duplex transceiver.
  *
  * Device arguments (also accepted as settings, see getSettingInfo()): ppm, ppm_ntp, harmonic, amplitude_mode,
- * iq_scale, debug_level, and the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
+ * iq_scale, debug_level, the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
  * sigma_delta_order, envelope_delay, envelope_floor, rfdac_lut, eer_lut, eer_ampm_lut, eer_gain, eer_offset,
- * eer_idle, eer_drive). Other device arguments are reported with a warning, except the identification keys
- * produced by enumeration or by SoapySDR (driver, label, product, serial, manufacturer, tuner, type) and keys
- * containing ':'.
+ * eer_idle, eer_drive) and the transmit/receive switching keys (relay_gpio, relay_active_low, relay_tx_delay_ms,
+ * relay_hang_ms, rx_mute_tx). Other device arguments are reported with a warning, except the identification keys
+ * produced by enumeration or by SoapySDR (driver, label, product, serial, manufacturer, tuner, type), keys
+ * containing ':', and the receiver keys below.
  * Stream arguments: see getStreamArgsInfo().
+ *
+ * Receiver: the device argument "rx=<driver>" (for example "rx=rtlsdr") opens a SoapySDR receiver through its
+ * installed module and exposes its channel 0 as RX channel 0 of this device. Device arguments "rx.<key>=<value>"
+ * are passed to the receiver as "<key>=<value>" (for example "rx.serial=00000001"); its settings are available as
+ * "rx.<key>". Every RX call (streams, frequency, gain, antennas, sample rate, bandwidth, corrections, sensors,
+ * channel settings) is forwarded to it, and the device then reports one RX and one TX channel and full duplex
+ * streaming (both streams may run at the same time). While the transmitter is keyed the receive samples are
+ * replaced by silence (rx_mute_tx). Enumeration lists the TX-only device first and, when the "rx" argument is not
+ * given, one transceiver entry for every RTL-SDR found.
+ *
+ * Antenna relay: relay_gpio selects a GPIO that switches an external T/R relay: it is driven to the TX position
+ * before the first sample of a transmission (which waits relay_tx_delay_ms), and back to the RX position once the
+ * transmission has been played and relay_hang_ms has elapsed, when the stream is deactivated or closed, and when
+ * the device is closed.
  */
 class SoapyRPITX : public SoapySDR::Device {
 public:
     /**
      * @brief Opens the device.
      *
-     * With the argument "profile=<file>" the profile is loaded first (see LoadProfile()); setting keys given as
-     * device arguments are then applied with writeSetting() and take precedence over the same keys of the profile.
+     * The antenna relay, when configured, is driven to the RX position first. With the argument "profile=<file>"
+     * the profile is loaded next (see LoadProfile()); setting keys given as device arguments are then applied with
+     * writeSetting() and take precedence over the same keys of the profile. The receiver selected by "rx" is
+     * opened last.
      *
      * @param args Device arguments; known setting keys are applied with writeSetting().
-     * @throws std::runtime_error when the board is not supported, /dev/mem is not accessible, or the profile
-     *         cannot be read or holds an invalid value.
+     * @throws std::runtime_error when the board is not supported, /dev/mem is not accessible, the profile cannot
+     *         be read or holds an invalid value, a relay setting is invalid, or the receiver cannot be opened
+     *         (driver not installed, "rpitx" itself, no RX channel, or refused by its module).
      */
     SoapyRPITX(const SoapySDR::Kwargs &args);
 
-    /** @brief Stops and closes the stream, if any, and releases the hardware. */
+    /** @brief Stops and closes the streams, if any, closes the receiver, returns the relay to RX and releases the hardware. */
     ~SoapyRPITX();
 
     /*******************************************************************
@@ -237,7 +272,8 @@ public:
 
     /**
      * @brief Returns hardware information.
-     * @return Driver version, board model, serial and origin.
+     * @return Driver version, board model, serial, origin, antenna relay GPIO; with a receiver also rx_driver,
+     *         rx_hardware and its own hardware information with the "rx." prefix.
      */
     SoapySDR::Kwargs getHardwareInfo(void) const;
 
@@ -248,15 +284,19 @@ public:
     /**
      * @brief Returns the number of channels.
      * @param direction SOAPY_SDR_TX or SOAPY_SDR_RX.
-     * @return 1 for TX, 0 for RX.
+     * @return 1 for TX; 1 for RX with a receiver, otherwise 0.
      */
     size_t getNumChannels(const int direction) const;
 
     /**
-     * @brief Tells whether TX and RX can run at the same time.
+     * @brief Tells whether TX and RX streams can run at the same time.
+     *
+     * With a receiver both streams run concurrently; the antenna is shared through the relay, and the receive
+     * samples are muted while the transmitter is keyed unless rx_mute_tx is false.
+     *
      * @param direction Direction.
      * @param channel   Channel.
-     * @return False (TX only).
+     * @return True with a receiver, false without one (TX only).
      */
     bool getFullDuplex(const int direction, const size_t channel) const;
 
@@ -268,7 +308,7 @@ public:
      * @brief Lists the supported host formats.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return CF32, CS16 and CS8 for TX; empty for RX.
+     * @return CF32, CS16 and CS8 for TX; the formats of the receiver for RX (empty without one).
      */
     std::vector<std::string> getStreamFormats(const int direction, const size_t channel) const;
 
@@ -276,8 +316,8 @@ public:
      * @brief Returns the native format.
      * @param direction Direction.
      * @param channel   Channel.
-     * @param fullScale Receives 1.0.
-     * @return CF32.
+     * @param fullScale Receives 1.0 for TX, the full scale of the receiver for RX.
+     * @return CF32 for TX, the native format of the receiver for RX.
      */
     std::string getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const;
 
@@ -303,19 +343,24 @@ public:
      *
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Argument descriptions (empty for RX).
+     * @return Argument descriptions; for RX the stream arguments of the receiver (empty without one).
      */
     SoapySDR::ArgInfoList getStreamArgsInfo(const int direction, const size_t channel) const;
 
     /**
-     * @brief Creates the TX stream.
-     * @param direction Must be SOAPY_SDR_TX.
-     * @param format    CF32, CS16 or CS8.
+     * @brief Creates the TX stream, or the RX stream of the receiver.
+     *
+     * One stream per direction can be open; the RX stream is created on channel 0 of the receiver with the
+     * format and arguments given here.
+     *
+     * @param direction SOAPY_SDR_TX, or SOAPY_SDR_RX with a receiver.
+     * @param format    CF32, CS16 or CS8 for TX; a format of the receiver for RX.
      * @param channels  Empty or {0}.
      * @param args      Stream arguments (see getStreamArgsInfo()).
      * @return Stream handle.
-     * @throws std::runtime_error for RX, an unsupported format or channel, invalid arguments, an already open
-     *         stream, or a hardware initialisation failure.
+     * @throws std::runtime_error for RX without a receiver, an unsupported format or channel, invalid arguments, a
+     *         stream already open in that direction, a TX stream argument that needs the antenna relay GPIO, or a
+     *         hardware or receiver initialisation failure.
      */
     SoapySDR::Stream *setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels = std::vector<size_t>(),
                                   const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
@@ -323,44 +368,58 @@ public:
     /**
      * @brief Stops and destroys a stream.
      *
-     * The carrier is turned off immediately (queued samples are discarded), also while another thread waits in
-     * deactivateStream() for the end of a burst. A writeStream() or readStreamStatus() running in another thread
-     * is woken up and returns (SOAPY_SDR_STREAM_ERROR / partial count) before the stream is destroyed; closeStream()
-     * waits for it.
+     * TX: the carrier is turned off immediately (queued samples are discarded), also while another thread waits in
+     * deactivateStream() for the end of a burst, and the relay returns to RX. A writeStream() or readStreamStatus()
+     * running in another thread is woken up and returns (SOAPY_SDR_STREAM_ERROR / partial count) before the stream
+     * is destroyed; closeStream() waits for it.
+     * RX: the receiver stream is deactivated and closed after the readStream() / readStreamStatus() calls in
+     * flight have returned.
      *
      * @param stream Stream handle.
      */
     void closeStream(SoapySDR::Stream *stream);
 
     /**
-     * @brief Returns the preferred number of samples per writeStream() call.
+     * @brief Returns the preferred number of samples per writeStream() / readStream() call.
      * @param stream Stream handle.
-     * @return MTU in samples, 0 for an invalid handle.
+     * @return MTU in samples (the MTU of the receiver for the RX stream), 0 for an invalid handle.
      */
     size_t getStreamMTU(SoapySDR::Stream *stream) const;
 
     /**
-     * @brief Starts transmission; activating an active stream has no effect.
+     * @brief Starts transmission (activating an active TX stream has no effect), or starts the receiver stream.
      * @param stream   Stream handle.
-     * @param flags    SOAPY_SDR_HAS_TIME is not supported.
-     * @param timeNs   Ignored.
-     * @param numElems Ignored.
-     * @return 0, SOAPY_SDR_NOT_SUPPORTED for timed activation, or SOAPY_SDR_STREAM_ERROR for an invalid handle.
+     * @param flags    TX: SOAPY_SDR_HAS_TIME is not supported. RX: passed to the receiver.
+     * @param timeNs   TX: ignored. RX: passed to the receiver.
+     * @param numElems TX: ignored. RX: passed to the receiver.
+     * @return 0, SOAPY_SDR_NOT_SUPPORTED for timed TX activation, SOAPY_SDR_STREAM_ERROR for an invalid handle,
+     *         or the result of the receiver.
      */
     int activateStream(SoapySDR::Stream *stream, const int flags = 0, const long long timeNs = 0, const size_t numElems = 0);
 
     /**
-     * @brief Stops transmission and turns the carrier off.
+     * @brief Stops transmission, turns the carrier off and returns the relay to RX, or stops the receiver stream.
      * @param stream Stream handle.
-     * @param flags  Ignored.
-     * @param timeNs Ignored.
-     * @return 0, or SOAPY_SDR_STREAM_ERROR for an invalid handle.
+     * @param flags  TX: ignored. RX: passed to the receiver.
+     * @param timeNs TX: ignored. RX: passed to the receiver.
+     * @return 0, SOAPY_SDR_STREAM_ERROR for an invalid handle, or the result of the receiver.
      */
     int deactivateStream(SoapySDR::Stream *stream, const int flags = 0, const long long timeNs = 0);
 
     /**
-     * @brief Receiving is not supported.
-     * @return SOAPY_SDR_NOT_SUPPORTED.
+     * @brief Reads samples from the receiver stream.
+     *
+     * Not serialised with the control API. While the transmitter is keyed and rx_mute_tx is true the samples
+     * returned are replaced by silence (zero, or mid-scale for unsigned formats); flags and time are kept.
+     *
+     * @param stream    RX stream handle.
+     * @param buffs     One buffer (channel 0) in the stream format.
+     * @param numElems  Capacity of the buffer in samples.
+     * @param flags     Receives the flags of the receiver.
+     * @param timeNs    Receives the time of the receiver.
+     * @param timeoutUs Maximum blocking time in microseconds.
+     * @return Number of samples read or a SOAPY_SDR_* error code (SOAPY_SDR_STREAM_ERROR for a handle that is not
+     *         the open RX stream).
      */
     int readStream(SoapySDR::Stream *stream, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long timeoutUs = 100000);
 
@@ -378,13 +437,15 @@ public:
                     const long timeoutUs = 100000);
 
     /**
-     * @brief Reports underflow events (see tx_streamer::readStatus()).
+     * @brief Reports underflow events of the TX stream (see tx_streamer::readStatus()), or the status of the
+     *        receiver stream.
      * @param stream    Stream handle.
      * @param chanMask  Receives the channel mask.
      * @param flags     Receives the flags.
      * @param timeNs    Unchanged.
      * @param timeoutUs Maximum waiting time in microseconds.
-     * @return SOAPY_SDR_UNDERFLOW, SOAPY_SDR_TIMEOUT or SOAPY_SDR_STREAM_ERROR.
+     * @return TX: SOAPY_SDR_UNDERFLOW, SOAPY_SDR_TIMEOUT or SOAPY_SDR_STREAM_ERROR. RX: the result of the receiver,
+     *         or SOAPY_SDR_STREAM_ERROR for an invalid handle.
      */
     int readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, int &flags, long long &timeNs, const long timeoutUs);
 
@@ -393,14 +454,14 @@ public:
      ******************************************************************/
 
     /**
-     * @brief Lists the sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors, sample_rate,
-     *        envelope_clip, envelope_late.
+     * @brief Lists the global sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors,
+     *        sample_rate, envelope_clip, envelope_late, ptt, ptt_count.
      * @return Sensor keys.
      */
     std::vector<std::string> listSensors(void) const;
 
     /**
-     * @brief Describes a sensor.
+     * @brief Describes a global sensor.
      * @param key Sensor key.
      * @return Sensor description.
      * @throws std::runtime_error for an unknown key.
@@ -408,12 +469,41 @@ public:
     SoapySDR::ArgInfo getSensorInfo(const std::string &key) const;
 
     /**
-     * @brief Reads a sensor.
+     * @brief Reads a global sensor.
      * @param key Sensor key.
-     * @return Value as a string ("false"/"0" while no stream exists).
+     * @return Value as a string (the transmitter sensors read "false"/"0" while no TX stream exists; ptt and
+     *         ptt_count are always available).
      * @throws std::runtime_error for an unknown key.
      */
     std::string readSensor(const std::string &key) const;
+
+    /**
+     * @brief Lists the channel sensors.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return The channel sensors of the receiver for RX; empty for TX.
+     */
+    std::vector<std::string> listSensors(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Describes a channel sensor.
+     * @param direction Must be SOAPY_SDR_RX with a receiver.
+     * @param channel   Channel.
+     * @param key       Sensor key.
+     * @return Sensor description of the receiver.
+     * @throws std::runtime_error for TX or without a receiver.
+     */
+    SoapySDR::ArgInfo getSensorInfo(const int direction, const size_t channel, const std::string &key) const;
+
+    /**
+     * @brief Reads a channel sensor.
+     * @param direction Must be SOAPY_SDR_RX with a receiver.
+     * @param channel   Channel.
+     * @param key       Sensor key.
+     * @return Value read by the receiver.
+     * @throws std::runtime_error for TX or without a receiver.
+     */
+    std::string readSensor(const int direction, const size_t channel, const std::string &key) const;
 
     /*******************************************************************
      * Settings API
@@ -433,6 +523,11 @@ public:
      * - envelope_delay: envelope delay relative to the phase path, in samples; envelope_floor: carrier-off level.
      * - rfdac_lut: amplitude with GPIO4 only, GPIO20 only and both (rf_dac stream argument).
      * - eer_lut, eer_ampm_lut, eer_gain, eer_offset, eer_idle, eer_drive: envelope DAC calibration (envelope_output).
+     * - relay_gpio: GPIO of the antenna relay (-1: none); relay_active_low: TX position with the pin low;
+     *   relay_tx_delay_ms: relay settling time before the first sample; relay_hang_ms: time the transmitter
+     *   stays keyed after the last sample.
+     * - rx_mute_tx: mute the receive samples while the transmitter is keyed.
+     * - rx.<key>: the settings of the receiver, when one is attached.
      *
      * @return Setting descriptions.
      */
@@ -443,21 +538,51 @@ public:
      *
      * The key "profile" loads a profile file (see LoadProfile()): its settings and gain are applied at once, its
      * stream arguments become the defaults of the next setupStream(); an empty value forgets the stream defaults.
+     * Keys starting with "rx." are written to the receiver without the prefix.
      *
      * @param key   Setting key.
      * @param value New value.
-     * @throws std::runtime_error for an unknown key, an invalid value, a frequency that cannot be produced, or a
-     *         profile that cannot be read or holds an invalid value.
+     * @throws std::runtime_error for an unknown key, an invalid value, a frequency that cannot be produced, a
+     *         relay_gpio / relay_active_low change while a TX stream is open, a profile that cannot be read or
+     *         holds an invalid value, or a receiver setting refused by the receiver.
      */
     void writeSetting(const std::string &key, const std::string &value);
 
     /**
      * @brief Reads a setting.
-     * @param key Setting key.
+     * @param key Setting key ("rx.<key>" reads a setting of the receiver).
      * @return Value as a string.
      * @throws std::runtime_error for an unknown key.
      */
     std::string readSetting(const std::string &key) const;
+
+    /**
+     * @brief Describes the channel settings.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return The channel settings of the receiver for RX; empty for TX.
+     */
+    SoapySDR::ArgInfoList getSettingInfo(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Changes a channel setting of the receiver.
+     * @param direction Must be SOAPY_SDR_RX with a receiver.
+     * @param channel   Channel.
+     * @param key       Setting key.
+     * @param value     New value.
+     * @throws std::runtime_error for TX or without a receiver.
+     */
+    void writeSetting(const int direction, const size_t channel, const std::string &key, const std::string &value);
+
+    /**
+     * @brief Reads a channel setting of the receiver.
+     * @param direction Must be SOAPY_SDR_RX with a receiver.
+     * @param channel   Channel.
+     * @param key       Setting key.
+     * @return Value read by the receiver.
+     * @throws std::runtime_error for TX or without a receiver.
+     */
+    std::string readSetting(const int direction, const size_t channel, const std::string &key) const;
 
     /*******************************************************************
      * Antenna API
@@ -467,7 +592,7 @@ public:
      * @brief Lists the antennas.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return {"GPIO4"} for TX, empty for RX.
+     * @return {"GPIO4"} for TX; the antennas of the receiver for RX (empty without one).
      */
     std::vector<std::string> listAntennas(const int direction, const size_t channel) const;
 
@@ -475,8 +600,8 @@ public:
      * @brief Selects the antenna.
      * @param direction Direction.
      * @param channel   Channel.
-     * @param name      Must be "GPIO4".
-     * @throws std::runtime_error for any other name or for RX.
+     * @param name      "GPIO4" for TX; an antenna of the receiver for RX.
+     * @throws std::runtime_error for any other TX name, for RX without a receiver, or when the receiver refuses it.
      */
     void setAntenna(const int direction, const size_t channel, const std::string &name);
 
@@ -484,7 +609,7 @@ public:
      * @brief Returns the antenna.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return "GPIO4" for TX, empty for RX.
+     * @return "GPIO4" for TX; the antenna of the receiver for RX (empty without one).
      */
     std::string getAntenna(const int direction, const size_t channel) const;
 
@@ -496,25 +621,89 @@ public:
      * @brief Tells whether automatic DC offset correction is available.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return False.
+     * @return False for TX; the answer of the receiver for RX.
      */
     bool hasDCOffsetMode(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Enables or disables automatic DC offset correction of the receiver.
+     * @param direction Direction (TX: no effect).
+     * @param channel   Channel.
+     * @param automatic Requested mode.
+     */
+    void setDCOffsetMode(const int direction, const size_t channel, const bool automatic);
+
+    /**
+     * @brief Returns the automatic DC offset correction mode.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False for TX; the mode of the receiver for RX.
+     */
+    bool getDCOffsetMode(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Tells whether a manual DC offset correction is available.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False for TX; the answer of the receiver for RX.
+     */
+    bool hasDCOffset(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Sets the manual DC offset correction of the receiver.
+     * @param direction Direction (TX: no effect).
+     * @param channel   Channel.
+     * @param offset    Correction.
+     */
+    void setDCOffset(const int direction, const size_t channel, const std::complex<double> &offset);
+
+    /**
+     * @brief Returns the manual DC offset correction.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return 0 for TX; the correction of the receiver for RX.
+     */
+    std::complex<double> getDCOffset(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Tells whether an IQ balance correction is available.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return False for TX; the answer of the receiver for RX.
+     */
+    bool hasIQBalance(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Sets the IQ balance correction of the receiver.
+     * @param direction Direction (TX: no effect).
+     * @param channel   Channel.
+     * @param balance   Correction.
+     */
+    void setIQBalance(const int direction, const size_t channel, const std::complex<double> &balance);
+
+    /**
+     * @brief Returns the IQ balance correction.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return 0 for TX; the correction of the receiver for RX.
+     */
+    std::complex<double> getIQBalance(const int direction, const size_t channel) const;
 
     /**
      * @brief Tells whether a frequency correction is available.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return True for TX.
+     * @return True for TX; the answer of the receiver for RX (false without one).
      */
     bool hasFrequencyCorrection(const int direction, const size_t channel) const;
 
     /**
-     * @brief Sets the crystal correction (same as the ppm setting).
-     * @param direction Must be SOAPY_SDR_TX.
+     * @brief Sets the crystal correction (TX: same as the ppm setting; RX: correction of the receiver).
+     * @param direction Direction.
      * @param channel   Channel.
-     * @param value     Correction in ppm, -200 to 200 (positive when the crystal runs slow, i.e. when the board
-     *                  transmits below the requested frequency).
-     * @throws std::runtime_error for RX, a value out of range, or a stream that rejects it.
+     * @param value     Correction in ppm; for TX -200 to 200 (positive when the crystal runs slow, i.e. when the
+     *                  board transmits below the requested frequency).
+     * @throws std::runtime_error for RX without a receiver, a TX value out of range, or a stream that rejects it.
      */
     void setFrequencyCorrection(const int direction, const size_t channel, const double value);
 
@@ -522,7 +711,7 @@ public:
      * @brief Returns the crystal correction.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Correction in ppm (0 for RX).
+     * @return Correction in ppm (for RX the correction of the receiver, 0 without one).
      */
     double getFrequencyCorrection(const int direction, const size_t channel) const;
 
@@ -534,7 +723,7 @@ public:
      * @brief Lists the gain elements.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return {"PAD"} for TX (pad drive strength 0-7, 2 mA to 16 mA).
+     * @return {"PAD"} for TX (pad drive strength 0-7, 2 mA to 16 mA); the gain elements of the receiver for RX.
      */
     std::vector<std::string> listGains(const int direction, const size_t channel) const;
 
@@ -542,12 +731,12 @@ public:
      * @brief Tells whether automatic gain is available.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return False.
+     * @return False for TX; the answer of the receiver for RX.
      */
     bool hasGainMode(const int direction, const size_t channel) const;
 
     /**
-     * @brief Automatic gain is not available; a request to enable it is ignored with a warning.
+     * @brief Sets the automatic gain mode; for TX a request to enable it is ignored with a warning.
      * @param direction Direction.
      * @param channel   Channel.
      * @param automatic Requested mode.
@@ -558,12 +747,12 @@ public:
      * @brief Returns the automatic gain state.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return False.
+     * @return False for TX; the mode of the receiver for RX.
      */
     bool getGainMode(const int direction, const size_t channel) const;
 
     /**
-     * @brief Sets the overall gain (pad drive level 0-7, rounded and clamped).
+     * @brief Sets the overall gain (TX: pad drive level 0-7, rounded and clamped; RX: overall gain of the receiver).
      * @param direction Direction.
      * @param channel   Channel.
      * @param value     Gain.
@@ -574,9 +763,9 @@ public:
      * @brief Sets the gain of an element.
      * @param direction Direction.
      * @param channel   Channel.
-     * @param name      Must be "PAD".
+     * @param name      "PAD" for TX; an element of the receiver for RX.
      * @param value     Gain.
-     * @throws std::runtime_error for an unknown element.
+     * @throws std::runtime_error for an unknown TX element.
      */
     void setGain(const int direction, const size_t channel, const std::string &name, const double value);
 
@@ -584,7 +773,7 @@ public:
      * @brief Returns the overall gain.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Pad drive level.
+     * @return Pad drive level for TX; the overall gain of the receiver for RX (0 without one).
      */
     double getGain(const int direction, const size_t channel) const;
 
@@ -593,7 +782,7 @@ public:
      * @param direction Direction.
      * @param channel   Channel.
      * @param name      Element name.
-     * @return Pad drive level.
+     * @return Pad drive level for TX; the element gain of the receiver for RX (0 without one).
      */
     double getGain(const int direction, const size_t channel, const std::string &name) const;
 
@@ -601,7 +790,7 @@ public:
      * @brief Returns the overall gain range.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return 0 to 7, step 1.
+     * @return 0 to 7, step 1, for TX; the overall range of the receiver for RX.
      */
     SoapySDR::Range getGainRange(const int direction, const size_t channel) const;
 
@@ -610,7 +799,7 @@ public:
      * @param direction Direction.
      * @param channel   Channel.
      * @param name      Element name.
-     * @return 0 to 7, step 1.
+     * @return 0 to 7, step 1, for TX; the element range of the receiver for RX.
      */
     SoapySDR::Range getGainRange(const int direction, const size_t channel, const std::string &name) const;
 
@@ -619,26 +808,50 @@ public:
      ******************************************************************/
 
     /**
-     * @brief Sets the output frequency.
+     * @brief Tunes the channel as a whole.
      *
-     * Applied immediately to an existing stream (the DMA restarts from the queued samples).
+     * TX: sets the "RF" element (see the element overload). RX: forwarded to the receiver, which distributes the
+     * frequency over its own elements.
      *
-     * @param direction Must be SOAPY_SDR_TX.
+     * @param direction Direction.
      * @param channel   Channel.
-     * @param name      "RF".
      * @param frequency Frequency in Hz.
-     * @param args      Ignored.
-     * @throws std::runtime_error when the frequency is out of range or cannot be produced.
+     * @param args      Tuning arguments (RX only).
+     * @throws std::runtime_error when the frequency is out of range or cannot be produced, or for RX without a
+     *         receiver.
+     */
+    void setFrequency(const int direction, const size_t channel, const double frequency, const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
+
+    /**
+     * @brief Sets the frequency of an element.
+     *
+     * TX: applied immediately to an existing stream (the DMA restarts from the queued samples).
+     *
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @param name      "RF" for TX; an element of the receiver for RX.
+     * @param frequency Frequency in Hz.
+     * @param args      TX: ignored. RX: passed to the receiver.
+     * @throws std::runtime_error when the frequency is out of range or cannot be produced, or for RX without a
+     *         receiver.
      */
     void setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency,
                       const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
 
     /**
-     * @brief Returns the output frequency.
+     * @brief Returns the frequency of the channel as a whole.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Frequency in Hz (for RX the frequency of the receiver, 0 without one).
+     */
+    double getFrequency(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the frequency of an element.
      * @param direction Direction.
      * @param channel   Channel.
      * @param name      Element name.
-     * @return Frequency in Hz (0 for RX).
+     * @return Frequency in Hz (for RX the element frequency of the receiver, 0 without one).
      */
     double getFrequency(const int direction, const size_t channel, const std::string &name) const;
 
@@ -646,7 +859,7 @@ public:
      * @brief Describes the tuning arguments.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Empty list.
+     * @return Empty list for TX; the tuning arguments of the receiver for RX.
      */
     SoapySDR::ArgInfoList getFrequencyArgsInfo(const int direction, const size_t channel) const;
 
@@ -654,16 +867,24 @@ public:
      * @brief Lists the tunable elements.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return {"RF"} for TX.
+     * @return {"RF"} for TX; the elements of the receiver for RX.
      */
     std::vector<std::string> listFrequencies(const int direction, const size_t channel) const;
 
     /**
-     * @brief Returns the tuning range.
+     * @brief Returns the tuning range of the channel as a whole.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return TX: range of the board (multiplied by the harmonic setting). RX: range of the receiver.
+     */
+    SoapySDR::RangeList getFrequencyRange(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the tuning range of an element.
      * @param direction Direction.
      * @param channel   Channel.
      * @param name      Element name.
-     * @return Range of the board (multiplied by the harmonic setting).
+     * @return TX: range of the board (multiplied by the harmonic setting). RX: element range of the receiver.
      */
     SoapySDR::RangeList getFrequencyRange(const int direction, const size_t channel, const std::string &name) const;
 
@@ -673,11 +894,12 @@ public:
 
     /**
      * @brief Sets the IQ sample rate.
-     * @param direction Must be SOAPY_SDR_TX.
+     * @param direction Direction.
      * @param channel   Channel.
      * @param rate      Rate in Hz, within getSampleRateRange().
-     * @throws std::runtime_error for an unsupported rate, or a rate for which the slot rate of the open stream
-     *         exceeds 200 kHz or its DMA ring is shorter than 10 ms.
+     * @throws std::runtime_error for an unsupported TX rate, a TX rate for which the slot rate of the open stream
+     *         exceeds 200 kHz or its DMA ring is shorter than 10 ms, for RX without a receiver, or when the
+     *         receiver refuses the rate.
      */
     void setSampleRate(const int direction, const size_t channel, const double rate);
 
@@ -685,7 +907,8 @@ public:
      * @brief Returns the IQ sample rate.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Nominal rate in Hz (0 for RX); the sample_rate sensor reports the rate produced by the pacing clock.
+     * @return Nominal rate in Hz (for RX the rate of the receiver, 0 without one); the sample_rate sensor reports
+     *         the TX rate produced by the pacing clock.
      */
     double getSampleRate(const int direction, const size_t channel) const;
 
@@ -701,12 +924,12 @@ public:
      * @brief Returns the supported sample-rate range.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Continuous range in Hz.
+     * @return Ranges in Hz.
      */
     SoapySDR::RangeList getSampleRateRange(const int direction, const size_t channel) const;
 
     /**
-     * @brief Sets the analog bandwidth; the bandwidth always equals the sample rate, so this has no effect.
+     * @brief Sets the analog bandwidth; for TX the bandwidth always equals the sample rate, so this has no effect.
      * @param direction Direction.
      * @param channel   Channel.
      * @param bw        Requested bandwidth in Hz.
@@ -717,7 +940,7 @@ public:
      * @brief Returns the bandwidth.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Sample rate in Hz.
+     * @return TX: sample rate in Hz. RX: bandwidth of the receiver.
      */
     double getBandwidth(const int direction, const size_t channel) const;
 
@@ -725,9 +948,17 @@ public:
      * @brief Lists bandwidths.
      * @param direction Direction.
      * @param channel   Channel.
-     * @return Empty list (not adjustable).
+     * @return Empty list for TX (not adjustable); the bandwidths of the receiver for RX.
      */
     std::vector<double> listBandwidths(const int direction, const size_t channel) const;
+
+    /**
+     * @brief Returns the bandwidth ranges.
+     * @param direction Direction.
+     * @param channel   Channel.
+     * @return Empty list for TX; the bandwidth ranges of the receiver for RX.
+     */
+    SoapySDR::RangeList getBandwidthRange(const int direction, const size_t channel) const;
 
 private:
     /**
@@ -875,6 +1106,97 @@ private:
      */
     void LoadProfile(const std::string &path, const SoapySDR::Kwargs *explicitArgs);
 
+    /**
+     * @brief Checks and applies the transmit/receive switching settings (device_mutex held).
+     * @param relay  Antenna relay configuration.
+     * @param muteTx Mute the receive samples while the transmitter is keyed.
+     * @param dryRun Only check, change nothing.
+     * @throws std::runtime_error when the relay configuration is invalid, its pin or polarity changes while a TX
+     *         stream is open, or the GPIO block cannot be mapped.
+     */
+    void ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, bool dryRun);
+
+    /**
+     * @brief Checks that the TX stream configuration leaves the antenna relay GPIO free.
+     * @param cfg Transmitter configuration of the stream being created.
+     * @throws std::runtime_error when the stream would use the relay GPIO.
+     */
+    void CheckRelayPin(const SoapyRPITX_TxConfig &cfg) const;
+
+    /*******************************************************************
+     * Receiver (SoapyRPITX_Receiver.cpp)
+     ******************************************************************/
+
+    /**
+     * @brief Opens the receiver through the factory of its installed SoapySDR module (constructor only).
+     *
+     * The receiver gets the arguments "driver=<driver>" and every "rx.<key>=<value>" of @p args as "<key>=<value>".
+     *
+     * @param driver SoapySDR driver key of the receiver.
+     * @param args   Device arguments of this device.
+     * @throws std::runtime_error when the driver is "rpitx", not installed, has no RX channel or refuses to open.
+     */
+    void OpenReceiver(const std::string &driver, const SoapySDR::Kwargs &args);
+
+    /**
+     * @brief Tells whether a call for @p direction goes to the receiver.
+     * @param direction Direction.
+     * @return True for SOAPY_SDR_RX with a receiver.
+     */
+    bool ForwardRx(const int direction) const;
+
+    /**
+     * @brief Returns the receiver.
+     * @return Receiver device.
+     * @throws std::runtime_error when no receiver is attached.
+     */
+    SoapySDR::Device &Rx() const;
+
+    /**
+     * @brief Creates the RX stream on channel 0 of the receiver.
+     * @param format   Stream format.
+     * @param channels Empty or {0}.
+     * @param args     Stream arguments of the receiver.
+     * @return Stream handle (a generation token shared with the TX handles).
+     * @throws std::runtime_error without a receiver, for another channel, an RX stream already open, or a
+     *         refusal of the receiver.
+     */
+    SoapySDR::Stream *SetupRxStream(const std::string &format, const std::vector<size_t> &channels, const SoapySDR::Kwargs &args);
+
+    /**
+     * @brief Tells whether a handle is the open RX stream.
+     * @param handle Stream handle.
+     * @return True when valid.
+     */
+    bool IsValidRxStreamHandle(SoapySDR::Stream *handle) const;
+
+    /**
+     * @brief Registers an RX data-path call (readStream() / readStreamStatus()) and validates the handle.
+     *
+     * Same protocol as EnterStreamCall(); every successful call must be paired with LeaveRxCall().
+     *
+     * @param handle Stream handle.
+     * @return The receiver stream, or nullptr (nothing registered) when the handle is not the open RX stream.
+     */
+    SoapySDR::Stream *EnterRxCall(SoapySDR::Stream *handle);
+
+    /** @brief Unregisters a call registered by EnterRxCall(). */
+    void LeaveRxCall();
+
+    /**
+     * @brief Deactivates and closes the open RX stream, if any, after the data-path calls in flight have returned.
+     *
+     * The caller holds @ref device_mutex.
+     */
+    void ReleaseRxStreamLocked();
+
+    /**
+     * @brief Replaces received samples with silence while the transmitter is keyed and rx_mute_tx is set.
+     * @param buffs    Buffers of the call.
+     * @param numElems Number of samples read into each buffer.
+     */
+    void MuteRx(void *const *buffs, size_t numElems) const;
+
     mutable std::mutex device_mutex;   ///< Serialises the control API.
     SoapyRPITX_TuneConfig tune;        ///< Frequency-related parameters.
     int driveLevel = 7;                ///< Pad drive level 0-7.
@@ -888,9 +1210,21 @@ private:
     std::string profilePath;           ///< Profile file loaded last (empty: none).
     SoapySDR::Kwargs profileStream;    ///< Default stream arguments of the loaded profile.
 
-    std::shared_ptr<tx_streamer> tx_stream;           ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
-    std::atomic<uintptr_t> streamHandle{0};           ///< Opaque generation token of the open stream (0: none), read by writeStream() without the mutex.
-    std::atomic<tx_streamer *> streamPtr{nullptr};    ///< Open stream the token was issued for; valid while a registered call holds the token.
-    uintptr_t streamGeneration = 0;                   ///< Last token issued; never reused, so a stale handle cannot match a new stream (device_mutex).
-    std::atomic<int> streamCalls{0};                  ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
+    std::shared_ptr<tx_streamer> tx_stream;        ///< Open TX stream, if any (kept alive by a draining deactivateStream()).
+    std::atomic<uintptr_t> streamHandle{0};        ///< Opaque generation token of the open stream (0: none), read by writeStream() without the mutex.
+    std::atomic<tx_streamer *> streamPtr{nullptr}; ///< Open stream the token was issued for; valid while a registered call holds the token.
+    uintptr_t streamGeneration = 0;                ///< Last token issued; never reused, so a stale handle cannot match a new stream (device_mutex).
+    std::atomic<int> streamCalls{0};               ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
+
+    std::shared_ptr<SoapyRPITX_Ptt> ptt; ///< Keyed state and antenna relay, shared with the TX stream.
+    std::atomic<bool> rxMuteTx{true};    ///< Mute the receive samples while the transmitter is keyed.
+
+    std::unique_ptr<SoapySDR::Device> rxDev;              ///< Receiver, or nullptr; set by the constructor only.
+    std::string rxDriver;                                 ///< SoapySDR driver key of the receiver.
+    SoapySDR::Stream *rxStream = nullptr;                 ///< Open stream of the receiver (device_mutex).
+    std::atomic<uintptr_t> rxHandle{0};                   ///< Generation token of the open RX stream (0: none).
+    std::atomic<SoapySDR::Stream *> rxStreamPtr{nullptr}; ///< Receiver stream the RX token was issued for.
+    std::atomic<int> rxCalls{0};                          ///< readStream() / readStreamStatus() calls in flight on the RX stream.
+    std::atomic<size_t> rxComponentBytes{0};              ///< Bytes of one I or Q component of the RX stream format.
+    std::atomic<bool> rxUnsigned{false};                  ///< The RX stream format is unsigned (silence is mid-scale).
 };

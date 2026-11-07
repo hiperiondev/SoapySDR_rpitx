@@ -57,6 +57,8 @@ const char *const kSettingKeys[] = {"ppm",
                                     "eer_offset",
                                     "eer_idle",
                                     "eer_drive"};
+// Transmit/receive switching keys, accepted as device arguments, settings and profile lines.
+const char *const kPttKeys[] = {"relay_gpio", "relay_active_low", "relay_tx_delay_ms", "relay_hang_ms", "rx_mute_tx"};
 // Device arguments produced by enumeration and by SoapySDR itself; they are not settings.
 const char *const kIdentificationKeys[] = {"driver", "label", "product", "serial", "manufacturer", "tuner", "type"};
 
@@ -67,8 +69,20 @@ bool isSettingKey(const std::string &key) {
     return false;
 }
 
+bool isPttKey(const std::string &key) {
+    for (const char *k : kPttKeys)
+        if (key == k)
+            return true;
+    return false;
+}
+
+bool isRxKey(const std::string &key) {
+    const std::string prefix = RPITX_RX_PREFIX;
+    return key.size() > prefix.size() && key.compare(0, prefix.size(), prefix) == 0;
+}
+
 bool isKnownArgument(const std::string &key) {
-    if (key == "profile")
+    if (key == "profile" || key == RPITX_RX_ARG || isRxKey(key) || isPttKey(key))
         return true;
     for (const char *k : kSettingKeys)
         if (key == k)
@@ -154,6 +168,40 @@ std::string formatList(const std::vector<double> &v, double scale) {
 
 constexpr double kDegree = M_PI / 180.0;
 
+// Transmit/receive switching settings parsed but not yet applied.
+struct PttPending {
+    SoapyRPITX_RelayConfig relay;
+    bool muteTx = true;
+    bool touched = false;
+};
+
+void parsePttSetting(const std::string &key, const std::string &value, PttPending &p) {
+    if (key == "relay_gpio") {
+        long v = parseInt(key, value);
+        if (v != -1 && (v < RPITX_RELAY_MIN_GPIO || v > RPITX_RELAY_MAX_GPIO))
+            throw std::runtime_error("rpitx: relay_gpio must be -1 or a GPIO from " + std::to_string(RPITX_RELAY_MIN_GPIO) + " to " +
+                                     std::to_string(RPITX_RELAY_MAX_GPIO));
+        p.relay.gpio = (int) v;
+    } else if (key == "relay_active_low") {
+        p.relay.activeLow = parseBool(key, value);
+    } else if (key == "relay_tx_delay_ms") {
+        long v = parseInt(key, value);
+        if (v < 0 || v > RPITX_RELAY_MAX_DELAY_MS)
+            throw std::runtime_error("rpitx: relay_tx_delay_ms out of range [0, " + std::to_string(RPITX_RELAY_MAX_DELAY_MS) + "]");
+        p.relay.txDelayMs = (uint32_t) v;
+    } else if (key == "relay_hang_ms") {
+        long v = parseInt(key, value);
+        if (v < 0 || v > RPITX_RELAY_MAX_HANG_MS)
+            throw std::runtime_error("rpitx: relay_hang_ms out of range [0, " + std::to_string(RPITX_RELAY_MAX_HANG_MS) + "]");
+        p.relay.hangMs = (uint32_t) v;
+    } else if (key == "rx_mute_tx") {
+        p.muteTx = parseBool(key, value);
+    } else {
+        throw std::runtime_error("rpitx: unknown setting '" + key + "'");
+    }
+    p.touched = true;
+}
+
 SoapySDR::ArgInfo makeArg(const char *key, const char *value, const char *name, const char *description, SoapySDR::ArgInfo::Type type, const char *units = "") {
     SoapySDR::ArgInfo a;
     a.key = key;
@@ -177,11 +225,27 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
     model = board.model;
     serial = board.serial;
     pi4 = board.pi4;
+    ptt = std::make_shared<SoapyRPITX_Ptt>();
 
     for (const auto &arg : args) {
         if (!isKnownArgument(arg.first))
             SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: unknown device argument '%s' ignored", arg.first.c_str());
     }
+
+    // The relay is put in the RX position before anything else can key the transmitter.
+    PttPending pending;
+    pending.relay = ptt->GetConfig();
+    pending.muteTx = rxMuteTx.load();
+    for (const char *key : kPttKeys) {
+        auto it = args.find(key);
+        if (it != args.end())
+            parsePttSetting(key, it->second, pending);
+    }
+    if (pending.touched) {
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ApplyPttLocked(pending.relay, pending.muteTx, false);
+    }
+
     auto profile = args.find("profile");
     if (profile != args.end() && !profile->second.empty())
         LoadProfile(profile->second, &args);
@@ -191,12 +255,19 @@ SoapyRPITX::SoapyRPITX(const SoapySDR::Kwargs &args) {
             writeSetting(key, it->second);
     }
 
-    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: opened %s (serial %s)", model.c_str(), serial.c_str());
+    auto rx = args.find(RPITX_RX_ARG);
+    if (rx != args.end() && !rx->second.empty() && rx->second != "none")
+        OpenReceiver(rx->second, args);
+
+    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: opened %s (serial %s)%s", model.c_str(), serial.c_str(),
+                  rxDev ? (", transceiver with receiver " + rxDriver).c_str() : "");
 }
 
 SoapyRPITX::~SoapyRPITX(void) {
     std::lock_guard<std::mutex> lock(device_mutex);
     ReleaseTxStreamLocked();
+    ReleaseRxStreamLocked();
+    rxDev.reset();
 }
 
 // ******************** Identification API ********************
@@ -218,6 +289,15 @@ SoapySDR::Kwargs SoapyRPITX::getHardwareInfo(void) const {
     info["serial"] = serial;
     info["rf_output"] = RPITX_ANTENNA_NAME;
     info["origin"] = "https://github.com/hiperiondev/SoapySDR_rpitx";
+    const int relay = ptt->GetConfig().gpio;
+    info["relay_gpio"] = relay >= 0 ? "GPIO" + std::to_string(relay) : "none";
+
+    if (rxDev) {
+        info["rx_driver"] = rxDriver;
+        info["rx_hardware"] = rxDev->getHardwareKey();
+        for (const auto &kv : rxDev->getHardwareInfo())
+            info[RPITX_RX_PREFIX + kv.first] = kv.second;
+    }
 
     return info;
 }
@@ -225,11 +305,13 @@ SoapySDR::Kwargs SoapyRPITX::getHardwareInfo(void) const {
 // ******************** Channels API ********************
 
 size_t SoapyRPITX::getNumChannels(const int direction) const {
-    return direction == SOAPY_SDR_TX ? 1 : 0;
+    if (direction == SOAPY_SDR_TX)
+        return 1;
+    return direction == SOAPY_SDR_RX && rxDev ? 1 : 0;
 }
 
 bool SoapyRPITX::getFullDuplex(const int, const size_t) const {
-    return false;
+    return rxDev != nullptr;
 }
 
 // ******************** Settings API ********************
@@ -350,6 +432,36 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
                               "defaults of the next stream. Empty: forget the stream defaults.",
                               SoapySDR::ArgInfo::STRING));
 
+    SoapySDR::ArgInfo relay = makeArg("relay_gpio", "-1", "Antenna relay GPIO",
+                                      "BCM GPIO driving the T/R antenna relay, in the TX position while the transmitter is keyed (-1: no relay). "
+                                      "Cannot change while a TX stream is open.",
+                                      SoapySDR::ArgInfo::INT);
+    relay.range = SoapySDR::Range(-1, RPITX_RELAY_MAX_GPIO, 1);
+    setArgs.push_back(relay);
+    setArgs.push_back(makeArg("relay_active_low", "false", "Relay active low",
+                              "The relay is in the TX position with the pin low (most relay modules). Cannot change while a TX stream is open.",
+                              SoapySDR::ArgInfo::BOOL));
+    SoapySDR::ArgInfo relayDelay =
+            makeArg("relay_tx_delay_ms", "20", "Relay TX delay",
+                    "Time given to the relay to settle in the TX position before the first sample of a transmission is queued.", SoapySDR::ArgInfo::INT, "ms");
+    relayDelay.range = SoapySDR::Range(0, RPITX_RELAY_MAX_DELAY_MS, 1);
+    setArgs.push_back(relayDelay);
+    SoapySDR::ArgInfo relayHang =
+            makeArg("relay_hang_ms", "100", "Relay hang time",
+                    "Time the transmitter stays keyed (relay in TX, receiver muted) after the last sample was played.", SoapySDR::ArgInfo::INT, "ms");
+    relayHang.range = SoapySDR::Range(0, RPITX_RELAY_MAX_HANG_MS, 1);
+    setArgs.push_back(relayHang);
+    setArgs.push_back(makeArg("rx_mute_tx", "true", "Mute RX while keyed", "Replace the receive samples with silence while the transmitter is keyed.",
+                              SoapySDR::ArgInfo::BOOL));
+
+    if (rxDev) {
+        for (SoapySDR::ArgInfo a : rxDev->getSettingInfo()) {
+            a.key = RPITX_RX_PREFIX + a.key;
+            a.name = "RX " + (a.name.empty() ? a.key : a.name);
+            setArgs.push_back(a);
+        }
+    }
+
     return setArgs;
 }
 
@@ -410,9 +522,19 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
     pending.iqScale = iqScale;
     pending.debugLevel = debugLevel;
     pending.driveLevel = driveLevel;
+    const SoapyRPITX_RelayConfig previousRelay = ptt->GetConfig();
+    const bool previousMute = rxMuteTx.load();
+    PttPending pendingPtt;
+    pendingPtt.relay = previousRelay;
+    pendingPtt.muteTx = previousMute;
 
     try {
         for (const auto &kv : p.settings) {
+            if (isPttKey(kv.first)) {
+                if (!(explicitArgs && explicitArgs->count(kv.first)))
+                    parsePttSetting(kv.first, kv.second, pendingPtt);
+                continue;
+            }
             if (!isSettingKey(kv.first)) {
                 SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: profile '%s': unknown setting '%s' ignored", path.c_str(), kv.first.c_str());
                 continue;
@@ -429,6 +551,8 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
             pending.gainTouched = true;
         }
         ValidateSettings(pending);
+        if (pendingPtt.touched)
+            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, true);
 
         // Dry run of the stream arguments with the parsers of setupStream().
         SoapyRPITX_TxConfig cfg;
@@ -436,8 +560,21 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
         std::string envOut;
         ParseStreamArgs(stream, cfg, envOut);
 
-        // Phase 2: apply once.
-        ApplySettings(pending);
+        // Phase 2: apply once; the switching settings are restored when the other settings are refused.
+        if (pendingPtt.touched)
+            ApplyPttLocked(pendingPtt.relay, pendingPtt.muteTx, false);
+        try {
+            ApplySettings(pending);
+        } catch (...) {
+            if (pendingPtt.touched) {
+                try {
+                    ApplyPttLocked(previousRelay, previousMute, false);
+                } catch (const std::exception &restore) {
+                    SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: could not restore the antenna relay settings: %s", restore.what());
+                }
+            }
+            throw;
+        }
     } catch (const std::runtime_error &e) {
         throw context(e);
     }
@@ -586,13 +723,39 @@ void SoapyRPITX::ApplySettings(const PendingSettings &pending) {
     }
 }
 
+void SoapyRPITX::ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, bool dryRun) {
+    std::string why = SoapyRPITX_CheckRelayConfig(relay);
+    if (!why.empty())
+        throw std::runtime_error("rpitx: " + why);
+    const SoapyRPITX_RelayConfig current = ptt->GetConfig();
+    if (tx_stream && (relay.gpio != current.gpio || relay.activeLow != current.activeLow))
+        throw std::runtime_error("rpitx: relay_gpio and relay_active_low cannot change while a TX stream is open");
+    if (dryRun)
+        return;
+    ptt->Configure(relay);
+    rxMuteTx.store(muteTx);
+}
+
 void SoapyRPITX::writeSetting(const std::string &key, const std::string &value) {
     if (key == "profile") {
         LoadProfile(value, nullptr);
         return;
     }
+    if (isRxKey(key)) {
+        Rx().writeSetting(key.substr(std::string(RPITX_RX_PREFIX).size()), value);
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(device_mutex);
+
+    if (isPttKey(key)) {
+        PttPending p;
+        p.relay = ptt->GetConfig();
+        p.muteTx = rxMuteTx.load();
+        parsePttSetting(key, value, p);
+        ApplyPttLocked(p.relay, p.muteTx, false);
+        return;
+    }
 
     PendingSettings pending;
     pending.tune = tune;
@@ -616,7 +779,23 @@ void SoapyRPITX::ApplyAmplitude(const SoapyRPITX_AmplitudeConfig &a) {
 }
 
 std::string SoapyRPITX::readSetting(const std::string &key) const {
+    if (isRxKey(key))
+        return Rx().readSetting(key.substr(std::string(RPITX_RX_PREFIX).size()));
+
     std::lock_guard<std::mutex> lock(device_mutex);
+
+    if (isPttKey(key)) {
+        const SoapyRPITX_RelayConfig r = ptt->GetConfig();
+        if (key == "relay_gpio")
+            return std::to_string(r.gpio);
+        if (key == "relay_active_low")
+            return r.activeLow ? "true" : "false";
+        if (key == "relay_tx_delay_ms")
+            return std::to_string(r.txDelayMs);
+        if (key == "relay_hang_ms")
+            return std::to_string(r.hangMs);
+        return rxMuteTx.load() ? "true" : "false";
+    }
 
     if (key == "ppm")
         return formatDouble(tune.ppm);
@@ -662,6 +841,24 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
     throw std::runtime_error("rpitx: unknown setting '" + key + "'");
 }
 
+SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getSettingInfo(SOAPY_SDR_RX, channel);
+    return SoapySDR::ArgInfoList();
+}
+
+void SoapyRPITX::writeSetting(const int direction, const size_t channel, const std::string &key, const std::string &value) {
+    if (!ForwardRx(direction))
+        throw std::runtime_error("rpitx: channel settings exist only on the RX channel of a receiver");
+    rxDev->writeSetting(SOAPY_SDR_RX, channel, key, value);
+}
+
+std::string SoapyRPITX::readSetting(const int direction, const size_t channel, const std::string &key) const {
+    if (!ForwardRx(direction))
+        throw std::runtime_error("rpitx: channel settings exist only on the RX channel of a receiver");
+    return rxDev->readSetting(SOAPY_SDR_RX, channel, key);
+}
+
 void SoapyRPITX::SetPpmLocked(double ppm) {
     if (!(ppm >= -200 && ppm <= 200))
         throw std::runtime_error("rpitx: ppm out of range [-200, 200]");
@@ -674,18 +871,17 @@ void SoapyRPITX::ApplyTune(const SoapyRPITX_TuneConfig &t) {
     if (tx_stream) {
         SoapyRPITX_RetuneResult r = tx_stream->transmitter().Retune(t);
         switch (r) {
-        case SoapyRPITX_RetuneResult::Ok:
-            break;
-        case SoapyRPITX_RetuneResult::Refused:
-            throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) +
-                                     " Hz with the requested harmonic and bandwidth");
-        case SoapyRPITX_RetuneResult::PacingRefused:
-            throw std::runtime_error("rpitx: the pacing clock cannot run at the slot rate for " +
-                                     formatDouble(t.sampleRate) + " S/s, or the DMA ring is too short");
-        case SoapyRPITX_RetuneResult::Stopped:
-            throw std::runtime_error("rpitx: the transmitter thread had already stopped; the change was not applied");
-        case SoapyRPITX_RetuneResult::Timeout:
-            throw std::runtime_error("rpitx: the transmitter thread did not respond within 3 s; the change was not applied");
+            case SoapyRPITX_RetuneResult::Ok:
+                break;
+            case SoapyRPITX_RetuneResult::Refused:
+                throw std::runtime_error("rpitx: the PLL cannot produce " + formatDouble(t.frequency) + " Hz with the requested harmonic and bandwidth");
+            case SoapyRPITX_RetuneResult::PacingRefused:
+                throw std::runtime_error("rpitx: the pacing clock cannot run at the slot rate for " + formatDouble(t.sampleRate) +
+                                         " S/s, or the DMA ring is too short");
+            case SoapyRPITX_RetuneResult::Stopped:
+                throw std::runtime_error("rpitx: the transmitter thread had already stopped; the change was not applied");
+            case SoapyRPITX_RetuneResult::Timeout:
+                throw std::runtime_error("rpitx: the transmitter thread did not respond within 3 s; the change was not applied");
         }
     }
     tune = t;
@@ -693,7 +889,10 @@ void SoapyRPITX::ApplyTune(const SoapyRPITX_TuneConfig &t) {
 
 // ******************** Antenna API ********************
 
-std::vector<std::string> SoapyRPITX::listAntennas(const int direction, const size_t) const {
+std::vector<std::string> SoapyRPITX::listAntennas(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listAntennas(SOAPY_SDR_RX, channel);
+
     std::vector<std::string> options;
 
     if (direction == SOAPY_SDR_TX)
@@ -702,60 +901,120 @@ std::vector<std::string> SoapyRPITX::listAntennas(const int direction, const siz
     return options;
 }
 
-void SoapyRPITX::setAntenna(const int direction, const size_t, const std::string &name) {
+void SoapyRPITX::setAntenna(const int direction, const size_t channel, const std::string &name) {
+    if (ForwardRx(direction)) {
+        rxDev->setAntenna(SOAPY_SDR_RX, channel, name);
+        return;
+    }
     if (direction != SOAPY_SDR_TX || name != RPITX_ANTENNA_NAME)
         throw std::runtime_error("rpitx: the only antenna is TX '" RPITX_ANTENNA_NAME "'");
 }
 
-std::string SoapyRPITX::getAntenna(const int direction, const size_t) const {
+std::string SoapyRPITX::getAntenna(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getAntenna(SOAPY_SDR_RX, channel);
     return direction == SOAPY_SDR_TX ? RPITX_ANTENNA_NAME : "";
 }
 
 // ******************** Frontend corrections API ********************
 
-bool SoapyRPITX::hasDCOffsetMode(const int, const size_t) const {
-    return false;
+bool SoapyRPITX::hasDCOffsetMode(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->hasDCOffsetMode(SOAPY_SDR_RX, channel);
 }
 
-bool SoapyRPITX::hasFrequencyCorrection(const int direction, const size_t) const {
+void SoapyRPITX::setDCOffsetMode(const int direction, const size_t channel, const bool automatic) {
+    if (ForwardRx(direction))
+        rxDev->setDCOffsetMode(SOAPY_SDR_RX, channel, automatic);
+}
+
+bool SoapyRPITX::getDCOffsetMode(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->getDCOffsetMode(SOAPY_SDR_RX, channel);
+}
+
+bool SoapyRPITX::hasDCOffset(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->hasDCOffset(SOAPY_SDR_RX, channel);
+}
+
+void SoapyRPITX::setDCOffset(const int direction, const size_t channel, const std::complex<double> &offset) {
+    if (ForwardRx(direction))
+        rxDev->setDCOffset(SOAPY_SDR_RX, channel, offset);
+}
+
+std::complex<double> SoapyRPITX::getDCOffset(const int direction, const size_t channel) const {
+    return ForwardRx(direction) ? rxDev->getDCOffset(SOAPY_SDR_RX, channel) : std::complex<double>(0.0, 0.0);
+}
+
+bool SoapyRPITX::hasIQBalance(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->hasIQBalance(SOAPY_SDR_RX, channel);
+}
+
+void SoapyRPITX::setIQBalance(const int direction, const size_t channel, const std::complex<double> &balance) {
+    if (ForwardRx(direction))
+        rxDev->setIQBalance(SOAPY_SDR_RX, channel, balance);
+}
+
+std::complex<double> SoapyRPITX::getIQBalance(const int direction, const size_t channel) const {
+    return ForwardRx(direction) ? rxDev->getIQBalance(SOAPY_SDR_RX, channel) : std::complex<double>(0.0, 0.0);
+}
+
+bool SoapyRPITX::hasFrequencyCorrection(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->hasFrequencyCorrection(SOAPY_SDR_RX, channel);
     return direction == SOAPY_SDR_TX;
 }
 
-void SoapyRPITX::setFrequencyCorrection(const int direction, const size_t, const double value) {
+void SoapyRPITX::setFrequencyCorrection(const int direction, const size_t channel, const double value) {
+    if (ForwardRx(direction)) {
+        rxDev->setFrequencyCorrection(SOAPY_SDR_RX, channel, value);
+        return;
+    }
     if (direction != SOAPY_SDR_TX)
-        throw std::runtime_error("rpitx: only the TX direction has a frequency correction");
+        throw std::runtime_error("rpitx: no receiver attached: only the TX direction has a frequency correction");
     std::lock_guard<std::mutex> lock(device_mutex);
     SetPpmLocked(value);
 }
 
-double SoapyRPITX::getFrequencyCorrection(const int direction, const size_t) const {
+double SoapyRPITX::getFrequencyCorrection(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequencyCorrection(SOAPY_SDR_RX, channel);
     std::lock_guard<std::mutex> lock(device_mutex);
     return direction == SOAPY_SDR_TX ? tune.ppm : 0.0;
 }
 
 // ******************** Gain API ********************
 
-std::vector<std::string> SoapyRPITX::listGains(const int direction, const size_t) const {
+std::vector<std::string> SoapyRPITX::listGains(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listGains(SOAPY_SDR_RX, channel);
+
     std::vector<std::string> options;
     if (direction == SOAPY_SDR_TX)
         options.push_back(RPITX_GAIN_NAME);
     return options;
 }
 
-bool SoapyRPITX::hasGainMode(const int, const size_t) const {
-    return false;
+bool SoapyRPITX::hasGainMode(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->hasGainMode(SOAPY_SDR_RX, channel);
 }
 
-void SoapyRPITX::setGainMode(const int, const size_t, const bool automatic) {
+void SoapyRPITX::setGainMode(const int direction, const size_t channel, const bool automatic) {
+    if (ForwardRx(direction)) {
+        rxDev->setGainMode(SOAPY_SDR_RX, channel, automatic);
+        return;
+    }
     if (automatic)
         SoapySDR_logf(SOAPY_SDR_WARNING, "rpitx: automatic gain is not available, request ignored");
 }
 
-bool SoapyRPITX::getGainMode(const int, const size_t) const {
-    return false;
+bool SoapyRPITX::getGainMode(const int direction, const size_t channel) const {
+    return ForwardRx(direction) && rxDev->getGainMode(SOAPY_SDR_RX, channel);
 }
 
-void SoapyRPITX::setGain(const int direction, const size_t, const double value) {
+void SoapyRPITX::setGain(const int direction, const size_t channel, const double value) {
+    if (ForwardRx(direction)) {
+        rxDev->setGain(SOAPY_SDR_RX, channel, value);
+        return;
+    }
     if (direction != SOAPY_SDR_TX)
         return;
 
@@ -768,25 +1027,37 @@ void SoapyRPITX::setGain(const int direction, const size_t, const double value) 
 }
 
 void SoapyRPITX::setGain(const int direction, const size_t channel, const std::string &name, const double value) {
+    if (ForwardRx(direction)) {
+        rxDev->setGain(SOAPY_SDR_RX, channel, name, value);
+        return;
+    }
     if (name != RPITX_GAIN_NAME)
         throw std::runtime_error("rpitx: unknown gain element '" + name + "'");
     setGain(direction, channel, value);
 }
 
-double SoapyRPITX::getGain(const int direction, const size_t) const {
+double SoapyRPITX::getGain(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getGain(SOAPY_SDR_RX, channel);
     std::lock_guard<std::mutex> lock(device_mutex);
     return direction == SOAPY_SDR_TX ? (double) driveLevel : 0.0;
 }
 
-double SoapyRPITX::getGain(const int direction, const size_t channel, const std::string &) const {
+double SoapyRPITX::getGain(const int direction, const size_t channel, const std::string &name) const {
+    if (ForwardRx(direction))
+        return rxDev->getGain(SOAPY_SDR_RX, channel, name);
     return getGain(direction, channel);
 }
 
-SoapySDR::Range SoapyRPITX::getGainRange(const int, const size_t) const {
+SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getGainRange(SOAPY_SDR_RX, channel);
     return SoapySDR::Range(0, 7, 1);
 }
 
-SoapySDR::Range SoapyRPITX::getGainRange(const int, const size_t, const std::string &) const {
+SoapySDR::Range SoapyRPITX::getGainRange(const int direction, const size_t channel, const std::string &name) const {
+    if (ForwardRx(direction))
+        return rxDev->getGainRange(SOAPY_SDR_RX, channel, name);
     return SoapySDR::Range(0, 7, 1);
 }
 
@@ -796,9 +1067,21 @@ SoapySDR::Range SoapyRPITX::PllRange() const {
     return SoapySDR::Range(kMinPllFrequency, pi4 ? kMaxPllFrequencyPi4 : kMaxPllFrequency);
 }
 
-void SoapyRPITX::setFrequency(const int direction, const size_t, const std::string &name, const double frequency, const SoapySDR::Kwargs &) {
+void SoapyRPITX::setFrequency(const int direction, const size_t channel, const double frequency, const SoapySDR::Kwargs &args) {
+    if (ForwardRx(direction)) {
+        rxDev->setFrequency(SOAPY_SDR_RX, channel, frequency, args);
+        return;
+    }
+    setFrequency(direction, channel, "RF", frequency, args);
+}
+
+void SoapyRPITX::setFrequency(const int direction, const size_t channel, const std::string &name, const double frequency, const SoapySDR::Kwargs &args) {
+    if (ForwardRx(direction)) {
+        rxDev->setFrequency(SOAPY_SDR_RX, channel, name, frequency, args);
+        return;
+    }
     if (direction != SOAPY_SDR_TX)
-        throw std::runtime_error("rpitx: only the TX direction can be tuned");
+        throw std::runtime_error("rpitx: no receiver attached: only the TX direction can be tuned");
     if (name != "RF")
         throw std::runtime_error("rpitx: unknown frequency element '" + name + "'");
 
@@ -814,23 +1097,44 @@ void SoapyRPITX::setFrequency(const int direction, const size_t, const std::stri
     SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: frequency %.0f Hz", frequency);
 }
 
-double SoapyRPITX::getFrequency(const int direction, const size_t, const std::string &) const {
+double SoapyRPITX::getFrequency(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequency(SOAPY_SDR_RX, channel);
+    return getFrequency(direction, channel, "RF");
+}
+
+double SoapyRPITX::getFrequency(const int direction, const size_t channel, const std::string &name) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequency(SOAPY_SDR_RX, channel, name);
     std::lock_guard<std::mutex> lock(device_mutex);
     return direction == SOAPY_SDR_TX ? tune.frequency : 0.0;
 }
 
-SoapySDR::ArgInfoList SoapyRPITX::getFrequencyArgsInfo(const int, const size_t) const {
+SoapySDR::ArgInfoList SoapyRPITX::getFrequencyArgsInfo(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequencyArgsInfo(SOAPY_SDR_RX, channel);
     return SoapySDR::ArgInfoList();
 }
 
-std::vector<std::string> SoapyRPITX::listFrequencies(const int direction, const size_t) const {
+std::vector<std::string> SoapyRPITX::listFrequencies(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listFrequencies(SOAPY_SDR_RX, channel);
+
     std::vector<std::string> names;
     if (direction == SOAPY_SDR_TX)
         names.push_back("RF");
     return names;
 }
 
-SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const size_t, const std::string &) const {
+SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequencyRange(SOAPY_SDR_RX, channel);
+    return getFrequencyRange(direction, channel, "RF");
+}
+
+SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const size_t channel, const std::string &name) const {
+    if (ForwardRx(direction))
+        return rxDev->getFrequencyRange(SOAPY_SDR_RX, channel, name);
     if (direction != SOAPY_SDR_TX)
         return SoapySDR::RangeList();
 
@@ -841,9 +1145,13 @@ SoapySDR::RangeList SoapyRPITX::getFrequencyRange(const int direction, const siz
 
 // ******************** Sample Rate API ********************
 
-void SoapyRPITX::setSampleRate(const int direction, const size_t, const double rate) {
+void SoapyRPITX::setSampleRate(const int direction, const size_t channel, const double rate) {
+    if (ForwardRx(direction)) {
+        rxDev->setSampleRate(SOAPY_SDR_RX, channel, rate);
+        return;
+    }
     if (direction != SOAPY_SDR_TX)
-        throw std::runtime_error("rpitx: only the TX direction has a sample rate");
+        throw std::runtime_error("rpitx: no receiver attached: only the TX direction has a sample rate");
     if (!(rate >= RPITX_MIN_SAMPLE_RATE && rate <= RPITX_MAX_SAMPLE_RATE))
         throw std::runtime_error("rpitx: sample rate " + formatDouble(rate) + " Hz is out of range");
 
@@ -864,33 +1172,55 @@ void SoapyRPITX::setSampleRate(const int direction, const size_t, const double r
     SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: sample rate %u Hz", t.sampleRate);
 }
 
-double SoapyRPITX::getSampleRate(const int direction, const size_t) const {
+double SoapyRPITX::getSampleRate(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getSampleRate(SOAPY_SDR_RX, channel);
     std::lock_guard<std::mutex> lock(device_mutex);
     return direction == SOAPY_SDR_TX ? (double) tune.sampleRate : 0.0;
 }
 
-std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_t) const {
+std::vector<double> SoapyRPITX::listSampleRates(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listSampleRates(SOAPY_SDR_RX, channel);
+
     std::vector<double> options;
     if (direction == SOAPY_SDR_TX)
         options = {24000, 48000, 96000, 192000};
     return options;
 }
 
-SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const size_t) const {
+SoapySDR::RangeList SoapyRPITX::getSampleRateRange(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getSampleRateRange(SOAPY_SDR_RX, channel);
+
     SoapySDR::RangeList results;
     if (direction == SOAPY_SDR_TX)
         results.push_back(SoapySDR::Range(RPITX_MIN_SAMPLE_RATE, RPITX_MAX_SAMPLE_RATE));
     return results;
 }
 
-void SoapyRPITX::setBandwidth(const int, const size_t, const double bw) {
+void SoapyRPITX::setBandwidth(const int direction, const size_t channel, const double bw) {
+    if (ForwardRx(direction)) {
+        rxDev->setBandwidth(SOAPY_SDR_RX, channel, bw);
+        return;
+    }
     SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: bandwidth %.0f Hz requested; the bandwidth follows the sample rate", bw);
 }
 
 double SoapyRPITX::getBandwidth(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getBandwidth(SOAPY_SDR_RX, channel);
     return getSampleRate(direction, channel);
 }
 
-std::vector<double> SoapyRPITX::listBandwidths(const int, const size_t) const {
+std::vector<double> SoapyRPITX::listBandwidths(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->listBandwidths(SOAPY_SDR_RX, channel);
     return std::vector<double>();
+}
+
+SoapySDR::RangeList SoapyRPITX::getBandwidthRange(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getBandwidthRange(SOAPY_SDR_RX, channel);
+    return SoapySDR::RangeList();
 }

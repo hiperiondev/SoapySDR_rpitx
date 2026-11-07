@@ -3,12 +3,16 @@
 [English](README.md) | [Español](README.es.md) | **Italiano**
 
 **Un driver di trasmissione SoapySDR che trasforma un Raspberry Pi in un trasmettitore I/Q a banda stretta — senza
-hardware aggiuntivo, solo il pin di clock GPIO4.**
+hardware aggiuntivo, solo il pin di clock GPIO4. Con un RTL-SDR e un relè diventa un ricetrasmettitore
+half-duplex.**
 
 SoapySDR_rpitx espone l'uscita di clock generica del Raspberry Pi (GPCLK0 su GPIO4) come un dispositivo TX standard
 di [SoapySDR](https://github.com/pothosware/SoapySDR). Qualsiasi applicazione compatibile con Soapy — GNU Radio,
 SDRangel, script Python, il bridge HPSDR incluso per piHPSDR / Thetis / linHPSDR / Quisk / SparkSDR — può inviargli
-campioni complessi in banda base e ottenere RF dal pin del connettore. È basato su una copia integrata e rinforzata
+campioni complessi in banda base e ottenere RF dal pin del connettore. Con `rx=rtlsdr` una chiavetta RTL-SDR diventa
+il canale RX dello stesso dispositivo, e `relay_gpio` comanda un relè d'antenna T/R: il dispositivo si annuncia e si
+comporta allora come un ricetrasmettitore TX/RX (vedere
+[Ricetrasmettitore](#ricetrasmettitore-ricevitore-rtl-sdr-e-relè-dantenna)). È basato su una copia integrata e rinforzata
 di [librpitx](https://github.com/F5OEO/librpitx) di Evariste Courjaud F5OEO.
 
 > **Stato: sperimentale.** Il percorso di trasmissione (anello DMA, alimentatore in tempo reale, modulazione del PLL,
@@ -54,7 +58,9 @@ riprogrammato, ma l'albero dei clock viene modificato appena si crea uno stream.
 
 | Caratteristica | Dettagli |
 |----------------|----------|
-| Direzione | Solo trasmissione, un canale |
+| Direzione | Un canale TX; con `rx=<driver>` (un RTL-SDR) anche un canale RX: un ricetrasmettitore con stream simultanei (full duplex) e commutazione d'antenna half-duplex |
+| Ricevitore | Qualsiasi modulo ricevitore SoapySDR (in pratica un RTL-SDR) aperto dal driver; ogni chiamata RX gli viene inoltrata; i suoi campioni vengono silenziati mentre il trasmettitore è in trasmissione |
+| Relè d'antenna | `relay_gpio`: GPIO di un relè T/R, commutato su TX prima del primo campione di una trasmissione (`relay_tx_delay_ms`) e di nuovo su RX dopo l'ultimo (`relay_hang_ms`) |
 | Formati dei campioni | `CF32` (nativo, fondo scala 1.0), `CS16` (fondo scala 32768), `CS8` (fondo scala 128) |
 | Frequenza di campionamento | 10 kHz – 200 kHz (qualsiasi valore; elencate 24 k / 48 k / 96 k / 192 k; predefinita 48 kHz) |
 | Frequenza | 50 kHz – 1500 MHz (BCM2711: 50 kHz – 1000 MHz) sulla fondamentale; `harmonic=n` moltiplica l'intervallo |
@@ -65,9 +71,9 @@ riprogrammato, ma l'albero dei clock viene modificato appena si crea uno stream.
 | Burst | `SOAPY_SDR_END_BURST` rispettato: la disattivazione attende che il burst sia uscito dall'antenna |
 | Streaming | FIFO lock-free, thread alimentatore in tempo reale, pre-roll configurabile, contropressione con timeout, scritture parziali |
 | Modifiche al volo | Frequenza, frequenza di campionamento, guadagno e tutte le impostazioni durante la trasmissione, senza perdere campioni in coda |
-| Diagnostica | Sensori per aggancio del PLL, stato del DMA, riempimento della FIFO, underflow, overrun del DMA, riavvii del DMA, frequenza di campionamento effettiva e saturazioni dell'inviluppo; `readStreamStatus()` segnala `SOAPY_SDR_UNDERFLOW` |
+| Diagnostica | Sensori per aggancio del PLL, stato del DMA, riempimento della FIFO, underflow, overrun del DMA, riavvii del DMA, frequenza di campionamento effettiva, saturazioni dell'inviluppo e lo stato di trasmissione (PTT); `readStreamStatus()` segnala `SOAPY_SDR_UNDERFLOW` |
 | Sicurezza | Lock a livello di sistema, registro dei crash e ripristino automatico, pulizia opzionale sui segnali, strumento `rpitx_reset`, rifiuto di utilizzatori in conflitto di GPIO / I2S / DMA |
-| Integrazioni | GNU Radio (Soapy sink), SDRangel (uscita SoapySDR), Python, programmi host HPSDR Protocol 1 tramite il bridge |
+| Integrazioni | GNU Radio (Soapy sink / source), SDRangel (uscita / ingresso SoapySDR), Python, programmi host HPSDR Protocol 1 tramite il bridge (come ricetrasmettitore con `--rx`) |
 
 Ciò che l'hardware fa bene: **NBFM, FSK/AFSK, modi digitali a inviluppo costante tipo WSPR/FT8, CW e BPSK**. AM e SSB
 funzionano; con il solo pin la loro qualità è limitata dagli 8 gradini di ampiezza (vedi
@@ -401,7 +407,11 @@ SoapySDRUtil --info                         # "rpitx" in "Available factories"
 sudo SoapySDRUtil --find="driver=rpitx"     # modello e numero di serie della scheda
 sudo SoapySDRUtil --probe="driver=rpitx"    # canali, intervalli, impostazioni, sensori
 sudo rpitx_tone_test.py --freq 144.800M     # tono NBFM di prova di 30 s (carico fittizio!)
+sudo SoapySDRUtil --probe="driver=rpitx,rx=rtlsdr"   # ricetrasmettitore: un canale RX e uno TX, full duplex
 ```
+
+Con un RTL-SDR collegato (e il suo modulo SoapySDR, `soapysdr-module-rtlsdr`, installato), `--find` elenca prima il
+dispositivo solo TX e poi una voce *RPITX transceiver* per ogni chiavetta.
 
 ---
 
@@ -441,7 +451,52 @@ sdr.closeStream(st)
   campionamento 48000, la frequenza centrale e argomenti di stream opzionali come `preroll_ms=150,fifo_ms=300`.
   Eseguire `gnuradio-companion` o lo script generato come root.
 - **SDRangel:** aggiungere un dispositivo *SoapySDR output* e selezionare il dispositivo rpitx; le impostazioni
-  compaiono nel pannello del dispositivo.
+  compaiono nel pannello del dispositivo. Con una voce di ricetrasmettitore (`rx=rtlsdr`) un *SoapySDR input* sullo
+  stesso dispositivo riceve tramite l'RTL-SDR.
+
+### Ricetrasmettitore: ricevitore RTL-SDR e relè d'antenna
+
+```sh
+# Ricetrasmettitore: il primo RTL-SDR come canale RX 0, relè su GPIO17 (alto = TX)
+driver=rpitx,rx=rtlsdr,relay_gpio=17
+# Una chiavetta precisa, campionamento diretto per l'HF, modulo relè attivo basso, tempo di mantenimento più lungo
+driver=rpitx,rx=rtlsdr,rx.serial=00000002,rx.direct_samp=2,relay_gpio=17,relay_active_low=true,relay_hang_ms=300
+# Solo TX con il PTT di un amplificatore / relè T-R su GPIO27
+driver=rpitx,relay_gpio=27
+```
+
+**Ricevitore.** `rx=<driver>` apre un ricevitore SoapySDR tramite il suo modulo installato (`rtlsdr` per un RTL-SDR;
+`none` o vuoto = solo TX) ed espone il suo canale 0 come canale RX 0 del dispositivo rpitx. Ogni argomento del
+dispositivo `rx.<chiave>=<valore>` gli viene passato come `<chiave>=<valore>` (`rx.serial=…` sceglie la chiavetta).
+Il dispositivo riporta allora un canale RX e uno TX e `getFullDuplex()` vero: uno stream RX e uno TX possono essere
+aperti e attivi contemporaneamente. Ogni chiamata RX — `setupStream`/`readStream`/`readStreamStatus`, frequenza,
+guadagno (e AGC), antenne, frequenza di campionamento, larghezza di banda, correzioni di DC / bilanciamento IQ /
+frequenza, sensori e impostazioni di canale — viene inoltrata al ricevitore; le sue impostazioni globali sono
+disponibili come `rx.<chiave>` (per esempio `rx.direct_samp`, `rx.offset_tune`, `rx.biastee` dell'RTL-SDR) e le sue
+informazioni hardware compaiono in `getHardwareInfo()` con il prefisso `rx.`, accanto a `rx_driver` e `rx_hardware`.
+`rx=rpitx` viene rifiutato.
+
+**Passaggio in trasmissione.** Il trasmettitore va *in trasmissione* con il primo campione scritto dopo un periodo
+inattivo ed *esce dalla trasmissione* quando tutti i campioni in coda sono stati riprodotti e non è stato scritto
+nulla per `relay_hang_ms`, oppure subito quando lo stream TX viene disattivato o chiuso. Durante la trasmissione il
+sensore `ptt` legge `true` e — con `rx_mute_tx=true`, il valore predefinito — i campioni ricevuti vengono sostituiti
+da silenzio (zeri, metà scala per i formati senza segno; flag e marche temporali restano), così un'applicazione può
+tenere attivi entrambi gli stream come con qualsiasi ricetrasmettitore.
+
+**Relè d'antenna.** Con `relay_gpio=<n>` il driver comanda quel GPIO come uscita: posizione RX all'apertura,
+posizione TX in trasmissione, di nuovo RX all'uscita dalla trasmissione e alla chiusura del dispositivo (il pin resta
+un'uscita in posizione RX). Il primo `writeStream()` di una trasmissione commuta il relè e attende
+`relay_tx_delay_ms` prima di mettere in coda qualsiasi suo campione, così nessuna RF arriva ai contatti in
+movimento (l'attesa non conta in `timeoutUs`). `relay_active_low=true` è per i moduli relè con ingresso attivo basso.
+Il pin è comandato tramite i registri GPSET/GPCLR, che il DMA del trasmettitore non tocca mai; la sua funzione viene
+impostata mentre non esiste uno stream TX, quindi `relay_gpio` e `relay_active_low` non possono cambiare con uno stream
+TX aperto (i tempi sì). Sono accettati GPIO2–27 tranne GPIO4, e uno stream TX che userebbe il pin del relè (`rf_dac`
+su GPIO20, `envelope_output=pcm` su GPIO18/19/21, `pwm` su `pwm_gpio`) viene rifiutato.
+
+> **Proteggere il ricevitore.** L'ingresso dell'RTL-SDR sopporta solo pochi milliwatt. Collegarlo tramite il relè (o
+> un commutatore T/R) e tenere `relay_tx_delay_ms` più lungo del tempo di intervento del relè; con due antenne
+> separate assicurarsi che l'isolamento basti per la potenza trasmessa. Il relè è comandato da un GPIO (3,3 V, pochi
+> mA): usare un transistor o un modulo relè, mai la bobina direttamente.
 
 ### Semantica dello stream
 
@@ -514,10 +569,19 @@ posizioni a 48 kHz). Un'applicazione che scrive più veloce del tempo reale mant
 | `eer_idle` | 0 | Codice d'inviluppo mentre non si trasmette (frazione del fondo scala) |
 | `eer_drive` | 7 | Corrente dei pin di clock mentre si usa il DAC d'inviluppo |
 | `profile` | vuoto | File di profilo: le sue impostazioni e `gain` si applicano subito, le sue righe `stream.*` diventano i valori predefiniti del prossimo stream (vedere [File di profilo](#file-di-profilo)); vuoto dimentica quei valori dello stream |
+| `relay_gpio` | -1 | GPIO del relè d'antenna T/R (2 – 27, non 4), -1 = nessun relè; non può cambiare con uno stream TX aperto |
+| `relay_active_low` | false | Il relè è in posizione TX con il pin basso; non può cambiare con uno stream TX aperto |
+| `relay_tx_delay_ms` | 20 | Tempo di assestamento del relè prima di mettere in coda il primo campione di una trasmissione, 0 – 1000 ms |
+| `relay_hang_ms` | 100 | Tempo in cui il trasmettitore resta in trasmissione (relè su TX, ricevitore silenziato) dopo la riproduzione dell'ultimo campione, 0 – 10000 ms |
+| `rx_mute_tx` | true | Sostituire i campioni ricevuti con silenzio durante la trasmissione |
+| `rx.<chiave>` | — | Un'impostazione del ricevitore (solo con `rx=<driver>`), per esempio `rx.direct_samp` |
+
+Solo come argomenti del dispositivo: `rx=<driver>` aggiunge un ricevitore, `rx.<chiave>=<valore>` gli viene passato
+(vedere [Ricetrasmettitore](#ricetrasmettitore-ricevitore-rtl-sdr-e-relè-dantenna)).
 
 Esempio: `driver=rpitx,amplitude_mode=constant,ppm=1.5`. Gli argomenti del dispositivo sconosciuti vengono segnalati con
-un avviso, tranne le chiavi di identificazione (`driver`, `label`, `product`, `serial`, `manufacturer`, `tuner`, `type`)
-e le chiavi che contengono `:`. Gli interi sono decimali (uno zero iniziale non significa ottale) e i numeri non possono avere caratteri in
+un avviso, tranne le chiavi di identificazione (`driver`, `label`, `product`, `serial`, `manufacturer`, `tuner`, `type`),
+le chiavi del ricevitore (`rx`, `rx.*`) e le chiavi che contengono `:`. Gli interi sono decimali (uno zero iniziale non significa ottale) e i numeri non possono avere caratteri in
 coda.
 
 ### File di profilo
@@ -541,6 +605,8 @@ gain=7
 - Le righe `stream.<chiave>` diventano i valori predefiniti di `setupStream()`; gli argomenti passati
   dall'applicazione hanno la precedenza.
 - `gain` imposta il guadagno PAD (0–7).
+- Sono accettate anche le chiavi del relè (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`) e
+  `rx_mute_tx`; `rx` e `rx.*` sono argomenti del dispositivo e non vengono letti da un profilo.
 - Le righe vuote e quelle che iniziano con `#` sono ignorate, le chiavi sconosciute sono segnalate con un avviso e
   ignorate, una riga senza `=` è un errore, e una riga successiva sostituisce una precedente con la stessa chiave.
 - `readSetting("profile")` restituisce l'ultimo file caricato; `writeSetting("profile", "")` dimentica i suoi valori
@@ -563,6 +629,10 @@ gain=7
 | `sample_rate` | float Hz | Frequenza di campionamento I/Q prodotta effettivamente dai divisori del clock di cadenza |
 | `envelope_clip` | int | Posizioni il cui inviluppo (\|I/Q\| × `iq_scale`, o il codice EER) ha superato il fondo scala |
 | `envelope_late` | int | Parole d'inviluppo che non è stato possibile scrivere in anticipo (anello quasi vuoto) |
+| `ptt` | bool | Il trasmettitore è in trasmissione: relè in posizione TX e, con `rx_mute_tx`, ricevitore silenziato (sempre disponibile) |
+| `ptt_count` | int | Volte in cui il trasmettitore è andato in trasmissione dall'apertura del dispositivo (sempre disponibile) |
+
+I sensori di canale del ricevitore sono disponibili sul canale RX (`listSensors(SOAPY_SDR_RX, 0)`).
 
 ---
 
@@ -716,7 +786,8 @@ canale che si sa libero). Adatto a `ExecStopPost=` in un'unità systemd.
 ### `hpsdr_rpitx_bridge.py` — bridge HPSDR Protocol 1
 
 Fa apparire il Pi in rete come una radio openHPSDR Protocol 1, così piHPSDR, Thetis, PowerSDR mRX, linHPSDR, Quisk o
-SparkSDR lo rilevano e trasmettono tramite rpitx.
+SparkSDR lo rilevano e trasmettono tramite rpitx. Con `--rx rtlsdr` è un ricetrasmettitore completo: i ricevitori
+dell'host ricevono I/Q reali dall'RTL-SDR, e `--relay-gpio` commuta l'antenna.
 
 ```sh
 sudo hpsdr_rpitx_bridge.py                          # segue la frequenza TX dell'host, emulazione Hermes
@@ -726,6 +797,10 @@ sudo hpsdr_rpitx_bridge.py --amplitude-mode constant --follow-drive
 sudo hpsdr_rpitx_bridge.py --key-dot-gpio 17 --key-dash-gpio 27 --ptt-gpio 22
 sudo hpsdr_rpitx_bridge.py --allow 192.168.1.20         # risponde solo a questo host
 hpsdr_rpitx_bridge.py --dry-run --verbose           # solo protocollo, senza trasmettitore, senza root
+sudo hpsdr_rpitx_bridge.py --rx rtlsdr --relay-gpio 17              # ricetrasmettitore: ricevitore RTL-SDR, relè su GPIO17
+sudo hpsdr_rpitx_bridge.py --rx rtlsdr --rx-args serial=00000002,direct_samp=2 --follow-rx-gain   # HF, guadagno dall'host
+sudo hpsdr_rpitx_bridge.py --rx rtlsdr --rx-freq-offset -125M       # RTL-SDR dietro un convertitore da 125 MHz
+hpsdr_rpitx_bridge.py --dry-run --rx rtlsdr         # solo ricezione (senza trasmettitore), p. es. per provare su un PC
 ```
 
 | Area | Implementazione |
@@ -734,8 +809,10 @@ hpsdr_rpitx_bridge.py --dry-run --verbose           # solo protocollo, senza tra
 | Schede | `metis`, `hermes` (predefinita), `hermes2`/`griffin`, `angelia`, `orion`, `orion2`, `hermeslite` |
 | Avvio / arresto | I/Q EP6 e wideband EP4, su UDP o TCP; un altro host prende il controllo con un avvio; un arresto da un altro host viene ignorato |
 | C&C dell'host (EP2) | Tutti gli indirizzi decodificati (frequenza, ricevitori, duplex, NCO TX/RX, potenza, filtri, attenuatori, microfono, PureSignal, keyer CW, estensioni HL2); `--verbose` registra le modifiche |
-| Stato (EP6) | PTT/punto/linea, ingressi IO inattivi, firmware, potenza diretta (`--fwd-counts`), tensione di alimentazione, temperatura HL2, livello della FIFO TX e conferme |
-| I/Q di ricezione | Rumore sintetico o zeri a 48/96/192/384 kHz, microfono muto; cadenzato perché lo stream TX dell'host vada a 48 kHz |
+| Stato (EP6) | PTT/punto/linea, ingressi IO inattivi, firmware, potenza diretta (`--fwd-counts`), tensione di alimentazione, sovraccarico dell'ADC (saturazione del ricevitore, con `--rx`), temperatura HL2, livello della FIFO TX e conferme |
+| I/Q di ricezione | Con `--rx`: la cattura del ricevitore (un multiplo intero della frequenza dell'host che accetta, p. es. 240 kS/s per 48 kHz su un RTL-SDR) convertita in banda base e decimata a 48/96/192/384 kHz per ogni ricevitore dell'host (fino a 12) sulla propria frequenza; i ricevitori fuori dalla cattura inviano zeri; EP6 è cadenzato dal clock del ricevitore. Senza `--rx`: rumore sintetico o zeri cadenzati dal clock di sistema. Microfono muto in entrambi i casi |
+| Controllo del ricevitore | Segue le frequenze RX dell'host (più `--rx-freq-offset`, predefinito `--freq-offset`); il centro della cattura è RX1 più uno scostamento che tiene la spuria di DC dell'RTL-SDR fuori dalla banda (`--rx-offset`) e viene risintonizzato solo quando RX1 esce dal 90 % della cattura; guadagno `--rx-gain` (dB o `auto`) oppure, con `--follow-rx-gain`, dall'attenuatore dell'host / guadagno LNA dell'HL2; `--rx-antenna`, `--rx-ppm`, `--rx-rate`, `--rx-args`, `--rx-stream-args` |
+| Commutazione T/R | La esegue il driver: `--relay-gpio`, `--relay-active-low`, `--relay-tx-delay-ms`, `--relay-hang-ms`; il ricevitore è silenziato durante la trasmissione salvo con `--rx-during-tx` |
 | Trasmissione | I/Q TX dell'host finché MOX è attivo, sull'NCO TX (o RX1 quando il duplex è disattivato) |
 | CW | Keyer iambico A/B o tasto verticale con palette su GPIO e temporizzazione dell'host, CWX di HL2, ingresso PTT su GPIO |
 | Watchdog | Lo streaming si ferma e il TX viene rilasciato dopo `--host-timeout` s senza pacchetti dall'host |
@@ -744,7 +821,10 @@ hpsdr_rpitx_bridge.py --dry-run --verbose           # solo protocollo, senza tra
 Note: in SSB con il microfono muto non c'è portante (in modo `envelope` le ampiezze sotto 0,5 / (PAD + 1) del fondo
 scala spengono la portante; il bridge mostra un suggerimento). Con l'opzione *CW handled in Radio* di piHPSDR l'host non
 attiva MOX in CW: collegare le palette agli ingressi GPIO o disattivare quell'opzione. piHPSDR limita le radio
-Protocol 1 a 61,44 MHz; usare `--freq-offset` o un LO di transverter per il VHF.
+Protocol 1 a 61,44 MHz; usare `--freq-offset` o un LO di transverter per il VHF (con `--rx` il ricevitore segue lo
+stesso scostamento salvo indicare `--rx-freq-offset`). Il rapporto di stato aggiunge il centro del ricevitore, la
+frequenza di cattura, gli overflow, i campioni scartati e le interruzioni; quando il ricevitore smette di fornire
+campioni il bridge mantiene attivo l'host con rumore.
 
 ---
 
@@ -1006,6 +1086,24 @@ dichiarato inviato mentre ci sono campioni in transito tra la FIFO, il buffer di
 viene aggiornata a ogni retune. Un produttore bloccato attende su una variabile di condizione a intervalli di 2 ms e
 viene risvegliato dall'alimentatore quando libera spazio.
 
+### Commutazione trasmissione/ricezione
+
+`SoapyRPITX_Ptt` conserva lo stato di trasmissione condiviso dallo stream TX e dal percorso RX. `writeStream()` vi
+registra ogni scrittura: la prima scrittura dopo un periodo inattivo porta il trasmettitore in trasmissione e, con un
+relè, porta il pin del relè in posizione TX e attende `relay_tx_delay_ms` prima di inserire i campioni nella FIFO —
+il DMA vede solo dati arrivati dopo l'assestamento del relè. Un thread supervisore dello stream TX controlla ogni
+millisecondo se il trasmettitore si è svuotato (l'alimentatore pubblica il contatore di inserimenti fino al quale
+tutto è stato riprodotto, lo stesso valore usato da `WaitDrained()`) ed esce dalla trasmissione quando è vuoto, senza
+scritture in corso, da `relay_hang_ms`. Disattivare, chiudere o distruggere lo stream ferma prima il trasmettitore
+(portante spenta) ed esce dalla trasmissione dopo. Poiché il DMA riscrive le parole GPFSEL0/GPFSEL2 intere con i
+valori letti in `Start()`, il pin del relè viene reso un'uscita prima che esista uno stream TX e la sua funzione non
+cambia mai con uno stream aperto; il suo livello passa per GPSET0/GPCLR0, che il DMA non scrive.
+
+Il ricevitore viene aperto con la funzione di fabbrica registrata dal suo modulo (non tramite
+`SoapySDR::Device::make()`, che sta già creando il dispositivo rpitx); appartiene al dispositivo rpitx e si chiude con
+esso. `readStream()` gira senza il mutex del dispositivo, come `writeStream()`, ed è conteggiata, così
+`closeStream()` attende una lettura in corso prima di chiudere lo stream del ricevitore.
+
 ### Chiusura, ripristino dopo i crash e sicurezza
 
 - **Chiusura normale** (`deactivateStream` / `closeStream` / distruzione del dispositivo): si attende la fine
@@ -1096,6 +1194,11 @@ chiama mai `exit()`; ogni guasto hardware diventa una `std::runtime_error` che l
 | "the transmitter thread did not respond within 3 s" | Il thread alimentatore non ha avuto CPU (un altro task `SCHED_FIFO`?); la modifica non è stata applicata, ripeterla |
 | "not a regular file" / "writable by group or others" per un profilo | Usare un file regolare con modo 0644 (o più restrittivo) |
 | Nessuna portante in SSB con il bridge HPSDR | Microfono muto; vedere le note del bridge sopra |
+| "receiver driver 'rtlsdr' is not installed" | Installare il modulo SoapySDR del ricevitore (`soapysdr-module-rtlsdr`); `SoapySDRUtil --info` deve elencare `rtlsdr` |
+| "cannot open the receiver 'rtlsdr'" | Chiavetta assente, usata da un altro programma (rtl_tcp, dump1090…) o driver DVB del kernel caricato (mettere in blacklist `dvb_usb_rtl28xxu`); controllare `rx.serial` |
+| "GPIOn is the antenna relay (relay_gpio)" | Lo stream TX usa quel pin (`rf_dac`, `envelope_output`); spostare il relè su un altro GPIO |
+| "relay_gpio and relay_active_low cannot change while a TX stream is open" | Chiudere lo stream TX, cambiare l'impostazione e riaprirlo |
+| Ricevitore muto durante la trasmissione | È previsto con `rx_mute_tx=true` (bridge: `--rx-during-tx` per mantenerlo) |
 
 ---
 
@@ -1115,7 +1218,7 @@ che esce dalla FIFO).
 | `rpitx_unit_tests` | Ordine della FIFO con concorrenza e limite di capacità; contabilità dell'anello contro un motore simulato (regime stabile, brevi blocchi, giri persi, doppio blocco, mancanza di dati dall'host, motore fermo senza giri attribuiti); stima di frequenza del DSP, soglia e continuità di fase attraverso lo zero; modello di ampiezza, tabelle, medie del sigma-delta, ritardo dell'inviluppo e allineamento inviluppo/fase, corrispondenza del codice EER |
 | `rpitx_devicetree_tests` | Base delle periferiche, limite dei canali DMA classici e maschera DMA del kernel con la nomenclatura vecchia e attuale del device tree |
 | `rpitx_transmitter_tests` | Alimentatore, pre-roll, svuotamento, retune con portante spenta e ripetizione dell'anello, arresto di emergenza seguito da distruzione, riavvio del DMA, isteresi dei pad, capacità della FIFO rispetto alla frequenza, errori del costruttore (frequenza irraggiungibile, allocazione rifiutata, anello corto), selezione del canale DMA (e nessuna ipotesi senza la maschera del kernel), lock di sessione e ripristino dopo i crash (pin, PWM, maschera del kernel illeggibile, marcatore finale del registro, registro incompleto), directory di lock privata, collegamento simbolico e registri non plausibili, registrazione anticipata dell'allocazione, nodi del device tree senza `status`, gestori di segnale, avvio cadenzato del DMA, ritardo dell'inviluppo, sigma-delta, correzione AM/PM, RF-DAC, posizioni per campione, uscita d'inviluppo PCM e PWM con allineamento inviluppo/fase, fine del burst prima di un burst breve, ripetizione delle sole posizioni di dati (retune prima dell'avvio del DMA e dopo un intervallo inattivo), svuotamento durante un retune concorrente, rilascio registrato prima di liberare la memoria VideoCore |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: impostazioni e intervalli, analisi rigorosa dei numeri, impostazioni di ampiezza, correzione di frequenza, argomenti dello stream (compresa l'uscita d'inviluppo), scalatura CF32/CS16/CS8, svuotamento con `END_BURST`, `closeStream()` durante uno svuotamento, `activateStream()` su uno stream attivo, stato dello stream, sensori, file di profilo e `profile=`, controlli dei file di profilo (dispositivi, pipe, dimensione, permessi, collegamenti simbolici), interi e guadagni fuori intervallo, limiti dei timeout |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: impostazioni e intervalli, analisi rigorosa dei numeri, impostazioni di ampiezza, correzione di frequenza, argomenti dello stream (compresa l'uscita d'inviluppo), scalatura CF32/CS16/CS8, svuotamento con `END_BURST`, `closeStream()` durante uno svuotamento, `activateStream()` su uno stream attivo, stato dello stream, sensori, file di profilo e `profile=`, controlli dei file di profilo (dispositivi, pipe, dimensione, permessi, collegamenti simbolici), interi e guadagni fuori intervallo, limiti dei timeout; modo ricetrasmettitore con un ricevitore simulato registrato dal test (apertura, inoltro dell'API e delle impostazioni RX, stream RX/TX simultanei, verifica degli handle, voci di enumerazione, silenziamento durante la trasmissione con formati con e senza segno); relè d'antenna sui registri GPIO simulati (validazione, polarità, rilascio del pin, conflitti con gli stream TX, ritardo di commutazione, tempo di mantenimento, uscita dalla trasmissione alla disattivazione/chiusura, pin di GPFSEL0 sotto il DMA, chiavi del relè nei profili) |
 
 La CI (`.github/workflows/ci.yml`) esegue i test in una compilazione normale, con AddressSanitizer +
 UndefinedBehaviorSanitizer e con ThreadSanitizer (`tests/tsan.supp` sopprime solo gli accessi ai registri simulati), e
@@ -1134,8 +1237,10 @@ d'errore noti, convergenza su entrambi i percorsi, esiti `HARDWARE_LIMIT` e `UNV
 src/
   SoapyRPITX.hpp                 classe del dispositivo SoapySDR e wrapper dello stream
   SoapyRPITX_Registration.cpp    rilevamento della scheda, enumerazione, registrazione in SoapySDR
-  SoapyRPITX_Settings.cpp        identificazione, impostazioni, antenna, guadagno, frequenza, frequenza di campionamento
-  SoapyRPITX_Streaming.cpp       configurazione dello stream, conversione dei formati, scrittura / stato / burst
+  SoapyRPITX_Settings.cpp        identificazione, impostazioni, antenna, guadagno, frequenza, frequenza di campionamento (TX, e inoltro RX)
+  SoapyRPITX_Streaming.cpp       configurazione dello stream, conversione dei formati, scrittura / lettura / stato / burst
+  SoapyRPITX_Receiver.cpp        apertura del ricevitore e inoltro dello stream RX (modo ricetrasmettitore)
+  SoapyRPITX_Ptt.*               stato di trasmissione e GPIO del relè d'antenna
   SoapySDR_Sensors.cpp           sensori
   SoapyRPITX_IQ_dmaSync.*        trasmettitore: anello DMA, thread alimentatore, modulazione, retune, chiusura
   SoapyRPITX_Buffers.hpp         SpscFifo e DmaRingTracker (indipendenti dall'hardware)
@@ -1148,7 +1253,7 @@ tools/
   rpitx_tone_test.py             trasmettitore di prova (tono / WAV)
   rpitx_amp_calibrate.py         calibrazione di ampiezza, AM/PM, RF-DAC, EER e ritardo dell'inviluppo
   rpitx_autotune.py              test e regolazione in anello chiuso via radio di ogni modo (pin diretto ed EER)
-  hpsdr_rpitx_bridge.py          emulazione di radio openHPSDR Protocol 1
+  hpsdr_rpitx_bridge.py          emulazione di radio openHPSDR Protocol 1 (trasmettitore o ricetrasmettitore)
 tests/                           test unitari, del device tree, del trasmettitore e del driver, simulazione hardware, soppressioni TSan
 rpi-cross.sh                     helper per la compilazione incrociata (host Fedora / derivato di Debian)
 ```

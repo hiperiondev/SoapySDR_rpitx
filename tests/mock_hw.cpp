@@ -49,6 +49,7 @@ std::function<void()> g_vcMapHook;
 std::function<void(unsigned)> g_vcFreeHook;
 
 constexpr unsigned kPeriBase = 0x20000000; // BCM2835 peripheral base reported without a device tree
+constexpr unsigned kMaxHandle = 31;        // highest memory handle whose physical address stays below kPeriBase
 
 // Simulated register blocks live as long as the process, like the real peripherals; they are released
 // at exit so that leak checkers only report allocations of the code under test.
@@ -96,7 +97,19 @@ unsigned mem_alloc(int, unsigned size, unsigned, unsigned) {
         g_failNextAlloc = false;
         return 0;
     }
-    unsigned h = g_nextHandle++;
+    // Handles are recycled, as the firmware does: the bus address of handle h is 0x40000000 | (h << 24), and
+    // from handle 32 on its physical address would fall in the simulated peripheral range.
+    unsigned h = 0;
+    for (unsigned tries = 0; tries < kMaxHandle; tries++) {
+        unsigned candidate = g_nextHandle;
+        g_nextHandle = g_nextHandle % kMaxHandle + 1;
+        if (!g_vcmem.count(candidate)) {
+            h = candidate;
+            break;
+        }
+    }
+    if (h == 0)
+        return 0; // every handle in use
     g_vcmem[h] = Allocation{allocPages(size), size};
     return h;
 }

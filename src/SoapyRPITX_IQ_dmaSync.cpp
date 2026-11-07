@@ -454,8 +454,7 @@ SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::CheckTune(const SoapyRPITX_TuneCo
 
     const int bandwidth = (int) std::ceil((0.5 + kMaxPhaseStep / (2.0 * M_PI)) * (double) rate);
     const uint64_t pllFrequency = (uint64_t) std::llround(tune.frequency / tune.harmonic);
-    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0 ? SoapyRPITX_RetuneResult::Ok
-                                                                        : SoapyRPITX_RetuneResult::Refused;
+    return clkgpio::CheckCenterFrequency(pllFrequency, bandwidth) >= 0 ? SoapyRPITX_RetuneResult::Ok : SoapyRPITX_RetuneResult::Refused;
 }
 
 bool SoapyRPITX_IQ_dmaSync::ApplyTune(const SoapyRPITX_TuneConfig &tune) {
@@ -963,6 +962,10 @@ bool SoapyRPITX_IQ_dmaSync::WaitDrained(long timeoutUs) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return false;
+}
+
+bool SoapyRPITX_IQ_dmaSync::IsDrained() const {
+    return active.load() && drainedPush.load() == fifo.pushedTotal();
 }
 
 SoapyRPITX_RetuneResult SoapyRPITX_IQ_dmaSync::Retune(const SoapyRPITX_TuneConfig &tune) {

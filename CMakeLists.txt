@@ -1,4 +1,4 @@
-# SoapySDR_rpitx - SoapySDR TX driver for librpitx (Raspberry Pi GPIO transmitter)
+# SoapySDR_rpitx - SoapySDR driver for librpitx (Raspberry Pi GPIO transmitter), optionally a transceiver with an RTL-SDR receiver
 cmake_minimum_required(VERSION 3.10)
 project(SoapyRPITX VERSION 0.3.0 LANGUAGES CXX)
 
@@ -78,6 +78,8 @@ if(RPITX_BUILD_DRIVER)
 
     set(RPITX_SOURCES
         src/SoapyRPITX_IQ_dmaSync.cpp
+        src/SoapyRPITX_Ptt.cpp
+        src/SoapyRPITX_Receiver.cpp
         src/SoapyRPITX_Registration.cpp
         src/SoapyRPITX_Settings.cpp
         src/SoapyRPITX_Streaming.cpp
@@ -163,6 +165,8 @@ if(BUILD_TESTING)
         add_executable(rpitx_driver_tests
             tests/test_driver.cpp
             ${RPITX_TEST_HW_SOURCES}
+            src/SoapyRPITX_Ptt.cpp
+            src/SoapyRPITX_Receiver.cpp
             src/SoapyRPITX_Registration.cpp
             src/SoapyRPITX_Settings.cpp
             src/SoapyRPITX_Streaming.cpp

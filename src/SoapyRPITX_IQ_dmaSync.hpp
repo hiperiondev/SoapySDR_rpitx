@@ -365,6 +365,16 @@ public:
     bool WaitDrained(long timeoutUs);
 
     /**
+     * @brief Tells, without waiting, whether every queued sample has been played (any thread).
+     *
+     * Uses the drain state published by the feeder thread, as WaitDrained() does.
+     *
+     * @return True when active and drained; false while samples are queued, in the replay buffer or in the ring,
+     *         and when the transmitter is not active.
+     */
+    bool IsDrained() const;
+
+    /**
      * @brief Changes the frequency-related parameters.
      *
      * While active the change is performed by the feeder thread: the DMA is stopped, the carrier is turned off,

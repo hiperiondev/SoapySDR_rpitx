@@ -30,6 +30,7 @@
 #include <iterator>
 #include <string>
 
+#include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Registry.hpp>
 
 #include "SoapyRPITX.hpp"
@@ -53,6 +54,49 @@ std::string readDeviceTreeString(const char *path) {
 
 bool startsWith(const std::string &s, const std::string &prefix) {
     return s.compare(0, prefix.size(), prefix) == 0;
+}
+
+// Receiver driver announced in the transceiver entries when the "rx" argument is not given.
+constexpr const char *kDefaultReceiver = "rtlsdr";
+
+// Enumerates the receivers of a driver through the find function of its module (not through the factory, which is
+// enumerating this module); "rx.<key>" arguments are passed as "<key>".
+std::vector<SoapySDR::Kwargs> findReceivers(const std::string &driver, const SoapySDR::Kwargs &args) {
+    std::vector<SoapySDR::Kwargs> found;
+    if (driver == "rpitx")
+        return found;
+    const SoapySDR::FindFunctions finders = SoapySDR::Registry::listFindFunctions();
+    auto finder = finders.find(driver);
+    if (finder == finders.end())
+        return found;
+
+    SoapySDR::Kwargs rxArgs;
+    const std::string prefix = RPITX_RX_PREFIX;
+    for (const auto &kv : args)
+        if (startsWith(kv.first, prefix) && kv.first.size() > prefix.size())
+            rxArgs[kv.first.substr(prefix.size())] = kv.second;
+    rxArgs["driver"] = driver;
+    try {
+        found = finder->second(rxArgs);
+    } catch (const std::exception &e) {
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: enumerating %s receivers failed: %s", driver.c_str(), e.what());
+        found.clear();
+    }
+    return found;
+}
+
+// Transceiver entry: the transmitter with one receiver, opened again with rx=<driver> and its serial.
+SoapySDR::Kwargs transceiverEntry(const SoapySDR::Kwargs &tx, const std::string &driver, const SoapySDR::Kwargs &rx) {
+    SoapySDR::Kwargs entry = tx;
+    auto label = rx.find("label");
+    entry["label"] = "RPITX transceiver :: " + tx.at("product") + " + " + (label != rx.end() ? label->second : driver);
+    entry[RPITX_RX_ARG] = driver;
+    auto rxSerial = rx.find("serial");
+    if (rxSerial != rx.end())
+        entry[std::string(RPITX_RX_PREFIX) + "serial"] = rxSerial->second;
+    auto tuner = rx.find("tuner");
+    entry["tuner"] = tuner != rx.end() ? tuner->second : driver;
+    return entry;
 }
 
 } // namespace
@@ -106,7 +150,26 @@ static std::vector<SoapySDR::Kwargs> find_RPITX(const SoapySDR::Kwargs &args) {
     devInfo["serial"] = board.serial;
     devInfo["manufacturer"] = "LU3VEA";
     devInfo["tuner"] = "none";
-    results.push_back(devInfo);
+
+    // Without "rx" the TX-only device comes first (the default of a bare driver=rpitx), followed by one
+    // transceiver entry per RTL-SDR; with "rx" only the entries of that receiver are listed.
+    auto rx = args.find(RPITX_RX_ARG);
+    if (rx == args.end()) {
+        results.push_back(devInfo);
+        for (const SoapySDR::Kwargs &r : findReceivers(kDefaultReceiver, args))
+            results.push_back(transceiverEntry(devInfo, kDefaultReceiver, r));
+    } else if (rx->second.empty() || rx->second == "none") {
+        results.push_back(devInfo);
+    } else {
+        std::vector<SoapySDR::Kwargs> found = findReceivers(rx->second, args);
+        for (const SoapySDR::Kwargs &r : found)
+            results.push_back(transceiverEntry(devInfo, rx->second, r));
+        if (found.empty()) {
+            // Opening reports why the receiver is not available.
+            SoapySDR::Kwargs entry = transceiverEntry(devInfo, rx->second, SoapySDR::Kwargs());
+            results.push_back(entry);
+        }
+    }
 
     return results;
 }

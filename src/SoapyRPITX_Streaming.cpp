@@ -118,7 +118,10 @@ SoapySDR::ArgInfo intArg(const char *key, long def, const char *name, const char
 
 } // namespace
 
-std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const size_t) const {
+std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getStreamFormats(SOAPY_SDR_RX, channel);
+
     std::vector<std::string> formats;
 
     if (direction == SOAPY_SDR_TX) {
@@ -130,12 +133,18 @@ std::vector<std::string> SoapyRPITX::getStreamFormats(const int direction, const
     return formats;
 }
 
-std::string SoapyRPITX::getNativeStreamFormat(const int, const size_t, double &fullScale) const {
+std::string SoapyRPITX::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
+    if (ForwardRx(direction))
+        return rxDev->getNativeStreamFormat(SOAPY_SDR_RX, channel, fullScale);
+
     fullScale = 1.0;
     return SOAPY_SDR_CF32;
 }
 
-SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const size_t) const {
+SoapySDR::ArgInfoList SoapyRPITX::getStreamArgsInfo(const int direction, const size_t channel) const {
+    if (ForwardRx(direction))
+        return rxDev->getStreamArgsInfo(SOAPY_SDR_RX, channel);
+
     SoapySDR::ArgInfoList streamArgs;
     if (direction != SOAPY_SDR_TX)
         return streamArgs;
@@ -195,8 +204,8 @@ bool SoapyRPITX::IsValidTxStreamHandle(SoapySDR::Stream *handle) const {
 void SoapyRPITX::ParseStreamArgs(const SoapySDR::Kwargs &sargs, SoapyRPITX_TxConfig &cfg, std::string &envOut) const {
     cfg.slotsPerSample = (uint32_t) streamArg(sargs, "slots_per_sample", 1, 1, RPITX_MAX_SLOTS_PER_SAMPLE);
     const uint64_t slotRate = (uint64_t) cfg.tune.sampleRate * cfg.slotsPerSample;
-    cfg.ringSize = (uint32_t) streamArg(sargs, "ring_size", SoapyRPITX_DefaultRingSize((uint32_t) std::min<uint64_t>(slotRate, UINT32_MAX)), RPITX_MIN_RING_SIZE,
-                                        RPITX_MAX_RING_SIZE);
+    cfg.ringSize = (uint32_t) streamArg(sargs, "ring_size", SoapyRPITX_DefaultRingSize((uint32_t) std::min<uint64_t>(slotRate, UINT32_MAX)),
+                                        RPITX_MIN_RING_SIZE, RPITX_MAX_RING_SIZE);
     envOut = streamStringArg(sargs, "envelope_output", "none", {"none", "pcm", "pwm"});
     cfg.envelopeOutput = envOut == "pcm" ? SoapyRPITX_EnvelopeOutput::Pcm : envOut == "pwm" ? SoapyRPITX_EnvelopeOutput::Pwm : SoapyRPITX_EnvelopeOutput::None;
     cfg.pwmGpio = (int) streamArg(sargs, "pwm_gpio", 18, 12, 18);
@@ -213,9 +222,29 @@ void SoapyRPITX::ParseStreamArgs(const SoapySDR::Kwargs &sargs, SoapyRPITX_TxCon
     cfg.cpu = (int) streamArg(sargs, "cpu", kDefaultCpu, -1, 63);
 }
 
+void SoapyRPITX::CheckRelayPin(const SoapyRPITX_TxConfig &cfg) const {
+    const int pin = ptt->GetConfig().gpio;
+    if (pin < 0)
+        return;
+    bool used = false;
+    if (cfg.rfDac && pin == 20)
+        used = true;
+    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm && (pin == 18 || pin == 19 || pin == 21))
+        used = true;
+    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm && pin == cfg.pwmGpio)
+        used = true;
+    if (used)
+        throw std::runtime_error("rpitx: GPIO" + std::to_string(pin) + " is the antenna relay (relay_gpio) and cannot be used by the TX stream");
+}
+
 SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels, const SoapySDR::Kwargs &args) {
+    if (direction == SOAPY_SDR_RX) {
+        if (!rxDev)
+            throw std::runtime_error("rpitx: no receiver attached; open the device with rx=rtlsdr for an RX stream");
+        return SetupRxStream(format, channels, args);
+    }
     if (direction != SOAPY_SDR_TX)
-        throw std::runtime_error("rpitx: receive streams are not supported (TX only)");
+        throw std::runtime_error("rpitx: invalid stream direction");
 
     rpitxStreamFormat streamFormat;
     if (format == SOAPY_SDR_CF32) {
@@ -246,6 +275,7 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
     cfg.tune = tune;
     std::string envOut;
     ParseStreamArgs(sargs, cfg, envOut);
+    CheckRelayPin(cfg);
     const uint64_t slotRate = (uint64_t) tune.sampleRate * cfg.slotsPerSample;
     if (slotRate > RPITX_MAX_SAMPLE_RATE)
         throw std::runtime_error("rpitx: sample rate x slots_per_sample (" + std::to_string(slotRate) + " Hz) exceeds " +
@@ -261,7 +291,7 @@ SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string
     SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: TX stream %s, ring %u slots, %u slot(s) per sample, FIFO %u ms, pre-roll %u ms, envelope output %s%s", format.c_str(),
                   cfg.ringSize, cfg.slotsPerSample, cfg.fifoMs, cfg.prerollMs, envOut.c_str(), cfg.rfDac ? ", RF-DAC" : "");
 
-    tx_stream = std::make_shared<tx_streamer>(streamFormat, cfg);
+    tx_stream = std::make_shared<tx_streamer>(streamFormat, cfg, ptt);
 
     // Every stream gets a new token (0 is reserved for "no stream"; the counter is only changed under device_mutex).
     if (++streamGeneration == 0)
@@ -320,6 +350,8 @@ void SoapyRPITX::closeStream(SoapySDR::Stream *handle) {
 
     if (IsValidTxStreamHandle(handle))
         ReleaseTxStreamLocked();
+    else if (IsValidRxStreamHandle(handle))
+        ReleaseRxStreamLocked();
 }
 
 size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
@@ -327,13 +359,19 @@ size_t SoapyRPITX::getStreamMTU(SoapySDR::Stream *handle) const {
 
     if (IsValidTxStreamHandle(handle))
         return tx_stream->mtu();
+    if (IsValidRxStreamHandle(handle))
+        return rxDev->getStreamMTU(rxStream);
 
     return 0;
 }
 
-int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const long long, const size_t) {
+int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const long long timeNs, const size_t numElems) {
     std::lock_guard<std::mutex> lock(device_mutex);
 
+    if (IsValidRxStreamHandle(handle)) {
+        SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: start RX");
+        return rxDev->activateStream(rxStream, flags, timeNs, numElems);
+    }
     if (!IsValidTxStreamHandle(handle))
         return SOAPY_SDR_STREAM_ERROR;
     if (flags & SOAPY_SDR_HAS_TIME)
@@ -343,11 +381,15 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
     return tx_stream->activate();
 }
 
-int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int, const long long) {
+int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int flags, const long long timeNs) {
     std::shared_ptr<tx_streamer> stream;
     long drainUs = 0;
     {
         std::lock_guard<std::mutex> lock(device_mutex);
+        if (IsValidRxStreamHandle(handle)) {
+            SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: stop RX");
+            return rxDev->deactivateStream(rxStream, flags, timeNs);
+        }
         if (!IsValidTxStreamHandle(handle))
             return SOAPY_SDR_STREAM_ERROR;
         stream = tx_stream;
@@ -365,8 +407,23 @@ int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int, const long
     return stream->deactivate();
 }
 
-int SoapyRPITX::readStream(SoapySDR::Stream *, void *const *, const size_t, int &, long long &, const long) {
-    return SOAPY_SDR_NOT_SUPPORTED;
+int SoapyRPITX::readStream(SoapySDR::Stream *handle, void *const *buffs, const size_t numElems, int &flags, long long &timeNs, const long timeoutUs) {
+    // Not serialised with device_mutex, like writeStream(); closeStream() waits for the registered call.
+    SoapySDR::Stream *inner = EnterRxCall(handle);
+    if (inner == nullptr)
+        return SOAPY_SDR_STREAM_ERROR;
+
+    int ret;
+    try {
+        ret = rxDev->readStream(inner, buffs, numElems, flags, timeNs, timeoutUs);
+    } catch (...) {
+        LeaveRxCall();
+        throw;
+    }
+    if (ret > 0)
+        MuteRx(buffs, (size_t) ret);
+    LeaveRxCall();
+    return ret;
 }
 
 int SoapyRPITX::writeStream(SoapySDR::Stream *handle, const void *const *buffs, const size_t numElems, int &flags, const long long timeNs,
@@ -381,6 +438,19 @@ int SoapyRPITX::writeStream(SoapySDR::Stream *handle, const void *const *buffs, 
 }
 
 int SoapyRPITX::readStreamStatus(SoapySDR::Stream *handle, size_t &chanMask, int &flags, long long &timeNs, const long timeoutUs) {
+    SoapySDR::Stream *inner = EnterRxCall(handle);
+    if (inner != nullptr) {
+        int ret;
+        try {
+            ret = rxDev->readStreamStatus(inner, chanMask, flags, timeNs, timeoutUs);
+        } catch (...) {
+            LeaveRxCall();
+            throw;
+        }
+        LeaveRxCall();
+        return ret;
+    }
+
     StreamCall call(*this, handle);
     if (call.get() == nullptr)
         return SOAPY_SDR_STREAM_ERROR;
@@ -390,14 +460,28 @@ int SoapyRPITX::readStreamStatus(SoapySDR::Stream *handle, size_t &chanMask, int
 
 // ************************************** TX STREAMER **************************************
 
-tx_streamer::tx_streamer(rpitxStreamFormat _format, const SoapyRPITX_TxConfig &cfg) :
+tx_streamer::tx_streamer(rpitxStreamFormat _format, const SoapyRPITX_TxConfig &cfg, std::shared_ptr<SoapyRPITX_Ptt> _ptt) :
         format(_format),
         iqsender(new SoapyRPITX_IQ_dmaSync(cfg)),
-        scratch(kScratchSize) {
+        scratch(kScratchSize),
+        ptt(std::move(_ptt)) {
+    supervisor = std::thread(&tx_streamer::Supervise, this);
 }
 
 tx_streamer::~tx_streamer() {
     iqsender->Stop();
+    ptt->Release();
+    supervising.store(false);
+    if (supervisor.joinable())
+        supervisor.join();
+}
+
+void tx_streamer::Supervise() {
+    // A stopped transmitter counts as drained: its carrier is off.
+    while (supervising.load()) {
+        ptt->Poll(!iqsender->IsActive() || iqsender->IsDrained());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 SoapyRPITX_IQ_dmaSync &tx_streamer::transmitter() {
@@ -407,6 +491,7 @@ SoapyRPITX_IQ_dmaSync &tx_streamer::transmitter() {
 void tx_streamer::interrupt() {
     closing.store(true);
     iqsender->Stop();
+    ptt->Release();
 }
 
 size_t tx_streamer::mtu() const {
@@ -437,6 +522,7 @@ long tx_streamer::drainTimeoutUs() {
 
 int tx_streamer::deactivate() {
     iqsender->Stop();
+    ptt->Release();
     endBurstPending.store(false);
     return 0;
 }
@@ -463,6 +549,18 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
         }
         return 0;
     }
+
+    // Keying: with an antenna relay the first write of a transmission waits until the relay has settled in the
+    // TX position, before any of its samples can reach the DMA.
+    const long relayDelayUs = ptt->BeginWrite();
+    struct WriteScope {
+        SoapyRPITX_Ptt &p;
+        ~WriteScope() {
+            p.EndWrite();
+        }
+    } scope{*ptt};
+    if (relayDelayUs > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(relayDelayUs));
 
     const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;
