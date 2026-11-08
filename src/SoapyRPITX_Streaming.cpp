@@ -41,7 +41,7 @@ namespace {
 
 // Size of the conversion buffer, in samples.
 constexpr size_t kScratchSize = 4096;
-// Longest uninterrupted sleep of the relay settling wait.
+// Longest uninterrupted sleep of the T/R sequence wait.
 constexpr auto kRelaySlice = std::chrono::milliseconds(2);
 // Longest blocking time of one call to the receiver; longer timeouts are split into slices of this length.
 constexpr long kRxSliceUs = 100000;
@@ -227,18 +227,25 @@ void SoapyRPITX::ParseStreamArgs(const SoapySDR::Kwargs &sargs, SoapyRPITX_TxCon
 }
 
 void SoapyRPITX::CheckRelayPin(const SoapyRPITX_TxConfig &cfg) const {
-    const int pin = ptt->GetConfig().gpio;
-    if (pin < 0)
-        return;
-    bool used = false;
-    if (cfg.rfDac && pin == 20)
-        used = true;
-    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm && (pin == 18 || pin == 19 || pin == 21))
-        used = true;
-    if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm && pin == cfg.pwmGpio)
-        used = true;
-    if (used)
-        throw std::runtime_error("rpitx: GPIO" + std::to_string(pin) + " is the antenna relay (relay_gpio) and cannot be used by the TX stream");
+    const SoapyRPITX_RelayConfig r = ptt->GetConfig();
+    const struct {
+        int pin;
+        const char *key;
+        const char *what;
+    } outputs[] = {{r.gpio, "relay_gpio", "antenna relay"}, {r.pttGpio, "ptt_gpio", "PTT line"}};
+    for (const auto &o : outputs) {
+        if (o.pin < 0)
+            continue;
+        bool used = false;
+        if (cfg.rfDac && o.pin == 20)
+            used = true;
+        if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pcm && (o.pin == 18 || o.pin == 19 || o.pin == 21))
+            used = true;
+        if (cfg.envelopeOutput == SoapyRPITX_EnvelopeOutput::Pwm && o.pin == cfg.pwmGpio)
+            used = true;
+        if (used)
+            throw std::runtime_error("rpitx: GPIO" + std::to_string(o.pin) + " is the " + o.what + " (" + o.key + ") and cannot be used by the TX stream");
+    }
 }
 
 SoapySDR::Stream *SoapyRPITX::setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels, const SoapySDR::Kwargs &args) {
@@ -591,27 +598,24 @@ int tx_streamer::send(const void *const *buffs, size_t numElems, int &flags, lon
         return 0;
     }
 
-    // Keying: with an antenna relay the first write of a transmission waits until the relay has settled in the
-    // TX position, before any of its samples can reach the DMA.
-    const long relayDelayUs = ptt->BeginWrite();
+    // Keying: the first write of a transmission waits for the T/R sequence (relay settled in the TX position, PTT
+    // line asserted and its delay elapsed) before any of its samples can reach the DMA.
+    long waitUs = ptt->BeginWrite();
     struct WriteScope {
         SoapyRPITX_Ptt &p;
         ~WriteScope() {
             p.EndWrite();
         }
     } scope{*ptt};
-    if (relayDelayUs > 0) {
-        // The relay settles in slices, so that closing or stopping the stream ends the wait at once.
-        const auto settled = std::chrono::steady_clock::now() + std::chrono::microseconds(relayDelayUs);
-        for (;;) {
-            if (closing.load() || !iqsender->IsActive())
-                return SOAPY_SDR_STREAM_ERROR;
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= settled)
-                break;
-            std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(settled - now, kRelaySlice));
-        }
+    // The sequence advances in slices, so that closing or stopping the stream ends the wait at once.
+    while (waitUs > 0) {
+        if (closing.load() || !iqsender->IsActive())
+            return SOAPY_SDR_STREAM_ERROR;
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(std::chrono::microseconds(waitUs), kRelaySlice));
+        waitUs = ptt->ReadyInUs();
     }
+    if (closing.load() || !iqsender->IsActive())
+        return SOAPY_SDR_STREAM_ERROR;
 
     const auto deadline = SoapyRPITX_DeadlineAfter(timeoutUs);
     size_t done = 0;

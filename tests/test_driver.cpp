@@ -12,7 +12,8 @@
 // generated in the build directory (see CMakeLists.txt). Also covers the profile file format, the checks of
 // profile files, the profile=<file> device argument / setting and the limits of numeric inputs and timeouts,
 // the transceiver mode with a simulated SoapySDR receiver registered by this test (forwarding of the RX API,
-// enumeration, receive muting while keyed) and the antenna relay GPIO on the simulated GPIO registers.
+// enumeration, receive muting while keyed) and the antenna relay and PTT line GPIOs (keying and unkeying
+// sequences and their delays) on the simulated GPIO registers.
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1212,6 +1213,207 @@ void testPttWriteSequence() {
     CHECK(!fresh.MutedNow(RPITX_RX_MUTE_MAX_TAIL_MS));
 }
 
+constexpr int kPttPin = 27;
+constexpr uint32_t kPttBit = 1u << kPttPin;
+
+// Waits until a sensor reads @p value; returns the time it was seen, or a time point far in the future on timeout.
+std::chrono::steady_clock::time_point waitSensor(SoapyRPITX &dev, const char *key, const char *value, int timeoutMs) {
+    for (int i = 0; i < timeoutMs * 10; i++) {
+        if (dev.readSensor(key) == value)
+            return std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return std::chrono::steady_clock::time_point::max();
+}
+
+void testPttLineSettings() {
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"ptt_gpio", "4"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"ptt_gpio", "28"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"ptt_gpio", "17"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"ptt_tx_delay_ms", "1001"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"ptt_rx_delay_ms", "-1"}}); }));
+    CHECK(throws([] { SoapyRPITX dev(SoapySDR::Kwargs{{"ptt_active_low", "maybe"}}); }));
+
+    // Opening drives the released level first and then makes the pin an output.
+    MockPokeBits(GENERAL_BASE, GPFSEL2, 7u << 21, 0);
+    clearSetClr();
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"ptt_gpio", "27"}, {"ptt_tx_delay_ms", "15"}, {"ptt_rx_delay_ms", "25"}});
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL2) >> 21) & 7) == fsel_output);
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kPttBit) != 0 && (MockPeek(GENERAL_BASE, kGpset0) & kPttBit) == 0);
+    CHECK(dev.readSetting("ptt_gpio") == "27" && dev.readSetting("ptt_active_low") == "false");
+    CHECK(dev.readSetting("ptt_tx_delay_ms") == "15" && dev.readSetting("ptt_rx_delay_ms") == "25");
+    CHECK(dev.getHardwareInfo()["ptt_gpio"] == "GPIO27");
+    CHECK(dev.readSensor("ptt_line") == "false");
+    CHECK(throws([&] { dev.writeSetting("ptt_gpio", "17"); })); // the relay pin
+    CHECK(dev.readSetting("ptt_gpio") == "27");
+
+    bool listedTx = false, listedRx = false;
+    for (const auto &a : dev.getSettingInfo()) {
+        listedTx = listedTx || (a.key == "ptt_tx_delay_ms" && a.value == std::to_string(RPITX_PTT_DEFAULT_TX_DELAY_MS));
+        listedRx = listedRx || (a.key == "ptt_rx_delay_ms" && a.value == std::to_string(RPITX_PTT_DEFAULT_RX_DELAY_MS));
+    }
+    CHECK(listedTx && listedRx);
+
+    // Polarity: active low drives the pin high while released.
+    clearSetClr();
+    dev.writeSetting("ptt_active_low", "true");
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & kPttBit) != 0);
+    dev.writeSetting("ptt_active_low", "false");
+
+    // Streams that would use the PTT pin are refused; the pin cannot change while a stream is open.
+    dev.writeSetting("ptt_gpio", "20");
+    CHECK(((MockPeek(GENERAL_BASE, GPFSEL2) >> 21) & 7) == fsel_input); // released
+    CHECK(throws([&] { dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rf_dac", "true"}}); }));
+    dev.writeSetting("ptt_gpio", "27");
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
+    CHECK(throws([&] { dev.writeSetting("ptt_gpio", "22"); }));
+    CHECK(throws([&] { dev.writeSetting("ptt_active_low", "true"); }));
+    dev.writeSetting("ptt_tx_delay_ms", "30"); // timing may change at any time
+    dev.closeStream(st);
+    dev.writeSetting("ptt_gpio", "-1");
+    CHECK(dev.getHardwareInfo()["ptt_gpio"] == "none");
+}
+
+// Keying: relay, relay_tx_delay_ms, PTT line, ptt_tx_delay_ms, samples. Unkeying: PTT line, ptt_rx_delay_ms, relay.
+void testPttLineSequencing() {
+    using std::chrono::milliseconds;
+    SoapyRPITX_Ptt ptt;
+    SoapyRPITX_RelayConfig c;
+    c.gpio = kRelayPin;
+    c.pttGpio = kPttPin;
+    c.txDelayMs = 30;
+    c.pttTxDelayMs = 40;
+    c.pttRxDelayMs = 50;
+    c.hangMs = 0;
+    ptt.Configure(c);
+
+    clearSetClr();
+    const auto t0 = std::chrono::steady_clock::now();
+    long waitUs = ptt.BeginWrite();
+    CHECK(waitUs > 0 && ptt.IsKeyed() && !ptt.IsPttAsserted());
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & kRelayBit) != 0);
+    auto pttSeen = std::chrono::steady_clock::time_point::max();
+    while (waitUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(std::min<long>(waitUs, 500)));
+        waitUs = ptt.ReadyInUs();
+        if (ptt.IsPttAsserted() && pttSeen == std::chrono::steady_clock::time_point::max()) {
+            pttSeen = std::chrono::steady_clock::now();
+            CHECK((MockPeek(GENERAL_BASE, kGpset0) & kPttBit) != 0);
+        }
+    }
+    const auto ready = std::chrono::steady_clock::now();
+    CHECK(pttSeen - t0 >= milliseconds(30));
+    CHECK(ready - pttSeen >= milliseconds(39));
+    ptt.EndWrite();
+
+    // Drained: the PTT line is released at once, the relay only after ptt_rx_delay_ms.
+    clearSetClr();
+    ptt.Poll(ptt.WriteSeq(), true);
+    const auto released = std::chrono::steady_clock::now();
+    CHECK(!ptt.IsPttAsserted() && ptt.IsKeyed());
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kPttBit) != 0 && (MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) == 0);
+    while (ptt.IsKeyed() && std::chrono::steady_clock::now() - released < milliseconds(1000)) {
+        ptt.Poll(ptt.WriteSeq(), true);
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    CHECK(!ptt.IsKeyed() && std::chrono::steady_clock::now() - released >= milliseconds(50));
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+
+    // A write during the release delay keys the PTT line again without moving the relay: only ptt_tx_delay_ms.
+    waitUs = ptt.BeginWrite();
+    while (waitUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(std::min<long>(waitUs, 500)));
+        waitUs = ptt.ReadyInUs();
+    }
+    ptt.EndWrite();
+    ptt.Poll(ptt.WriteSeq(), true);
+    CHECK(ptt.IsKeyed() && !ptt.IsPttAsserted());
+    clearSetClr();
+    const uint64_t keys = ptt.KeyCount();
+    const auto rekey = std::chrono::steady_clock::now();
+    waitUs = ptt.BeginWrite();
+    CHECK(ptt.IsKeyed() && ptt.KeyCount() == keys);
+    CHECK((MockPeek(GENERAL_BASE, kGpset0) & kPttBit) != 0 && (MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) == 0);
+    while (waitUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(std::min<long>(waitUs, 500)));
+        waitUs = ptt.ReadyInUs();
+    }
+    const auto rekeyed = std::chrono::steady_clock::now() - rekey;
+    CHECK(rekeyed >= milliseconds(39) && rekeyed < milliseconds(30 + 40));
+    ptt.EndWrite();
+
+    // Release() (transmitter stopped) also waits ptt_rx_delay_ms before the relay returns to RX.
+    clearSetClr();
+    const auto stop = std::chrono::steady_clock::now();
+    ptt.Release();
+    CHECK(!ptt.IsKeyed() && !ptt.IsPttAsserted());
+    CHECK(std::chrono::steady_clock::now() - stop >= milliseconds(50));
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+
+    // Release() during the relay delay: the PTT line was never asserted, the relay returns at once.
+    waitUs = ptt.BeginWrite();
+    CHECK(waitUs > 0 && !ptt.IsPttAsserted());
+    const auto early = std::chrono::steady_clock::now();
+    ptt.Release();
+    ptt.EndWrite();
+    CHECK(!ptt.IsKeyed() && !ptt.IsPttAsserted() && std::chrono::steady_clock::now() - early < milliseconds(20));
+    CHECK(ptt.ReadyInUs() == 0);
+
+    // PTT line without relay: asserted at once, samples after ptt_tx_delay_ms, released at once.
+    c.gpio = -1;
+    ptt.Configure(c);
+    const auto t1 = std::chrono::steady_clock::now();
+    waitUs = ptt.BeginWrite();
+    CHECK(ptt.IsPttAsserted() && waitUs > 30000);
+    while (waitUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(std::min<long>(waitUs, 500)));
+        waitUs = ptt.ReadyInUs();
+    }
+    CHECK(std::chrono::steady_clock::now() - t1 >= milliseconds(39));
+    ptt.EndWrite();
+    ptt.Poll(ptt.WriteSeq(), true);
+    CHECK(!ptt.IsKeyed() && !ptt.IsPttAsserted());
+}
+
+// The same sequence through writeStream() and the supervisor of the TX stream.
+void testPttLineStream() {
+    using std::chrono::milliseconds;
+    clearSetClr();
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"},
+                                    {"ptt_gpio", "27"},
+                                    {"relay_tx_delay_ms", "20"},
+                                    {"ptt_tx_delay_ms", "30"},
+                                    {"ptt_rx_delay_ms", "40"},
+                                    {"relay_hang_ms", "10"}});
+    dev.setSampleRate(SOAPY_SDR_TX, 0, kRate);
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "0"}});
+    CHECK(dev.activateStream(st) == 0);
+
+    std::vector<std::complex<float>> buf(kRate / 10, std::complex<float>(1.0f, 0.0f));
+    const void *buffs[] = {buf.data()};
+    int flags = SOAPY_SDR_END_BURST;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(std::chrono::steady_clock::now() - t0 >= milliseconds(50));
+    CHECK(dev.readSensor("ptt") == "true" && dev.readSensor("ptt_line") == "true");
+
+    // End of the burst: PTT line first, relay ptt_rx_delay_ms later.
+    const auto lineOff = waitSensor(dev, "ptt_line", "false", 3000);
+    const auto relayOff = waitSensor(dev, "ptt", "false", 3000);
+    CHECK(lineOff != std::chrono::steady_clock::time_point::max() && relayOff != std::chrono::steady_clock::time_point::max());
+    CHECK(relayOff - lineOff >= milliseconds(35));
+    CHECK((MockPeek(GENERAL_BASE, kGpclr0) & kRelayBit) != 0);
+    CHECK(carrierOn(engine.Take()) == buf.size());
+
+    // Deactivating a keyed stream releases the PTT line and, after the delay, the relay.
+    flags = 0;
+    CHECK(dev.writeStream(st, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
+    CHECK(dev.deactivateStream(st) == 0);
+    CHECK(dev.readSensor("ptt") == "false" && dev.readSensor("ptt_line") == "false");
+    dev.closeStream(st);
+}
+
 // Samples stay muted for rx_mute_tail_ms after the unkeying.
 void testReceiverMuteTail() {
     SoapyRPITX dev(SoapySDR::Kwargs{{"rx", "rpitx_test_rx"}, {"relay_hang_ms", "0"}, {"rx_mute_tail_ms", "400"}});
@@ -1449,6 +1651,9 @@ int main() {
     testReceiverMute();
     testRelayProfile();
     testPttWriteSequence();
+    testPttLineSettings();
+    testPttLineSequencing();
+    testPttLineStream();
     testReceiverMuteTail();
     testReceiverMutePackedFormats();
     testCloseInterruptsWaits();

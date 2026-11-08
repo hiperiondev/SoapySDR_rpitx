@@ -58,7 +58,8 @@ const char *const kSettingKeys[] = {"ppm",
                                     "eer_idle",
                                     "eer_drive"};
 // Transmit/receive switching keys, accepted as device arguments, settings and profile lines.
-const char *const kPttKeys[] = {"relay_gpio", "relay_active_low", "relay_tx_delay_ms", "relay_hang_ms", "rx_mute_tx", "rx_mute_tail_ms"};
+const char *const kPttKeys[] = {"relay_gpio",     "relay_active_low", "relay_tx_delay_ms", "relay_hang_ms", "ptt_gpio",
+                                "ptt_active_low", "ptt_tx_delay_ms",  "ptt_rx_delay_ms",   "rx_mute_tx",    "rx_mute_tail_ms"};
 // Device arguments produced by enumeration and by SoapySDR itself; they are not settings.
 const char *const kIdentificationKeys[] = {"driver", "label", "product", "serial", "manufacturer", "tuner", "type"};
 
@@ -195,6 +196,24 @@ void parsePttSetting(const std::string &key, const std::string &value, PttPendin
         if (v < 0 || v > RPITX_RELAY_MAX_HANG_MS)
             throw std::runtime_error("rpitx: relay_hang_ms out of range [0, " + std::to_string(RPITX_RELAY_MAX_HANG_MS) + "]");
         p.relay.hangMs = (uint32_t) v;
+    } else if (key == "ptt_gpio") {
+        long v = parseInt(key, value);
+        if (v != -1 && (v < RPITX_RELAY_MIN_GPIO || v > RPITX_RELAY_MAX_GPIO))
+            throw std::runtime_error("rpitx: ptt_gpio must be -1 or a GPIO from " + std::to_string(RPITX_RELAY_MIN_GPIO) + " to " +
+                                     std::to_string(RPITX_RELAY_MAX_GPIO));
+        p.relay.pttGpio = (int) v;
+    } else if (key == "ptt_active_low") {
+        p.relay.pttActiveLow = parseBool(key, value);
+    } else if (key == "ptt_tx_delay_ms") {
+        long v = parseInt(key, value);
+        if (v < 0 || v > RPITX_PTT_MAX_DELAY_MS)
+            throw std::runtime_error("rpitx: ptt_tx_delay_ms out of range [0, " + std::to_string(RPITX_PTT_MAX_DELAY_MS) + "]");
+        p.relay.pttTxDelayMs = (uint32_t) v;
+    } else if (key == "ptt_rx_delay_ms") {
+        long v = parseInt(key, value);
+        if (v < 0 || v > RPITX_PTT_MAX_DELAY_MS)
+            throw std::runtime_error("rpitx: ptt_rx_delay_ms out of range [0, " + std::to_string(RPITX_PTT_MAX_DELAY_MS) + "]");
+        p.relay.pttRxDelayMs = (uint32_t) v;
     } else if (key == "rx_mute_tx") {
         p.muteTx = parseBool(key, value);
     } else if (key == "rx_mute_tail_ms") {
@@ -296,8 +315,9 @@ SoapySDR::Kwargs SoapyRPITX::getHardwareInfo(void) const {
     info["serial"] = serial;
     info["rf_output"] = RPITX_ANTENNA_NAME;
     info["origin"] = "https://github.com/hiperiondev/SoapySDR_rpitx";
-    const int relay = ptt->GetConfig().gpio;
-    info["relay_gpio"] = relay >= 0 ? "GPIO" + std::to_string(relay) : "none";
+    const SoapyRPITX_RelayConfig sw = ptt->GetConfig();
+    info["relay_gpio"] = sw.gpio >= 0 ? "GPIO" + std::to_string(sw.gpio) : "none";
+    info["ptt_gpio"] = sw.pttGpio >= 0 ? "GPIO" + std::to_string(sw.pttGpio) : "none";
 
     if (rxDev) {
         info["rx_driver"] = rxDriver;
@@ -448,9 +468,10 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
     setArgs.push_back(makeArg("relay_active_low", "false", "Relay active low",
                               "The relay is in the TX position with the pin low (most relay modules). Cannot change while a TX stream is open.",
                               SoapySDR::ArgInfo::BOOL));
-    SoapySDR::ArgInfo relayDelay =
-            makeArg("relay_tx_delay_ms", "20", "Relay TX delay",
-                    "Time given to the relay to settle in the TX position before the first sample of a transmission is queued.", SoapySDR::ArgInfo::INT, "ms");
+    SoapySDR::ArgInfo relayDelay = makeArg("relay_tx_delay_ms", "20", "Relay TX delay",
+                                           "Time given to the relay to settle in the TX position before the PTT line is asserted (before the first sample of a "
+                                           "transmission is queued when there is no PTT line).",
+                                           SoapySDR::ArgInfo::INT, "ms");
     relayDelay.range = SoapySDR::Range(0, RPITX_RELAY_MAX_DELAY_MS, 1);
     setArgs.push_back(relayDelay);
     SoapySDR::ArgInfo relayHang =
@@ -458,6 +479,23 @@ SoapySDR::ArgInfoList SoapyRPITX::getSettingInfo(void) const {
                     "Time the transmitter stays keyed (relay in TX, receiver muted) after the last sample was played.", SoapySDR::ArgInfo::INT, "ms");
     relayHang.range = SoapySDR::Range(0, RPITX_RELAY_MAX_HANG_MS, 1);
     setArgs.push_back(relayHang);
+    SoapySDR::ArgInfo pttPin = makeArg("ptt_gpio", "-1", "PTT GPIO",
+                                       "BCM GPIO driving the PTT line of an amplifier or radio, asserted relay_tx_delay_ms after the relay switched to "
+                                       "TX and released before the relay returns to RX (-1: no PTT line). Cannot change while a TX stream is open.",
+                                       SoapySDR::ArgInfo::INT);
+    pttPin.range = SoapySDR::Range(-1, RPITX_RELAY_MAX_GPIO, 1);
+    setArgs.push_back(pttPin);
+    setArgs.push_back(makeArg("ptt_active_low", "false", "PTT active low",
+                              "The PTT line is asserted with the pin low. Cannot change while a TX stream is open.", SoapySDR::ArgInfo::BOOL));
+    SoapySDR::ArgInfo pttTx = makeArg("ptt_tx_delay_ms", std::to_string(RPITX_PTT_DEFAULT_TX_DELAY_MS).c_str(), "PTT TX delay",
+                                      "Time from the PTT line asserted to the first sample of a transmission (ptt_gpio).", SoapySDR::ArgInfo::INT, "ms");
+    pttTx.range = SoapySDR::Range(0, RPITX_PTT_MAX_DELAY_MS, 1);
+    setArgs.push_back(pttTx);
+    SoapySDR::ArgInfo pttRx =
+            makeArg("ptt_rx_delay_ms", std::to_string(RPITX_PTT_DEFAULT_RX_DELAY_MS).c_str(), "PTT RX delay",
+                    "Time from the PTT line released to the relay returning to the RX position (ptt_gpio with relay_gpio).", SoapySDR::ArgInfo::INT, "ms");
+    pttRx.range = SoapySDR::Range(0, RPITX_PTT_MAX_DELAY_MS, 1);
+    setArgs.push_back(pttRx);
     setArgs.push_back(makeArg("rx_mute_tx", "true", "Mute RX while keyed", "Replace the receive samples with silence while the transmitter is keyed.",
                               SoapySDR::ArgInfo::BOOL));
     SoapySDR::ArgInfo muteTail = makeArg("rx_mute_tail_ms", std::to_string(RPITX_RX_MUTE_DEFAULT_TAIL_MS).c_str(), "RX mute tail",
@@ -585,7 +623,7 @@ void SoapyRPITX::LoadProfile(const std::string &path, const SoapySDR::Kwargs *ex
                 try {
                     ApplyPttLocked(previousRelay, previousMute, previousTail, false);
                 } catch (const std::exception &restore) {
-                    SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: could not restore the antenna relay settings: %s", restore.what());
+                    SoapySDR_logf(SOAPY_SDR_ERROR, "rpitx: could not restore the T/R switching settings: %s", restore.what());
                 }
             }
             throw;
@@ -745,6 +783,8 @@ void SoapyRPITX::ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx
     const SoapyRPITX_RelayConfig current = ptt->GetConfig();
     if (tx_stream && (relay.gpio != current.gpio || relay.activeLow != current.activeLow))
         throw std::runtime_error("rpitx: relay_gpio and relay_active_low cannot change while a TX stream is open");
+    if (tx_stream && (relay.pttGpio != current.pttGpio || relay.pttActiveLow != current.pttActiveLow))
+        throw std::runtime_error("rpitx: ptt_gpio and ptt_active_low cannot change while a TX stream is open");
     if (muteTailMs > RPITX_RX_MUTE_MAX_TAIL_MS)
         throw std::runtime_error("rpitx: rx_mute_tail_ms out of range [0, " + std::to_string(RPITX_RX_MUTE_MAX_TAIL_MS) + "]");
     if (dryRun)
@@ -813,6 +853,14 @@ std::string SoapyRPITX::readSetting(const std::string &key) const {
             return std::to_string(r.txDelayMs);
         if (key == "relay_hang_ms")
             return std::to_string(r.hangMs);
+        if (key == "ptt_gpio")
+            return std::to_string(r.pttGpio);
+        if (key == "ptt_active_low")
+            return r.pttActiveLow ? "true" : "false";
+        if (key == "ptt_tx_delay_ms")
+            return std::to_string(r.pttTxDelayMs);
+        if (key == "ptt_rx_delay_ms")
+            return std::to_string(r.pttRxDelayMs);
         if (key == "rx_mute_tail_ms")
             return std::to_string(rxMuteTailMs.load());
         return rxMuteTx.load() ? "true" : "false";

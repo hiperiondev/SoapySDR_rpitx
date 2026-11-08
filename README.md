@@ -59,6 +59,7 @@ being reprogrammed, but the clock tree is modified as soon as a stream is create
 | Direction | One TX channel; with `rx=<driver>` (an RTL-SDR) also one RX channel: a transceiver with full-duplex streaming and half-duplex antenna switching |
 | Receiver | Any SoapySDR receiver module (RTL-SDR in practice) opened by the driver; every RX call is forwarded to it; its samples are muted while the transmitter is keyed |
 | Antenna relay | `relay_gpio`: GPIO of a T/R relay, switched to TX before the first sample of a transmission (`relay_tx_delay_ms`) and back to RX after the last one (`relay_hang_ms`) |
+| PTT line | `ptt_gpio`: GPIO keying an amplifier or radio, asserted `relay_tx_delay_ms` after the relay switched to TX and `ptt_tx_delay_ms` before the first sample; released before the relay returns to RX (`ptt_rx_delay_ms`) |
 | Sample formats | `CF32` (native, full scale 1.0), `CS16` (full scale 32768), `CS8` (full scale 128) |
 | Sample rate | 10 kHz – 200 kHz (any value; listed 24 k / 48 k / 96 k / 192 k; default 48 kHz) |
 | Frequency | 50 kHz – 1500 MHz (BCM2711: 50 kHz – 1000 MHz) on the fundamental; `harmonic=n` multiplies the range |
@@ -458,6 +459,8 @@ driver=rpitx,rx=rtlsdr,relay_gpio=17
 driver=rpitx,rx=rtlsdr,rx.serial=00000002,rx.direct_samp=2,relay_gpio=17,relay_active_low=true,relay_hang_ms=300
 # TX only with an amplifier PTT / T-R relay on GPIO27
 driver=rpitx,relay_gpio=27
+# Relay on GPIO17, amplifier PTT on GPIO27: 30 ms for the relay, then PTT, 15 ms for the amplifier, then RF
+driver=rpitx,rx=rtlsdr,relay_gpio=17,relay_tx_delay_ms=30,ptt_gpio=27,ptt_tx_delay_ms=15,ptt_rx_delay_ms=20
 ```
 
 **Receiver.** `rx=<driver>` opens a SoapySDR receiver through its installed module (`rtlsdr` for an RTL-SDR;
@@ -489,6 +492,27 @@ registers, which the transmitter DMA never touches; its function is set while no
 `relay_gpio` and `relay_active_low` cannot change while a TX stream is open (the timings can). GPIO2–27 except
 GPIO4 are accepted, and a TX stream that would use the relay pin (`rf_dac` on GPIO20, `envelope_output=pcm` on
 GPIO18/19/21, `pwm` on `pwm_gpio`) is refused.
+
+**PTT line.** With `ptt_gpio=<n>` the driver also keys an external amplifier, transverter or radio, sequenced with
+the relay so that the relay never switches under power and the amplifier is keyed before it is driven:
+
+```
+key:    relay → TX ── relay_tx_delay_ms ──▶ PTT on ── ptt_tx_delay_ms ──▶ first sample (RF)
+unkey:  last sample ── relay_hang_ms ──▶ PTT off ── ptt_rx_delay_ms ──▶ relay → RX
+```
+
+The first `writeStream()` of a transmission waits for the whole keying sequence (`relay_tx_delay_ms` +
+`ptt_tx_delay_ms`; not counted in `timeoutUs`, ended at once by deactivating or closing the stream). A delay whose
+GPIO is not configured is skipped: without relay the PTT line is asserted at once and the samples follow
+`ptt_tx_delay_ms` later; without PTT line the samples follow `relay_tx_delay_ms` (the behaviour above). When the
+transmission ends, or the stream is deactivated or closed, the PTT line is released first and the relay returns to
+RX `ptt_rx_delay_ms` later (at once if the PTT line had not been asserted yet); `deactivateStream()` and
+`closeStream()` wait for that delay. A write that arrives while the relay is still waiting to return to RX asserts
+the PTT line again without moving the relay, so only `ptt_tx_delay_ms` is waited. The `ptt` sensor stays `true`
+(and the receiver muted) until the relay is back in RX; the `ptt_line` sensor shows the PTT GPIO itself.
+`ptt_active_low=true` is for PTT inputs that key on a low level (open-collector stage, most radios). The same rules
+as for the relay pin apply: GPIO2–27 except GPIO4, not the relay pin, not a pin used by the TX stream, and
+`ptt_gpio` / `ptt_active_low` cannot change while a TX stream is open (the delays can).
 
 > **Protect the receiver.** The RTL-SDR input survives only a few milliwatts. Connect it through the relay (or a T/R
 > switch) and keep `relay_tx_delay_ms` longer than the relay operate time; with two separate antennas make sure the
@@ -573,8 +597,12 @@ An application that writes faster than real time keeps the FIFO full: latency �
 | `profile` | empty | Profile file: its settings and `gain` are applied at once, its `stream.*` lines become the defaults of the next stream (see [Profile files](#profile-files)); empty forgets the stream defaults |
 | `relay_gpio` | -1 | GPIO of the antenna T/R relay (2 – 27, not 4), -1 = no relay; cannot change while a TX stream is open |
 | `relay_active_low` | false | The relay is in the TX position with the pin low; cannot change while a TX stream is open |
-| `relay_tx_delay_ms` | 20 | Relay settling time before the first sample of a transmission is queued, 0 – 1000 ms |
+| `relay_tx_delay_ms` | 20 | Relay settling time before the PTT line is asserted (before the first sample of a transmission is queued when there is no PTT line), 0 – 1000 ms |
 | `relay_hang_ms` | 100 | Time the transmitter stays keyed (relay in TX, receiver muted) after the last sample was played, 0 – 10000 ms |
+| `ptt_gpio` | -1 | GPIO of the PTT line of an amplifier or radio (2 – 27, not 4, not `relay_gpio`), -1 = no PTT line; cannot change while a TX stream is open |
+| `ptt_active_low` | false | The PTT line is asserted with the pin low; cannot change while a TX stream is open |
+| `ptt_tx_delay_ms` | 10 | Time from the PTT line asserted to the first sample of a transmission, 0 – 1000 ms |
+| `ptt_rx_delay_ms` | 10 | Time from the PTT line released to the relay returning to RX, 0 – 1000 ms |
 | `rx_mute_tx` | true | Replace the receive samples with silence while the transmitter is keyed |
 | `rx_mute_tail_ms` | 50 | Time the receive samples stay muted after the unkeying (receiver buffering latency), 0 – 10000 ms |
 | `rx.<key>` | — | A setting of the receiver (only with `rx=<driver>`), for example `rx.direct_samp` |
@@ -607,7 +635,8 @@ gain=7
 - `stream.<key>` lines become the defaults of `setupStream()`; the arguments passed by the application take
   precedence.
 - `gain` sets the PAD gain (0–7).
-- The relay keys (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`), `rx_mute_tx` and
+- The relay and PTT keys (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`, `ptt_gpio`,
+  `ptt_active_low`, `ptt_tx_delay_ms`, `ptt_rx_delay_ms`), `rx_mute_tx` and
   `rx_mute_tail_ms` are
   accepted too; `rx` and `rx.*` are device arguments and are not read from a profile.
 - Blank lines and lines starting with `#` are ignored, unknown keys are reported with a warning and ignored, a line
@@ -635,7 +664,8 @@ gain=7
 | `sample_rate` | float Hz | I/Q sample rate actually produced by the pacing clock dividers |
 | `envelope_clip` | int | Slots whose envelope (\|I/Q\| × `iq_scale`, or the EER code) exceeded full scale |
 | `envelope_late` | int | Envelope words that could not be written ahead of their sample (ring nearly empty) |
-| `ptt` | bool | The transmitter is keyed: relay in the TX position and, with `rx_mute_tx`, receiver muted (always available) |
+| `ptt` | bool | The transmitter is keyed: from the start of the keying sequence until the relay is back in RX; with `rx_mute_tx` the receiver is muted (always available) |
+| `ptt_line` | bool | The PTT GPIO (`ptt_gpio`) is asserted; always `false` without PTT line (always available) |
 | `ptt_count` | int | Times the transmitter has been keyed since the device was opened (always available) |
 
 The channel sensors of the receiver are available on the RX channel (`listSensors(SOAPY_SDR_RX, 0)`).
@@ -819,7 +849,7 @@ hpsdr_rpitx_bridge.py --dry-run --rx rtlsdr         # receive only (no transmitt
 | Status (EP6) | PTT/dot/dash, IO inputs inactive, firmware, forward power (`--fwd-counts`), supply voltage, ADC overload (receiver clipping, with `--rx`), HL2 temperature, TX FIFO level and acknowledges |
 | Receive I/Q | With `--rx`: the receiver capture (an integer multiple of the host rate it accepts, e.g. 240 kS/s for 48 kHz on an RTL-SDR) down-converted and decimated to 48/96/192/384 kHz for every host receiver (up to 12) on its own frequency; receivers outside the capture send zeros; EP6 is paced by the receiver clock. Without `--rx`: synthetic noise or zeros paced by the system clock. Silent microphone in both cases |
 | Receiver control | Follows the host RX frequencies (plus `--rx-freq-offset`, default `--freq-offset`); the capture centre is RX1 plus an offset that keeps the RTL-SDR DC spur out of the band (`--rx-offset`) and is retuned only when RX1 leaves 90 % of the capture; gain `--rx-gain` (dB or `auto`) or, with `--follow-rx-gain`, from the host attenuator / HL2 LNA gain; `--rx-antenna`, `--rx-ppm`, `--rx-rate`, `--rx-args`, `--rx-stream-args` |
-| T/R switching | Done by the driver: `--relay-gpio`, `--relay-active-low`, `--relay-tx-delay-ms`, `--relay-hang-ms`; the receiver is muted while transmitting unless `--rx-during-tx` |
+| T/R switching | Done by the driver: `--relay-gpio`, `--relay-active-low`, `--relay-tx-delay-ms`, `--relay-hang-ms`; PTT output to an amplifier or radio with `--ptt-out-gpio`, `--ptt-out-active-low`, `--ptt-tx-delay-ms`, `--ptt-rx-delay-ms` (`--ptt-gpio` is the PTT *input*); the receiver is muted while transmitting unless `--rx-during-tx` |
 | Transmit | Host TX I/Q while MOX is set, on the TX NCO (or RX1 when duplex is off) |
 | CW | Iambic A/B or straight keyer on GPIO paddles with host timing, HL2 CWX, GPIO PTT input |
 | Watchdog | Streaming stops and TX is released after `--host-timeout` s without host packets |
@@ -1103,19 +1133,25 @@ prints every millisecond (and that `Stop()` and the destructor flush).
 
 ### Transmit/receive switching
 
-`SoapyRPITX_Ptt` holds the keyed state shared by the TX stream and the RX path. `writeStream()` registers every
-write with it: the first write after an idle period keys the transmitter and, with a relay, drives the relay pin to
-the TX position and sleeps `relay_tx_delay_ms` before the samples are pushed into the FIFO — the DMA only ever sees
-data that arrived after the relay settled. A supervisor thread of the TX stream polls every millisecond whether the
+`SoapyRPITX_Ptt` holds the keyed state shared by the TX stream and the RX path and sequences the relay and PTT
+pins. `writeStream()` registers every write with it: the first write after an idle period keys the transmitter,
+drives the relay pin to the TX position and schedules the PTT line `relay_tx_delay_ms` later and the first sample
+`ptt_tx_delay_ms` after the PTT line. The write sleeps in slices of at most 2 ms, asking the sequencer each time,
+until the samples may be pushed into the FIFO — the DMA only ever sees data that arrived after the relay settled and
+the PTT delay elapsed. The PTT delay is counted from the moment the line was actually asserted, by the writer or by
+the supervisor, whichever comes first. A supervisor thread of the TX stream polls every millisecond whether the
 transmitter is drained (the feeder publishes the push count up to which everything has been played, the same value
 `WaitDrained()` uses) and unkeys once it has been drained, with no write in progress, for `relay_hang_ms`. Every
 write advances a sequence number that the supervisor reads *before* it evaluates the drain state; when a write began
-in between, the transmitter stays keyed. So samples are never played with the relay in the RX position, even with
-`relay_hang_ms=0`. The receive path stays muted for `rx_mute_tail_ms` after the unkeying.
-Deactivating, closing or destroying the stream stops the transmitter first (carrier off) and unkeys afterwards.
-Because the DMA rewrites the whole GPFSEL0/GPFSEL2 words with the values sampled at `Start()`, the relay pin is made
-an output before any TX stream exists and its function is never changed while one is open; its level goes through
-GPSET0/GPCLR0, which the DMA does not write.
+in between, the transmitter stays keyed. So samples are never played with the relay in the RX position or the PTT
+line released, even with `relay_hang_ms=0`. Unkeying releases the PTT line and the supervisor returns the relay to
+RX once `ptt_rx_delay_ms` has elapsed; the transmitter counts as keyed until then. The receive path stays muted for
+`rx_mute_tail_ms` after the relay is back in RX.
+Deactivating, closing or destroying the stream stops the transmitter first (carrier off) and unkeys afterwards,
+waiting `ptt_rx_delay_ms` between the PTT line and the relay.
+Because the DMA rewrites the whole GPFSEL0/GPFSEL2 words with the values sampled at `Start()`, the relay and PTT pins
+are made outputs before any TX stream exists and their functions are never changed while one is open; their levels
+go through GPSET0/GPCLR0, which the DMA does not write.
 
 The receiver is opened with the factory function its module registered (not through `SoapySDR::Device::make()`,
 which is already creating the rpitx device), owned by the rpitx device and closed with it. `readStream()` runs
@@ -1222,6 +1258,11 @@ hardware failure becomes a `std::runtime_error` that the application receives fr
 | "cannot open the receiver 'rtlsdr'" | Dongle missing, in use by another program (rtl_tcp, dump1090…) or the DVB kernel driver is loaded (blacklist `dvb_usb_rtl28xxu`); check `rx.serial` |
 | "GPIOn is the antenna relay (relay_gpio)" | The TX stream uses that pin (`rf_dac`, `envelope_output`); move the relay to another GPIO |
 | "relay_gpio and relay_active_low cannot change while a TX stream is open" | Close the TX stream, change the setting, open it again |
+| "GPIOn is the PTT line (ptt_gpio)" | The TX stream uses that pin (`rf_dac`, `envelope_output`); move the PTT line to another GPIO |
+| "ptt_gpio and ptt_active_low cannot change while a TX stream is open" | Close the TX stream, change the setting, open it again |
+| "relay_gpio and ptt_gpio cannot be the same GPIO" | The relay and the PTT line need two different GPIOs |
+| Amplifier keyed while the relay still moves, or RF before the amplifier is ready | Raise `relay_tx_delay_ms` (relay operate time) or `ptt_tx_delay_ms` (amplifier keying time) |
+| Relay clicks while the amplifier still outputs power at the end of a transmission | Raise `ptt_rx_delay_ms` |
 | Receiver silent while transmitting | Expected with `rx_mute_tx=true` (bridge: `--rx-during-tx` to keep it); it stays muted `rx_mute_tail_ms` after the unkeying |
 | End of the transmission heard in the receiver | The receiver buffers more than `rx_mute_tail_ms`: raise it (or `relay_hang_ms`) |
 
@@ -1242,7 +1283,7 @@ PCM / PWM pacing FIFO with its DREQ level, recording per frame the registers in 
 | `rpitx_unit_tests` | FIFO ordering under concurrency and capacity limit; ring accounting against a simulated engine (steady state, short stalls, lost laps, double stall, host starvation, stopped engine without lap credit); DSP frequency estimation, gating and phase continuity through zero; amplitude model, tables, sigma-delta averages, envelope delay and envelope/phase alignment, EER code mapping |
 | `rpitx_devicetree_tests` | Peripheral base, legacy DMA channel limit and kernel DMA mask with old and current device-tree naming |
 | `rpitx_transmitter_tests` | Feeder, pre-roll, drain, retune with the carrier off and ring replay, emergency stop then destruction, DMA restart, pad hysteresis, FIFO capacity vs rate, constructor failures (unreachable frequency, refused allocation, short ring), DMA channel selection (and no guess without the kernel mask), session lock and crash recovery (pins, PWM, unreadable kernel mask, record end marker, incomplete record), private lock directory, symbolic link and implausible records, early allocation record, device-tree nodes without `status`, signal handlers, paced DMA start, envelope delay, sigma-delta, AM/PM correction, RF-DAC, slots per sample, PCM and PWM envelope output with envelope/phase alignment, burst end before a short burst, replay of data slots only (retune before the DMA start and after an idle gap), drain during a concurrent retune, release recorded before the VideoCore memory is freed, stop while a producer is blocked (no sample reaches the next activation, drain still detected), back-to-back bursts without false underflows, PWM channel off until the DMA starts (also after a retune of a stopped transmitter), EMMC moved to PLLD at the same rate only when it is on PLLC, PLLC client scan, PLL feasibility without hardware |
-| `rpitx_driver_tests` | SoapySDR device: settings and ranges, strict number parsing, amplitude settings, frequency correction, stream arguments (including the envelope output), CF32/CS16/CS8 scaling, `END_BURST` drain, `closeStream()` during a drain, `activateStream()` on an active stream, stream status, sensors, profile files and `profile=`, profile file checks (devices, pipes, size, permissions, symbolic links), out-of-range integers and gains, timeout limits; transceiver mode with a simulated receiver registered by the test (opening, forwarding of the RX API and settings, simultaneous RX/TX streams, handle checks, enumeration entries, muting while keyed in signed and unsigned formats); antenna relay on the simulated GPIO registers (validation, polarity, pin release, conflicts with TX streams, keying delay, hang time, unkeying on deactivate/close, GPFSEL0 pins under the DMA, relay keys in profiles); unkeying only after a drain observed after the last write began, mute tail, muting of every RX format (packed ones included), `closeStream()` ending a relay-delay wait and a blocked RX read at once (sliced receiver timeouts), each status event reported once to concurrent pollers, profiles of the `sudo` user (run as root; skipped otherwise) |
+| `rpitx_driver_tests` | SoapySDR device: settings and ranges, strict number parsing, amplitude settings, frequency correction, stream arguments (including the envelope output), CF32/CS16/CS8 scaling, `END_BURST` drain, `closeStream()` during a drain, `activateStream()` on an active stream, stream status, sensors, profile files and `profile=`, profile file checks (devices, pipes, size, permissions, symbolic links), out-of-range integers and gains, timeout limits; transceiver mode with a simulated receiver registered by the test (opening, forwarding of the RX API and settings, simultaneous RX/TX streams, handle checks, enumeration entries, muting while keyed in signed and unsigned formats); antenna relay on the simulated GPIO registers (validation, polarity, pin release, conflicts with TX streams, keying delay, hang time, unkeying on deactivate/close, GPFSEL0 pins under the DMA, relay keys in profiles); PTT line (validation, polarity, pin release, conflicts with the relay and TX streams, keying sequence relay → delay → PTT → delay → samples, unkeying sequence PTT → delay → relay, re-keying during the release delay, PTT without relay, `ptt_line` sensor, the sequence through `writeStream()`); unkeying only after a drain observed after the last write began, mute tail, muting of every RX format (packed ones included), `closeStream()` ending a relay-delay wait and a blocked RX read at once (sliced receiver timeouts), each status event reported once to concurrent pollers, profiles of the `sudo` user (run as root; skipped otherwise) |
 
 CI (`.github/workflows/ci.yml`) runs the tests with `-Werror` in a plain build, with AddressSanitizer +
 UndefinedBehaviorSanitizer and with ThreadSanitizer (`tests/tsan.supp` suppresses only the simulated-register
@@ -1265,7 +1306,7 @@ src/
   SoapyRPITX_Settings.cpp        identification, settings, antenna, gain, frequency, sample rate (TX, and RX forwarding)
   SoapyRPITX_Streaming.cpp       stream setup, format conversion, write / read / status / burst handling
   SoapyRPITX_Receiver.cpp        receiver opening and RX stream forwarding (transceiver mode)
-  SoapyRPITX_Ptt.*               keyed state and antenna relay GPIO
+  SoapyRPITX_Ptt.*               keyed state, antenna relay and PTT line GPIOs
   SoapySDR_Sensors.cpp           sensors
   SoapyRPITX_IQ_dmaSync.*        transmitter: DMA ring, feeder thread, modulation, retune, shutdown
   SoapyRPITX_Buffers.hpp         SpscFifo and DmaRingTracker (hardware independent)

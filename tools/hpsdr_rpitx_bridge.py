@@ -15,7 +15,8 @@
 # (for example --rx rtlsdr) the driver opens the receiver as its RX channel and the bridge works as a transceiver:
 # the receiver follows the host RX frequencies, its samples are down-converted and decimated to the host receive
 # sample rate and sent as the receiver I/Q of EP6; with --relay-gpio the driver switches an antenna T/R relay and
-# mutes the receiver while transmitting.
+# mutes the receiver while transmitting, and with --ptt-out-gpio it keys an amplifier or radio PTT line after the
+# relay has settled (--relay-tx-delay-ms), before the first TX sample (--ptt-tx-delay-ms).
 #
 # Protocol coverage:
 #   - discovery over UDP (broadcast and directed) and over TCP, with the board specific reply layout;
@@ -436,7 +437,7 @@ class Radio:
     """Opens the SoapySDR device shared by the transmitter and the receiver.
 
     Normally the rpitx driver is opened, with the receiver of --rx attached as its RX channel ("rx=<driver>",
-    "rx.<key>=<value>" for --rx-args) and the antenna relay settings. With --dry-run nothing is transmitted: only
+    "rx.<key>=<value>" for --rx-args), the antenna relay and the PTT output settings. With --dry-run nothing is transmitted: only
     the receiver of --rx, if any, is opened on its own. `sdr` is None when no device is needed.
     """
 
@@ -464,6 +465,13 @@ class Radio:
                 dev_args["relay_active_low"] = "true" if args.relay_active_low else "false"
                 dev_args["relay_tx_delay_ms"] = str(args.relay_tx_delay_ms)
                 dev_args["relay_hang_ms"] = str(args.relay_hang_ms)
+            if args.ptt_out_gpio is not None:
+                dev_args["ptt_gpio"] = str(args.ptt_out_gpio)
+                dev_args["ptt_active_low"] = "true" if args.ptt_out_active_low else "false"
+                dev_args["ptt_tx_delay_ms"] = str(args.ptt_tx_delay_ms)
+                dev_args["ptt_rx_delay_ms"] = str(args.ptt_rx_delay_ms)
+                if args.relay_gpio is None:
+                    dev_args["relay_hang_ms"] = str(args.relay_hang_ms)
             if args.rx:
                 dev_args["rx_mute_tx"] = "false" if args.rx_during_tx else "true"
                 dev_args["rx"] = args.rx
@@ -1376,6 +1384,8 @@ class Bridge:
         used = [p for p in (args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio) if p is not None]
         if args.relay_gpio is not None and args.relay_gpio in used:
             raise SystemExit("GPIO%d cannot be both the antenna relay and a key or PTT input" % args.relay_gpio)
+        if args.ptt_out_gpio is not None and args.ptt_out_gpio in used:
+            raise SystemExit("GPIO%d cannot be both the PTT output and a key or PTT input" % args.ptt_out_gpio)
         inputs = KeyInputs(args.gpio_chip, args.key_dot_gpio, args.key_dash_gpio, args.ptt_gpio)
         try:
             self._open(args, inputs)
@@ -2102,15 +2112,34 @@ def main():
     relay.add_argument("--relay-gpio", type=int, default=None,
                        help="GPIO of the antenna relay: TX position while the transmitter is keyed")
     relay.add_argument("--relay-active-low", action="store_true", help="the relay is in the TX position with the pin low")
-    relay.add_argument("--relay-tx-delay-ms", type=int, default=20, help="relay settling time before the first TX sample")
+    relay.add_argument("--relay-tx-delay-ms", type=int, default=20,
+                       help="relay settling time before the PTT output is asserted (before the first TX sample without "
+                            "--ptt-out-gpio)")
     relay.add_argument("--relay-hang-ms", type=int, default=100,
                        help="time the relay stays in TX (and the receiver muted) after the last TX sample")
+    relay.add_argument("--ptt-out-gpio", type=int, default=None,
+                       help="GPIO of the PTT output (amplifier or radio), asserted --relay-tx-delay-ms after the relay switched "
+                            "to TX and released before the relay returns to RX")
+    relay.add_argument("--ptt-out-active-low", action="store_true", help="the PTT output is asserted with the pin low")
+    relay.add_argument("--ptt-tx-delay-ms", type=int, default=10,
+                       help="time from the PTT output asserted to the first TX sample")
+    relay.add_argument("--ptt-rx-delay-ms", type=int, default=10,
+                       help="time from the PTT output released to the relay returning to RX")
     args = p.parse_args()
 
     if args.relay_gpio is not None and args.relay_gpio == 4:
         p.error("--relay-gpio cannot be GPIO4, the rpitx RF output")
     if args.relay_gpio is not None and args.dry_run:
         print("warning: --relay-gpio has no effect with --dry-run (the driver is not opened)", file=sys.stderr)
+    if args.ptt_out_gpio is not None and args.ptt_out_gpio == 4:
+        p.error("--ptt-out-gpio cannot be GPIO4, the rpitx RF output")
+    if args.ptt_out_gpio is not None and args.ptt_out_gpio == args.relay_gpio:
+        p.error("--ptt-out-gpio and --relay-gpio cannot be the same GPIO")
+    for name in ("ptt_tx_delay_ms", "ptt_rx_delay_ms"):
+        if not 0 <= getattr(args, name) <= 1000:
+            p.error("--%s must be between 0 and 1000" % name.replace("_", "-"))
+    if args.ptt_out_gpio is not None and args.dry_run:
+        print("warning: --ptt-out-gpio has no effect with --dry-run (the driver is not opened)", file=sys.stderr)
 
     if not bind_is_loopback(args.bind):
         print("warning: listening on %s: Protocol 1 has no authentication, any host allowed by --allow (%s) that can reach "

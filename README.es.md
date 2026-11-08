@@ -62,6 +62,7 @@ PLL, pero el árbol de relojes se modifica en cuanto se crea un stream.
 | Dirección | Un canal TX; con `rx=<driver>` (un RTL-SDR) también un canal RX: un transceptor con streams simultáneos (full duplex) y conmutación de antena semidúplex |
 | Receptor | Cualquier módulo receptor de SoapySDR (en la práctica un RTL-SDR) abierto por el driver; toda llamada RX se le reenvía; sus muestras se silencian mientras el transmisor está activado |
 | Relé de antena | `relay_gpio`: GPIO de un relé T/R, conmutado a TX antes de la primera muestra de una transmisión (`relay_tx_delay_ms`) y de vuelta a RX tras la última (`relay_hang_ms`) |
+| Línea PTT | `ptt_gpio`: GPIO que activa un amplificador o una radio, afirmado `relay_tx_delay_ms` después de que el relé pasó a TX y `ptt_tx_delay_ms` antes de la primera muestra; se libera antes de que el relé vuelva a RX (`ptt_rx_delay_ms`) |
 | Formatos de muestra | `CF32` (nativo, fondo de escala 1.0), `CS16` (fondo de escala 32768), `CS8` (fondo de escala 128) |
 | Frecuencia de muestreo | 10 kHz – 200 kHz (cualquier valor; listadas 24 k / 48 k / 96 k / 192 k; por defecto 48 kHz) |
 | Frecuencia | 50 kHz – 1500 MHz (BCM2711: 50 kHz – 1000 MHz) en la fundamental; `harmonic=n` multiplica el rango |
@@ -468,6 +469,8 @@ driver=rpitx,rx=rtlsdr,relay_gpio=17
 driver=rpitx,rx=rtlsdr,rx.serial=00000002,rx.direct_samp=2,relay_gpio=17,relay_active_low=true,relay_hang_ms=300
 # Solo TX con el PTT de un amplificador / relé T-R en GPIO27
 driver=rpitx,relay_gpio=27
+# Relé en GPIO17, PTT del amplificador en GPIO27: 30 ms para el relé, luego PTT, 15 ms para el amplificador, luego RF
+driver=rpitx,rx=rtlsdr,relay_gpio=17,relay_tx_delay_ms=30,ptt_gpio=27,ptt_tx_delay_ms=15,ptt_rx_delay_ms=20
 ```
 
 **Receptor.** `rx=<driver>` abre un receptor SoapySDR mediante su módulo instalado (`rtlsdr` para un RTL-SDR;
@@ -500,6 +503,28 @@ registros GPSET/GPCLR, que el DMA del transmisor nunca toca; su función se fija
 lo que `relay_gpio` y `relay_active_low` no pueden cambiar con un stream TX abierto (los tiempos sí). Se aceptan
 GPIO2–27 salvo GPIO4, y un stream TX que usaría el pin del relé (`rf_dac` en GPIO20, `envelope_output=pcm` en
 GPIO18/19/21, `pwm` en `pwm_gpio`) se rechaza.
+
+**Línea PTT.** Con `ptt_gpio=<n>` el driver también activa un amplificador, transversor o radio externo, en
+secuencia con el relé, de modo que el relé nunca conmuta con potencia y el amplificador se activa antes de recibir
+excitación:
+
+```
+activar:     relé → TX ── relay_tx_delay_ms ──▶ PTT on ── ptt_tx_delay_ms ──▶ primera muestra (RF)
+desactivar:  última muestra ── relay_hang_ms ──▶ PTT off ── ptt_rx_delay_ms ──▶ relé → RX
+```
+
+El primer `writeStream()` de una transmisión espera la secuencia de activación completa (`relay_tx_delay_ms` +
+`ptt_tx_delay_ms`; no se cuenta en `timeoutUs` y termina de inmediato al desactivar o cerrar el stream). Una demora
+cuyo GPIO no está configurado se omite: sin relé la línea PTT se afirma de inmediato y las muestras siguen
+`ptt_tx_delay_ms` después; sin línea PTT las muestras siguen a `relay_tx_delay_ms` (el comportamiento de arriba).
+Cuando la transmisión termina, o el stream se desactiva o se cierra, primero se libera la línea PTT y el relé vuelve
+a RX `ptt_rx_delay_ms` después (de inmediato si la línea PTT todavía no se había afirmado); `deactivateStream()` y
+`closeStream()` esperan esa demora. Una escritura que llega mientras el relé todavía espera para volver a RX afirma
+de nuevo la línea PTT sin mover el relé, así que solo se espera `ptt_tx_delay_ms`. El sensor `ptt` sigue en `true`
+(y el receptor silenciado) hasta que el relé está de vuelta en RX; el sensor `ptt_line` muestra el propio GPIO de PTT.
+`ptt_active_low=true` es para entradas de PTT que activan con nivel bajo (etapa a colector abierto, la mayoría de
+las radios). Valen las mismas reglas que para el pin del relé: GPIO2–27 salvo GPIO4, distinto del pin del relé, no
+usado por el stream TX, y `ptt_gpio` / `ptt_active_low` no pueden cambiar con un stream TX abierto (las demoras sí).
 
 > **Proteja el receptor.** La entrada del RTL-SDR soporta solo unos pocos milivatios. Conéctelo a través del relé (o
 > de un conmutador T/R) y mantenga `relay_tx_delay_ms` mayor que el tiempo de operación del relé; con dos antenas
@@ -586,8 +611,12 @@ posiciones a 48 kHz). Una aplicación que escribe más rápido que el tiempo rea
 | `profile` | vacío | Archivo de perfil: sus ajustes y `gain` se aplican de inmediato, sus líneas `stream.*` pasan a ser los valores por defecto del próximo stream (véase [Archivos de perfil](#archivos-de-perfil)); vacío olvida esos valores del stream |
 | `relay_gpio` | -1 | GPIO del relé de antena T/R (2 – 27, no 4), -1 = sin relé; no puede cambiar con un stream TX abierto |
 | `relay_active_low` | false | El relé está en posición TX con el pin en bajo; no puede cambiar con un stream TX abierto |
-| `relay_tx_delay_ms` | 20 | Tiempo de asentamiento del relé antes de encolar la primera muestra de una transmisión, 0 – 1000 ms |
+| `relay_tx_delay_ms` | 20 | Tiempo de asentamiento del relé antes de afirmar la línea PTT (antes de encolar la primera muestra de una transmisión cuando no hay línea PTT), 0 – 1000 ms |
 | `relay_hang_ms` | 100 | Tiempo que el transmisor sigue activado (relé en TX, receptor silenciado) tras reproducirse la última muestra, 0 – 10000 ms |
+| `ptt_gpio` | -1 | GPIO de la línea PTT de un amplificador o radio (2 – 27, no 4, no `relay_gpio`), -1 = sin línea PTT; no puede cambiar con un stream TX abierto |
+| `ptt_active_low` | false | La línea PTT se afirma con el pin en bajo; no puede cambiar con un stream TX abierto |
+| `ptt_tx_delay_ms` | 10 | Tiempo desde que se afirma la línea PTT hasta la primera muestra de una transmisión, 0 – 1000 ms |
+| `ptt_rx_delay_ms` | 10 | Tiempo desde que se libera la línea PTT hasta que el relé vuelve a RX, 0 – 1000 ms |
 | `rx_mute_tx` | true | Reemplazar las muestras recibidas por silencio mientras el transmisor está activado |
 | `rx_mute_tail_ms` | 50 | Tiempo que las muestras recibidas siguen silenciadas tras la desactivación (latencia de los búferes del receptor), 0 – 10000 ms |
 | `rx.<clave>` | — | Un ajuste del receptor (solo con `rx=<driver>`), por ejemplo `rx.direct_samp` |
@@ -621,8 +650,9 @@ gain=7
 - Las líneas `stream.<clave>` pasan a ser los valores por defecto de `setupStream()`; los argumentos que pasa la
   aplicación tienen prioridad.
 - `gain` fija la ganancia PAD (0–7).
-- También se aceptan las claves del relé (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`, `relay_hang_ms`),
-  `rx_mute_tx` y `rx_mute_tail_ms`; `rx` y `rx.*` son argumentos de dispositivo y no se leen de un perfil.
+- También se aceptan las claves del relé y del PTT (`relay_gpio`, `relay_active_low`, `relay_tx_delay_ms`,
+  `relay_hang_ms`, `ptt_gpio`, `ptt_active_low`, `ptt_tx_delay_ms`, `ptt_rx_delay_ms`), `rx_mute_tx` y
+  `rx_mute_tail_ms`; `rx` y `rx.*` son argumentos de dispositivo y no se leen de un perfil.
 - Las líneas vacías y las que empiezan con `#` se ignoran, las claves desconocidas se informan con una advertencia y se
   ignoran, una línea sin `=` es un error, y una línea posterior reemplaza a una anterior con la misma clave.
 - `readSetting("profile")` devuelve el último archivo cargado; `writeSetting("profile", "")` olvida sus valores por
@@ -650,7 +680,8 @@ gain=7
 | `sample_rate` | float Hz | Frecuencia de muestreo I/Q producida realmente por los divisores del reloj de cadencia |
 | `envelope_clip` | int | Posiciones cuya envolvente (\|I/Q\| × `iq_scale`, o el código EER) superó el fondo de escala |
 | `envelope_late` | int | Palabras de envolvente que no pudieron escribirse por adelantado (anillo casi vacío) |
-| `ptt` | bool | El transmisor está activado: relé en posición TX y, con `rx_mute_tx`, receptor silenciado (siempre disponible) |
+| `ptt` | bool | El transmisor está activado: desde el inicio de la secuencia de activación hasta que el relé vuelve a RX; con `rx_mute_tx` el receptor está silenciado (siempre disponible) |
+| `ptt_line` | bool | El GPIO de PTT (`ptt_gpio`) está afirmado; siempre `false` sin línea PTT (siempre disponible) |
 | `ptt_count` | int | Veces que se activó el transmisor desde que se abrió el dispositivo (siempre disponible) |
 
 Los sensores de canal del receptor están disponibles en el canal RX (`listSensors(SOAPY_SDR_RX, 0)`).
@@ -839,7 +870,7 @@ hpsdr_rpitx_bridge.py --dry-run --rx rtlsdr         # solo recepción (sin trans
 | Estado (EP6) | PTT/punto/raya, entradas IO inactivas, firmware, potencia directa (`--fwd-counts`), tensión de alimentación, sobrecarga del ADC (recorte del receptor, con `--rx`), temperatura HL2, nivel de la FIFO TX y confirmaciones |
 | I/Q de recepción | Con `--rx`: la captura del receptor (un múltiplo entero de la frecuencia del host que acepte, p. ej. 240 kS/s para 48 kHz en un RTL-SDR) convertida a banda base y diezmada a 48/96/192/384 kHz para cada receptor del host (hasta 12) en su propia frecuencia; los receptores fuera de la captura envían ceros; EP6 va cadenciado por el reloj del receptor. Sin `--rx`: ruido sintético o ceros cadenciados por el reloj del sistema. Micrófono en silencio en ambos casos |
 | Control del receptor | Sigue las frecuencias RX del host (más `--rx-freq-offset`, por defecto `--freq-offset`); el centro de la captura es RX1 más un desplazamiento que deja la espuria de DC del RTL-SDR fuera de la banda (`--rx-offset`) y se resintoniza solo cuando RX1 sale del 90 % de la captura; ganancia `--rx-gain` (dB o `auto`) o, con `--follow-rx-gain`, desde el atenuador del host / ganancia LNA de HL2; `--rx-antenna`, `--rx-ppm`, `--rx-rate`, `--rx-args`, `--rx-stream-args` |
-| Conmutación T/R | La hace el driver: `--relay-gpio`, `--relay-active-low`, `--relay-tx-delay-ms`, `--relay-hang-ms`; el receptor se silencia mientras se transmite salvo con `--rx-during-tx` |
+| Conmutación T/R | La hace el driver: `--relay-gpio`, `--relay-active-low`, `--relay-tx-delay-ms`, `--relay-hang-ms`; salida PTT a un amplificador o radio con `--ptt-out-gpio`, `--ptt-out-active-low`, `--ptt-tx-delay-ms`, `--ptt-rx-delay-ms` (`--ptt-gpio` es la *entrada* de PTT); el receptor se silencia mientras se transmite salvo con `--rx-during-tx` |
 | Transmisión | I/Q TX del host mientras MOX está activo, en el NCO de TX (o RX1 cuando el dúplex está desactivado) |
 | CW | Manipulador iámbico A/B o recto con paletas en GPIO y temporización del host, CWX de HL2, entrada PTT por GPIO |
 | Watchdog | El streaming se detiene y se libera el TX tras `--host-timeout` s sin paquetes del host |
@@ -1128,19 +1159,24 @@ sin bloqueos que el stream TX imprime cada milisegundo (y que `Stop()` y el dest
 
 ### Conmutación transmisión/recepción
 
-`SoapyRPITX_Ptt` guarda el estado de transmisión que comparten el stream TX y el camino RX. `writeStream()` registra
-cada escritura en él: la primera escritura tras un período inactivo activa el transmisor y, con relé, lleva el pin
-del relé a la posición TX y espera `relay_tx_delay_ms` antes de empujar las muestras a la FIFO — el DMA solo ve datos
-que llegaron después de que el relé se asentó. Un hilo supervisor del stream TX consulta cada milisegundo si el
+`SoapyRPITX_Ptt` guarda el estado de transmisión que comparten el stream TX y el camino RX y secuencia los pines del
+relé y del PTT. `writeStream()` registra cada escritura en él: la primera escritura tras un período inactivo activa
+el transmisor, lleva el pin del relé a la posición TX y programa la línea PTT `relay_tx_delay_ms` después y la
+primera muestra `ptt_tx_delay_ms` después de la línea PTT. La escritura duerme en tramos de 2 ms como máximo,
+consultando al secuenciador cada vez, hasta que las muestras pueden empujarse a la FIFO — el DMA solo ve datos que
+llegaron después de que el relé se asentó y transcurrió la demora del PTT. La demora del PTT se cuenta desde el
+momento en que la línea se afirmó realmente, por la escritura o por el supervisor, lo que ocurra primero. Un hilo supervisor del stream TX consulta cada milisegundo si el
 transmisor se vació (el alimentador publica el contador de inserciones hasta el que todo se reprodujo, el mismo valor
 que usa `WaitDrained()`) y lo desactiva cuando lleva `relay_hang_ms` vacío y sin escrituras en curso. Cada escritura
 avanza un número de secuencia que el supervisor lee *antes* de evaluar el estado de vaciado; si una escritura empezó
-entre medio, el transmisor sigue activado. Así nunca se reproducen muestras con el relé en posición RX, ni siquiera
-con `relay_hang_ms=0`. El camino de recepción sigue silenciado `rx_mute_tail_ms` tras la desactivación. Desactivar,
-cerrar o destruir el stream detiene primero el transmisor (portadora apagada) y desactiva después. Como el DMA
-reescribe palabras GPFSEL0/GPFSEL2 completas con los valores tomados en `Start()`, el pin del relé se configura como
-salida antes de que exista un stream TX y su función nunca cambia con uno abierto; su nivel pasa por GPSET0/GPCLR0,
-que el DMA no escribe.
+entre medio, el transmisor sigue activado. Así nunca se reproducen muestras con el relé en posición RX ni con la
+línea PTT liberada, ni siquiera con `relay_hang_ms=0`. La desactivación libera la línea PTT y el supervisor devuelve
+el relé a RX cuando transcurre `ptt_rx_delay_ms`; hasta entonces el transmisor cuenta como activado. El camino de
+recepción sigue silenciado `rx_mute_tail_ms` después de que el relé vuelve a RX. Desactivar, cerrar o destruir el
+stream detiene primero el transmisor (portadora apagada) y desactiva después, esperando `ptt_rx_delay_ms` entre la
+línea PTT y el relé. Como el DMA reescribe palabras GPFSEL0/GPFSEL2 completas con los valores tomados en `Start()`,
+los pines del relé y del PTT se configuran como salidas antes de que exista un stream TX y sus funciones nunca
+cambian con uno abierto; sus niveles pasan por GPSET0/GPCLR0, que el DMA no escribe.
 
 El receptor se abre con la función de fábrica que registró su módulo (no mediante `SoapySDR::Device::make()`, que
 ya está creando el dispositivo rpitx); pertenece al dispositivo rpitx y se cierra con él. `readStream()` corre sin el
@@ -1250,6 +1286,11 @@ de hardware se convierte en un `std::runtime_error` que la aplicación recibe de
 | "cannot open the receiver 'rtlsdr'" | Falta el dongle, lo usa otro programa (rtl_tcp, dump1090…) o está cargado el driver DVB del kernel (ponga en la lista negra `dvb_usb_rtl28xxu`); revise `rx.serial` |
 | "GPIOn is the antenna relay (relay_gpio)" | El stream TX usa ese pin (`rf_dac`, `envelope_output`); mueva el relé a otro GPIO |
 | "relay_gpio and relay_active_low cannot change while a TX stream is open" | Cierre el stream TX, cambie el ajuste y vuelva a abrirlo |
+| "GPIOn is the PTT line (ptt_gpio)" | El stream TX usa ese pin (`rf_dac`, `envelope_output`); mueva la línea PTT a otro GPIO |
+| "ptt_gpio and ptt_active_low cannot change while a TX stream is open" | Cierre el stream TX, cambie el ajuste y vuelva a abrirlo |
+| "relay_gpio and ptt_gpio cannot be the same GPIO" | El relé y la línea PTT necesitan dos GPIO distintos |
+| El amplificador se activa mientras el relé todavía se mueve, o hay RF antes de que el amplificador esté listo | Aumente `relay_tx_delay_ms` (tiempo de operación del relé) o `ptt_tx_delay_ms` (tiempo de activación del amplificador) |
+| El relé conmuta mientras el amplificador todavía entrega potencia al final de una transmisión | Aumente `ptt_rx_delay_ms` |
 | Receptor mudo mientras se transmite | Es lo esperado con `rx_mute_tx=true` (puente: `--rx-during-tx` para mantenerlo); sigue silenciado `rx_mute_tail_ms` tras la desactivación |
 | El final de la transmisión se oye en el receptor | El receptor acumula más que `rx_mute_tail_ms`: auméntelo (o `relay_hang_ms`) |
 
@@ -1271,7 +1312,7 @@ que sale de la FIFO).
 | `rpitx_unit_tests` | Orden de la FIFO con concurrencia y límite de capacidad; contabilidad del anillo contra un motor simulado (régimen estable, demoras cortas, vueltas perdidas, doble demora, falta de datos del host, motor detenido sin vueltas atribuidas); estimación de frecuencia del DSP, umbral y continuidad de fase a través de cero; modelo de amplitud, tablas, medias del sigma-delta, retardo de la envolvente y alineación envolvente/fase, correspondencia del código EER |
 | `rpitx_devicetree_tests` | Base de periféricos, límite de canales DMA clásicos y máscara DMA del kernel con la nomenclatura antigua y la actual del device tree |
 | `rpitx_transmitter_tests` | Alimentador, pre-roll, vaciado, retune con la portadora apagada y repetición del anillo, parada de emergencia y luego destrucción, reinicio del DMA, histéresis de los pads, capacidad de la FIFO según la frecuencia, fallos del constructor (frecuencia inalcanzable, reserva rechazada, anillo corto), selección de canal DMA (y sin adivinar sin la máscara del kernel), bloqueo de sesión y recuperación tras caídas (pines, PWM, máscara del kernel ilegible, marca final del registro, registro incompleto), directorio de bloqueo privado, enlace simbólico y registros inverosímiles, registro temprano de la reserva, nodos del device tree sin `status`, manejadores de señales, arranque cadenciado del DMA, retardo de la envolvente, sigma-delta, corrección AM/PM, RF-DAC, posiciones por muestra, salida de envolvente PCM y PWM con alineación envolvente/fase, fin de ráfaga antes de una ráfaga corta, repetición solo de las posiciones de datos (retune antes del arranque del DMA y tras un hueco inactivo), vaciado durante un retune concurrente, liberación registrada antes de liberar la memoria VideoCore, parada con un productor bloqueado (ninguna muestra llega a la activación siguiente, el vaciado se sigue detectando), ráfagas consecutivas sin falsos vaciados, canal PWM apagado hasta que arranca el DMA (también tras un retune con el transmisor detenido), EMMC pasado a PLLD a la misma frecuencia solo cuando está en PLLC, exploración de los clientes de PLLC, viabilidad del PLL sin hardware |
-| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores, archivos de perfil y `profile=`, comprobaciones de los archivos de perfil (dispositivos, tuberías, tamaño, permisos, enlaces simbólicos), enteros y ganancias fuera de rango, límites de los tiempos de espera; modo transceptor con un receptor simulado registrado por la prueba (apertura, reenvío de la API y los ajustes RX, streams RX/TX simultáneos, verificación de handles, entradas de enumeración, silenciado durante la transmisión en formatos con y sin signo); relé de antena sobre los registros GPIO simulados (validación, polaridad, liberación del pin, conflictos con streams TX, demora de activación, tiempo de retención, desactivación al desactivar/cerrar, pines de GPFSEL0 bajo el DMA, claves del relé en perfiles); desactivación solo tras un vaciado observado después de que empezó la última escritura, cola de silencio, silencio en todos los formatos RX (incluidos los empaquetados), `closeStream()` que termina de inmediato una espera del relé y una lectura RX bloqueada (tiempos de espera del receptor por tramos), cada evento de estado informado una sola vez a consultas concurrentes, perfiles del usuario de `sudo` (ejecutando como root; si no, se omite) |
+| `rpitx_driver_tests` | Dispositivo SoapySDR: ajustes y rangos, análisis estricto de números, ajustes de amplitud, corrección de frecuencia, argumentos del stream (incluida la salida de envolvente), escalado CF32/CS16/CS8, vaciado con `END_BURST`, `closeStream()` durante un vaciado, `activateStream()` sobre un stream activo, estado del stream, sensores, archivos de perfil y `profile=`, comprobaciones de los archivos de perfil (dispositivos, tuberías, tamaño, permisos, enlaces simbólicos), enteros y ganancias fuera de rango, límites de los tiempos de espera; modo transceptor con un receptor simulado registrado por la prueba (apertura, reenvío de la API y los ajustes RX, streams RX/TX simultáneos, verificación de handles, entradas de enumeración, silenciado durante la transmisión en formatos con y sin signo); relé de antena sobre los registros GPIO simulados (validación, polaridad, liberación del pin, conflictos con streams TX, demora de activación, tiempo de retención, desactivación al desactivar/cerrar, pines de GPFSEL0 bajo el DMA, claves del relé en perfiles); línea PTT (validación, polaridad, liberación del pin, conflictos con el relé y con streams TX, secuencia de activación relé → demora → PTT → demora → muestras, secuencia de desactivación PTT → demora → relé, reactivación durante la demora de liberación, PTT sin relé, sensor `ptt_line`, la secuencia a través de `writeStream()`); desactivación solo tras un vaciado observado después de que empezó la última escritura, cola de silencio, silencio en todos los formatos RX (incluidos los empaquetados), `closeStream()` que termina de inmediato una espera del relé y una lectura RX bloqueada (tiempos de espera del receptor por tramos), cada evento de estado informado una sola vez a consultas concurrentes, perfiles del usuario de `sudo` (ejecutando como root; si no, se omite) |
 
 La CI (`.github/workflows/ci.yml`) ejecuta las pruebas con `-Werror` en una compilación normal, con AddressSanitizer +
 UndefinedBehaviorSanitizer y con ThreadSanitizer (`tests/tsan.supp` suprime solo los accesos a registros simulados),
@@ -1294,7 +1335,7 @@ src/
   SoapyRPITX_Settings.cpp        identificación, ajustes, antena, ganancia, frecuencia, frecuencia de muestreo (TX, y reenvío RX)
   SoapyRPITX_Streaming.cpp       configuración del stream, conversión de formatos, escritura / lectura / estado / ráfagas
   SoapyRPITX_Receiver.cpp        apertura del receptor y reenvío del stream RX (modo transceptor)
-  SoapyRPITX_Ptt.*               estado de transmisión y GPIO del relé de antena
+  SoapyRPITX_Ptt.*               estado de transmisión y GPIO del relé de antena y de la línea PTT
   SoapySDR_Sensors.cpp           sensores
   SoapyRPITX_IQ_dmaSync.*        transmisor: anillo DMA, hilo alimentador, modulación, retune, cierre
   SoapyRPITX_Buffers.hpp         SpscFifo y DmaRingTracker (independientes del hardware)

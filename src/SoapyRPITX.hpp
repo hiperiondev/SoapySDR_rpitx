@@ -114,7 +114,7 @@ public:
      * @brief Creates the stream, the transmitter hardware object and the keying supervisor thread.
      * @param format Host sample format.
      * @param cfg    Transmitter configuration.
-     * @param ptt    Keyed state and antenna relay of the device, shared with the receive path.
+     * @param ptt    Keyed state, antenna relay and PTT line of the device, shared with the receive path.
      * @throws std::runtime_error when the hardware cannot be initialised.
      */
     tx_streamer(rpitxStreamFormat format, const SoapyRPITX_TxConfig &cfg, std::shared_ptr<SoapyRPITX_Ptt> ptt);
@@ -129,9 +129,10 @@ public:
      * @brief Queues samples for transmission.
      *
      * Blocks while the FIFO is full, up to @p timeoutUs. Partial writes are reported through the return value.
-     * The first write after an idle period keys the transmitter; with an antenna relay it first waits for the
-     * relay delay (relay_tx_delay_ms), which is not counted in @p timeoutUs and ends at once when the stream is
-     * deactivated or closed (the call then returns SOAPY_SDR_STREAM_ERROR).
+     * The first write after an idle period keys the transmitter and waits for the T/R sequence: the relay delay
+     * (relay_tx_delay_ms) with an antenna relay, then the PTT delay (ptt_tx_delay_ms) with a PTT line. The wait is
+     * not counted in @p timeoutUs and ends at once when the stream is deactivated or closed (the call then returns
+     * SOAPY_SDR_STREAM_ERROR).
      *
      * @param buffs     One buffer (channel 0) in the stream format.
      * @param numElems  Number of complex samples in the buffer.
@@ -139,7 +140,7 @@ public:
      * @param timeNs    Ignored.
      * @param timeoutUs Maximum blocking time in microseconds.
      * @return Number of samples accepted, SOAPY_SDR_TIMEOUT when none could be queued in time,
-     *         SOAPY_SDR_STREAM_ERROR when the stream is not active (or stopped during the relay delay), or
+     *         SOAPY_SDR_STREAM_ERROR when the stream is not active (or stopped during the T/R sequence), or
      *         SOAPY_SDR_NOT_SUPPORTED for timed writes.
      */
     int send(const void *const *buffs, size_t numElems, int &flags, long long timeNs, long timeoutUs);
@@ -197,8 +198,9 @@ public:
 
 private:
     /**
-     * @brief Supervisor thread: unkeys the transmitter once it has been drained for the relay hang time, and prints
-     *        the messages queued by the feeder thread.
+     * @brief Supervisor thread: asserts the PTT line on time, unkeys the transmitter once it has been drained for the
+     *        relay hang time, returns the relay to RX after the PTT release delay, and prints the messages queued by
+     *        the feeder thread.
      */
     void Supervise();
 
@@ -221,7 +223,7 @@ private:
  * iq_scale, debug_level, the amplitude calibration keys (amplitude_lut, ampm_lut, amplitude_quantizer,
  * sigma_delta_order, envelope_delay, envelope_floor, rfdac_lut, eer_lut, eer_ampm_lut, eer_gain, eer_offset,
  * eer_idle, eer_drive) and the transmit/receive switching keys (relay_gpio, relay_active_low, relay_tx_delay_ms,
- * relay_hang_ms, rx_mute_tx, rx_mute_tail_ms). Other device arguments are reported with a warning, except the identification keys
+ * relay_hang_ms, ptt_gpio, ptt_active_low, ptt_tx_delay_ms, ptt_rx_delay_ms, rx_mute_tx, rx_mute_tail_ms). Other device arguments are reported with a warning, except the identification keys
  * produced by enumeration or by SoapySDR (driver, label, product, serial, manufacturer, tuner, type), keys
  * containing ':', and the receiver keys below.
  * Stream arguments: see getStreamArgsInfo().
@@ -235,29 +237,31 @@ private:
  * it was unkeyed, the receive samples are replaced by silence (rx_mute_tx). Enumeration lists the TX-only device first and, when the "rx" argument is not
  * given, one transceiver entry for every RTL-SDR found.
  *
- * Antenna relay: relay_gpio selects a GPIO that switches an external T/R relay: it is driven to the TX position
- * before the first sample of a transmission (which waits relay_tx_delay_ms), and back to the RX position once the
- * transmission has been played and relay_hang_ms has elapsed, when the stream is deactivated or closed, and when
- * the device is closed.
+ * Antenna relay and PTT line: relay_gpio selects a GPIO that switches an external T/R relay and ptt_gpio a GPIO
+ * that keys an external amplifier or radio. The first write of a transmission drives the relay to the TX position,
+ * waits relay_tx_delay_ms, asserts the PTT line, waits ptt_tx_delay_ms and only then queues its samples (a delay
+ * whose GPIO is not configured is skipped). Once the transmission has been played and relay_hang_ms has elapsed,
+ * when the stream is deactivated or closed, and when the device is closed, the PTT line is released first and the
+ * relay returns to the RX position ptt_rx_delay_ms later.
  */
 class SoapyRPITX : public SoapySDR::Device {
 public:
     /**
      * @brief Opens the device.
      *
-     * The antenna relay, when configured, is driven to the RX position first. With the argument "profile=<file>"
+     * The antenna relay and the PTT line, when configured, are driven to their RX state first. With the argument "profile=<file>"
      * the profile is loaded next (see LoadProfile()); setting keys given as device arguments are then applied with
      * writeSetting() and take precedence over the same keys of the profile. The receiver selected by "rx" is
      * opened last.
      *
      * @param args Device arguments; known setting keys are applied with writeSetting().
      * @throws std::runtime_error when the board is not supported, /dev/mem is not accessible, the profile cannot
-     *         be read or holds an invalid value, a relay setting is invalid, or the receiver cannot be opened
+     *         be read or holds an invalid value, a relay or PTT setting is invalid, or the receiver cannot be opened
      *         (driver not installed, "rpitx" itself, no RX channel, or refused by its module).
      */
     SoapyRPITX(const SoapySDR::Kwargs &args);
 
-    /** @brief Stops and closes the streams, if any, closes the receiver, returns the relay to RX and releases the hardware. */
+    /** @brief Stops and closes the streams, if any, closes the receiver, releases the PTT line, returns the relay to RX and releases the hardware. */
     ~SoapyRPITX();
 
     /*******************************************************************
@@ -278,7 +282,7 @@ public:
 
     /**
      * @brief Returns hardware information.
-     * @return Driver version, board model, serial, origin, antenna relay GPIO; with a receiver also rx_driver,
+     * @return Driver version, board model, serial, origin, antenna relay and PTT GPIOs; with a receiver also rx_driver,
      *         rx_hardware and its own hardware information with the "rx." prefix.
      */
     SoapySDR::Kwargs getHardwareInfo(void) const;
@@ -365,7 +369,7 @@ public:
      * @param args      Stream arguments (see getStreamArgsInfo()).
      * @return Stream handle.
      * @throws std::runtime_error for RX without a receiver, an unsupported format or channel, invalid arguments, a
-     *         stream already open in that direction, a TX stream argument that needs the antenna relay GPIO, or a
+     *         stream already open in that direction, a TX stream argument that needs the antenna relay or PTT GPIO, or a
      *         hardware or receiver initialisation failure.
      */
     SoapySDR::Stream *setupStream(const int direction, const std::string &format, const std::vector<size_t> &channels = std::vector<size_t>(),
@@ -375,8 +379,8 @@ public:
      * @brief Stops and destroys a stream.
      *
      * TX: the carrier is turned off immediately (queued samples are discarded), also while another thread waits in
-     * deactivateStream() for the end of a burst, and the relay returns to RX. A writeStream() or readStreamStatus()
-     * running in another thread is woken up and returns (SOAPY_SDR_STREAM_ERROR / partial count) before the stream
+     * deactivateStream() for the end of a burst, the PTT line is released and the relay returns to RX after
+     * ptt_rx_delay_ms. A writeStream() or readStreamStatus() running in another thread is woken up and returns (SOAPY_SDR_STREAM_ERROR / partial count) before the stream
      * is destroyed; closeStream() waits for it.
      * RX: the receiver stream is deactivated and closed after the readStream() / readStreamStatus() calls in
      * flight have returned.
@@ -404,7 +408,7 @@ public:
     int activateStream(SoapySDR::Stream *stream, const int flags = 0, const long long timeNs = 0, const size_t numElems = 0);
 
     /**
-     * @brief Stops transmission, turns the carrier off and returns the relay to RX, or stops the receiver stream.
+     * @brief Stops transmission, turns the carrier off, releases the PTT line and returns the relay to RX, or stops the receiver stream.
      * @param stream Stream handle.
      * @param flags  TX: ignored. RX: passed to the receiver.
      * @param timeNs TX: ignored. RX: passed to the receiver.
@@ -464,7 +468,7 @@ public:
 
     /**
      * @brief Lists the global sensors: pll_locked, dma_running, fifo_fill, underflows, late, dma_errors,
-     *        sample_rate, envelope_clip, envelope_late, ptt, ptt_count.
+     *        sample_rate, envelope_clip, envelope_late, ptt, ptt_line, ptt_count.
      * @return Sensor keys.
      */
     std::vector<std::string> listSensors(void) const;
@@ -480,8 +484,8 @@ public:
     /**
      * @brief Reads a global sensor.
      * @param key Sensor key.
-     * @return Value as a string (the transmitter sensors read "false"/"0" while no TX stream exists; ptt and
-     *         ptt_count are always available).
+     * @return Value as a string (the transmitter sensors read "false"/"0" while no TX stream exists; ptt,
+     *         ptt_line and ptt_count are always available).
      * @throws std::runtime_error for an unknown key.
      */
     std::string readSensor(const std::string &key) const;
@@ -533,8 +537,11 @@ public:
      * - rfdac_lut: amplitude with GPIO4 only, GPIO20 only and both (rf_dac stream argument).
      * - eer_lut, eer_ampm_lut, eer_gain, eer_offset, eer_idle, eer_drive: envelope DAC calibration (envelope_output).
      * - relay_gpio: GPIO of the antenna relay (-1: none); relay_active_low: TX position with the pin low;
-     *   relay_tx_delay_ms: relay settling time before the first sample; relay_hang_ms: time the transmitter
-     *   stays keyed after the last sample.
+     *   relay_tx_delay_ms: relay settling time before the PTT line (before the first sample without PTT line);
+     *   relay_hang_ms: time the transmitter stays keyed after the last sample.
+     * - ptt_gpio: GPIO of the PTT line (-1: none); ptt_active_low: asserted with the pin low; ptt_tx_delay_ms: time
+     *   from the PTT line asserted to the first sample; ptt_rx_delay_ms: time from the PTT line released to the
+     *   relay returning to RX.
      * - rx_mute_tx: mute the receive samples while the transmitter is keyed; rx_mute_tail_ms: time they stay muted
      *   after the unkeying (receiver buffering latency).
      * - rx.<key>: the settings of the receiver, when one is attached.
@@ -553,7 +560,7 @@ public:
      * @param key   Setting key.
      * @param value New value.
      * @throws std::runtime_error for an unknown key, an invalid value, a frequency that cannot be produced, a
-     *         relay_gpio / relay_active_low change while a TX stream is open, a profile that cannot be read or
+     *         relay_gpio / relay_active_low / ptt_gpio / ptt_active_low change while a TX stream is open, a profile that cannot be read or
      *         holds an invalid value, or a receiver setting refused by the receiver.
      */
     void writeSetting(const std::string &key, const std::string &value);
@@ -1120,19 +1127,19 @@ private:
 
     /**
      * @brief Checks and applies the transmit/receive switching settings (device_mutex held).
-     * @param relay  Antenna relay configuration.
+     * @param relay      Antenna relay and PTT line configuration.
      * @param muteTx     Mute the receive samples while the transmitter is keyed.
      * @param muteTailMs Time the receive samples stay muted after the unkeying, in milliseconds.
      * @param dryRun     Only check, change nothing.
-     * @throws std::runtime_error when the relay configuration is invalid, its pin or polarity changes while a TX
-     *         stream is open, or the GPIO block cannot be mapped.
+     * @throws std::runtime_error when the configuration is invalid, a pin or polarity changes while a TX stream is
+     *         open, or the GPIO block cannot be mapped.
      */
     void ApplyPttLocked(const SoapyRPITX_RelayConfig &relay, bool muteTx, uint32_t muteTailMs, bool dryRun);
 
     /**
-     * @brief Checks that the TX stream configuration leaves the antenna relay GPIO free.
+     * @brief Checks that the TX stream configuration leaves the antenna relay and PTT GPIOs free.
      * @param cfg Transmitter configuration of the stream being created.
-     * @throws std::runtime_error when the stream would use the relay GPIO.
+     * @throws std::runtime_error when the stream would use the relay or PTT GPIO.
      */
     void CheckRelayPin(const SoapyRPITX_TxConfig &cfg) const;
 
@@ -1230,7 +1237,7 @@ private:
     uintptr_t streamGeneration = 0;                ///< Last token issued; never reused, so a stale handle cannot match a new stream (device_mutex).
     std::atomic<int> streamCalls{0};               ///< writeStream() / readStreamStatus() calls in flight; closing the stream waits for zero.
 
-    std::shared_ptr<SoapyRPITX_Ptt> ptt;                               ///< Keyed state and antenna relay, shared with the TX stream.
+    std::shared_ptr<SoapyRPITX_Ptt> ptt;                               ///< Keyed state, antenna relay and PTT line, shared with the TX stream.
     std::atomic<bool> rxMuteTx{true};                                  ///< Mute the receive samples while the transmitter is keyed.
     std::atomic<uint32_t> rxMuteTailMs{RPITX_RX_MUTE_DEFAULT_TAIL_MS}; ///< Time the receive samples stay muted after the unkeying, in milliseconds.
 

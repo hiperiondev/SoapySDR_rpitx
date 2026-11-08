@@ -31,7 +31,8 @@
 // ******************** Sensor API ********************
 
 std::vector<std::string> SoapyRPITX::listSensors(void) const {
-    return {"pll_locked", "dma_running", "fifo_fill", "underflows", "late", "dma_errors", "sample_rate", "envelope_clip", "envelope_late", "ptt", "ptt_count"};
+    return {"pll_locked",  "dma_running",   "fifo_fill",     "underflows", "late",     "dma_errors",
+            "sample_rate", "envelope_clip", "envelope_late", "ptt",        "ptt_line", "ptt_count"};
 }
 
 SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
@@ -87,7 +88,13 @@ SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
         info.value = "0";
     } else if (key == "ptt") {
         info.name = "PTT";
-        info.description = "True while the transmitter is keyed: antenna relay in the TX position and, with rx_mute_tx, receiver muted.";
+        info.description = "True while the transmitter is keyed: from the start of the T/R sequence until the antenna relay is back in the RX "
+                           "position; with rx_mute_tx the receiver is muted meanwhile.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+        info.value = "false";
+    } else if (key == "ptt_line") {
+        info.name = "PTT line";
+        info.description = "True while the PTT GPIO (ptt_gpio) is asserted; always false without PTT line.";
         info.type = SoapySDR::ArgInfo::BOOL;
         info.value = "false";
     } else if (key == "ptt_count") {
@@ -110,6 +117,8 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
 
     if (key == "ptt")
         return ptt->IsKeyed() ? "true" : "false";
+    if (key == "ptt_line")
+        return ptt->IsPttAsserted() ? "true" : "false";
     if (key == "ptt_count")
         return std::to_string(ptt->KeyCount());
 
