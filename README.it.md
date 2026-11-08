@@ -200,7 +200,7 @@ evita anch'esso il taglio.
 | Hardware esclusivo | Un canale DMA, il blocco PCM/I2S (o PWM con `envelope_output=pwm`), memoria VideoCore (140 byte per slot dell'anello), GPIO 0–9 bloccati durante la trasmissione, un trasmettitore per sistema |
 | Albero dei clock | Finché uno stream è aperto, il clock della VPU funziona da PLLA, che il firmware deve lasciare attivo; mantenere `gpu_freq=250`. Mini-UART, I2C, SPI e host SD funzionano a una velocità diversa da quella che il kernel presume |
 | Privilegi | Root: `/dev/mem` e `/dev/vcio` |
-| Solo trasmissione | Nessun percorso di ricezione e nessuna scrittura temporizzata (`SOAPY_SDR_HAS_TIME`) |
+| Nessuna scrittura temporizzata | `SOAPY_SDR_HAS_TIME` non è supportato; il percorso di ricezione è il ricevitore collegato con `rx=<driver>` |
 
 ---
 
@@ -494,7 +494,10 @@ da silenzio (zeri, metà scala per i formati senza segno, compresi i formati com
 e marche temporali restano), così un'applicazione può tenere attivi entrambi gli stream come con qualsiasi
 ricetrasmettitore. Il ricevitore consegna i campioni un po' dopo averli catturati (buffer USB), quindi il silenzio dura
 ancora `rx_mute_tail_ms` (50 ms predefiniti) dopo l'uscita dalla trasmissione; aumentarlo se la fine di una
-trasmissione filtra ancora nel segnale ricevuto.
+trasmissione filtra ancora nel segnale ricevuto. Il silenzio agisce sui campioni man mano che vengono consegnati, quindi
+`rx_mute_tail_ms` deve essere almeno il buffer del ricevitore (un trasferimento USB: su un RTL-SDR `bufflen` / 2
+campioni, ≈ 546 ms con il `bufflen` predefinito di 262144 byte a 240 kS/s, ≈ 34 ms con `bufflen=16384`). Il sensore
+`rx_muted` indica all'applicazione quali campioni sono stati sostituiti.
 
 **Relè d'antenna.** Con `relay_gpio=<n>` il driver comanda quel GPIO come uscita: posizione RX all'apertura,
 posizione TX in trasmissione, di nuovo RX all'uscita dalla trasmissione e alla chiusura del dispositivo (il pin resta
@@ -589,7 +592,10 @@ ritardi sì).
 
 Latenza da `writeStream()` all'antenna ≈ riempimento della FIFO + ¾ dell'anello (≈ 64 ms con un anello di 4096
 posizioni a 48 kHz). Un'applicazione che scrive più veloce del tempo reale mantiene la FIFO piena: latenza ≈
-`fifo_ms` + ¾ dell'anello.
+`fifo_ms` + ¾ dell'anello. Un'applicazione che scrive al ritmo del segnale mantiene il pre-roll nella FIFO; il sensore
+`tx_latency` riporta quella latenza per lo stream aperto, compresi i valori predefiniti del profilo,
+`slots_per_sample` e la sequenza di attivazione (il primo campione attende il maggiore tra il pre-roll e
+`relay_tx_delay_ms` + `ptt_tx_delay_ms`).
 
 ### Impostazioni (accettate anche come argomenti del dispositivo)
 
@@ -688,6 +694,8 @@ gain=7
 | `ptt` | bool | Il trasmettitore è in trasmissione: dall'inizio della sequenza di attivazione finché il relè non è di nuovo su RX; con `rx_mute_tx` il ricevitore è silenziato (sempre disponibile) |
 | `ptt_line` | bool | Il GPIO del PTT (`ptt_gpio`) è attivo; sempre `false` senza linea PTT (sempre disponibile) |
 | `ptt_count` | int | Volte in cui il trasmettitore è andato in trasmissione dall'apertura del dispositivo (sempre disponibile) |
+| `rx_muted` | bool | I campioni ricevuti vengono sostituiti dal silenzio (`rx_mute_tx`, in trasmissione o entro `rx_mute_tail_ms` dall'uscita dalla trasmissione); sempre `false` senza ricevitore (sempre disponibile) |
+| `tx_latency` | float ms | Latenza dello stream TX aperto per scritture al ritmo del segnale: il maggiore tra `preroll_ms` e la sequenza di attivazione, più ¾ dell'anello DMA; `0` senza stream TX |
 
 I sensori di canale del ricevitore sono disponibili sul canale RX (`listSensors(SOAPY_SDR_RX, 0)`).
 

@@ -401,11 +401,15 @@ void testStatusAndSensors() {
     }
     CHECK(haveErrors && haveRate);
     CHECK(dev.readSensor("dma_running") == "false");
+    CHECK(dev.readSensor("tx_latency") == "0");
+    CHECK(dev.readSensor("rx_muted") == "false");
     CHECK(throws([&] { dev.readSensor("nope"); }));
 
     MockDmaEngine engine(14, kRate);
     SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}});
     CHECK(std::stod(dev.readSensor("sample_rate")) > kRate * 0.999);
+    // Default pre-roll (100 ms) plus three quarters of the default 4096-slot ring at 48 kHz (64 ms).
+    CHECK(std::fabs(std::stod(dev.readSensor("tx_latency")) - 164.0) < 0.01);
     CHECK(dev.activateStream(st) == 0);
 
     size_t mask = 0;
@@ -1466,6 +1470,7 @@ void testReceiverMutePackedFormats() {
     int flags = 0;
     CHECK(dev.writeStream(tx, buffs, buf.size(), flags, 0, 1000000) == (int) buf.size());
     CHECK(dev.readSensor("ptt") == "true");
+    CHECK(dev.readSensor("rx_muted") == "true");
 
     for (const Case &c : cases) {
         const size_t elem = SoapySDR::formatToSize(c.format);
@@ -1628,6 +1633,19 @@ void testProfileSudoUser() {
     rmdir(dir.c_str());
 }
 
+// The latency sensor follows the keying sequence when it is longer than the pre-roll, and the slots per sample.
+void testLatencySensor() {
+    SoapyRPITX dev(SoapySDR::Kwargs{{"relay_gpio", "17"}, {"relay_tx_delay_ms", "150"}, {"ptt_gpio", "27"}, {"ptt_tx_delay_ms", "30"}});
+    MockDmaEngine engine(14, kRate);
+    SoapySDR::Stream *st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "50"}});
+    CHECK(std::fabs(std::stod(dev.readSensor("tx_latency")) - (180.0 + 64.0)) < 0.01);
+    dev.closeStream(st);
+
+    st = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {}, {{"rt_priority", "0"}, {"preroll_ms", "200"}, {"slots_per_sample", "4"}, {"ring_size", "16384"}});
+    CHECK(std::fabs(std::stod(dev.readSensor("tx_latency")) - (200.0 + 64.0)) < 0.01);
+    dev.closeStream(st);
+}
+
 int main() {
     testSettings();
     testStreamArguments();
@@ -1659,6 +1677,7 @@ int main() {
     testCloseInterruptsWaits();
     testStatusReportedOnce();
     testProfileSudoUser();
+    testLatencySensor();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

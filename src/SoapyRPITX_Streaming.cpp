@@ -380,7 +380,7 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
     std::lock_guard<std::mutex> lock(device_mutex);
 
     if (IsValidRxStreamHandle(handle)) {
-        SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: start RX");
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: start RX");
         return rxDev->activateStream(rxStream, flags, timeNs, numElems);
     }
     if (!IsValidTxStreamHandle(handle))
@@ -388,7 +388,7 @@ int SoapyRPITX::activateStream(SoapySDR::Stream *handle, const int flags, const 
     if (flags & SOAPY_SDR_HAS_TIME)
         return SOAPY_SDR_NOT_SUPPORTED;
 
-    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: start TX");
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: start TX");
     return tx_stream->activate();
 }
 
@@ -398,7 +398,7 @@ int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int flags, cons
     {
         std::lock_guard<std::mutex> lock(device_mutex);
         if (IsValidRxStreamHandle(handle)) {
-            SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: stop RX");
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: stop RX");
             return rxDev->deactivateStream(rxStream, flags, timeNs);
         }
         if (!IsValidTxStreamHandle(handle))
@@ -414,7 +414,7 @@ int SoapyRPITX::deactivateStream(SoapySDR::Stream *handle, const int flags, cons
     std::lock_guard<std::mutex> lock(device_mutex);
     if (tx_stream != stream)
         return 0; // closed meanwhile: closing stopped the transmitter
-    SoapySDR_logf(SOAPY_SDR_INFO, "rpitx: stop TX");
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "rpitx: stop TX");
     return stream->deactivate();
 }
 

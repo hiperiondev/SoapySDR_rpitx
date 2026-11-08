@@ -484,6 +484,12 @@ public:
     uint32_t SlotsPerSample() const;
 
     /**
+     * @brief Returns the pre-roll of the stream.
+     * @return Signal queued before the DMA starts, in milliseconds.
+     */
+    uint32_t PrerollMs() const;
+
+    /**
      * @brief Returns the IQ sample rate produced by the pacing clock (any thread).
      * @return Rate in Hz (differs from the nominal rate by the divider quantisation), published by the last
      *         successful frequency configuration.

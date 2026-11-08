@@ -1126,6 +1126,10 @@ uint32_t SoapyRPITX_IQ_dmaSync::SlotsPerSample() const {
     return slotsPerSample;
 }
 
+uint32_t SoapyRPITX_IQ_dmaSync::PrerollMs() const {
+    return prerollMs;
+}
+
 double SoapyRPITX_IQ_dmaSync::GetActualSampleRate() const {
     return actualSampleRate.load();
 }

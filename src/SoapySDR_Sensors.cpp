@@ -23,6 +23,7 @@
 // the Free Software Foundation, Inc., 51 Franklin Street,
 // Boston, MA 02110-1301, USA.
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 
@@ -31,8 +32,8 @@
 // ******************** Sensor API ********************
 
 std::vector<std::string> SoapyRPITX::listSensors(void) const {
-    return {"pll_locked",  "dma_running",   "fifo_fill",     "underflows", "late",     "dma_errors",
-            "sample_rate", "envelope_clip", "envelope_late", "ptt",        "ptt_line", "ptt_count"};
+    return {"pll_locked",    "dma_running",   "fifo_fill", "underflows", "late",      "dma_errors", "sample_rate",
+            "envelope_clip", "envelope_late", "ptt",       "ptt_line",   "ptt_count", "rx_muted",   "tx_latency"};
 }
 
 SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
@@ -102,6 +103,20 @@ SoapySDR::ArgInfo SoapyRPITX::getSensorInfo(const std::string &key) const {
         info.description = "Times the transmitter has been keyed since the device was opened.";
         info.type = SoapySDR::ArgInfo::INT;
         info.value = "0";
+    } else if (key == "rx_muted") {
+        info.name = "RX muted";
+        info.description = "True while the receive samples are replaced by silence (rx_mute_tx, transmitter keyed or within rx_mute_tail_ms "
+                           "of the unkeying); always false without receiver.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+        info.value = "false";
+    } else if (key == "tx_latency") {
+        info.name = "TX latency";
+        info.description = "Delay from writeStream() to the antenna of the open TX stream: the longer of the pre-roll and the keying "
+                           "sequence (relay_tx_delay_ms with a relay, plus ptt_tx_delay_ms with a PTT line), plus three quarters of the "
+                           "DMA ring; 0 without TX stream.";
+        info.type = SoapySDR::ArgInfo::FLOAT;
+        info.units = "ms";
+        info.value = "0";
     } else {
         throw std::runtime_error("rpitx: unknown sensor '" + key + "'");
     }
@@ -121,6 +136,8 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
         return ptt->IsPttAsserted() ? "true" : "false";
     if (key == "ptt_count")
         return std::to_string(ptt->KeyCount());
+    if (key == "rx_muted")
+        return rxDev && rxMuteTx.load() && ptt->MutedNow(rxMuteTailMs.load()) ? "true" : "false";
 
     if (!tx_stream)
         return info.value;
@@ -129,6 +146,16 @@ std::string SoapyRPITX::readSensor(const std::string &key) const {
 
     if (key == "pll_locked")
         return tx.IsPllLocked() ? "true" : "false";
+    if (key == "tx_latency") {
+        const SoapyRPITX_RelayConfig r = ptt->GetConfig();
+        double keyingMs = (r.gpio >= 0 ? (double) r.txDelayMs : 0.0) + (r.pttGpio >= 0 ? (double) r.pttTxDelayMs : 0.0);
+        double startMs = std::max((double) tx.PrerollMs(), keyingMs);
+        double slotRate = (double) tx.GetTune().sampleRate * (double) tx.SlotsPerSample();
+        double ringMs = slotRate > 0.0 ? 750.0 * (double) tx.RingSize() / slotRate : 0.0;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.3f", startMs + ringMs);
+        return buf;
+    }
 
     SoapyRPITX_TxStats stats = tx.GetStats();
     if (key == "dma_running")

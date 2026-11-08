@@ -192,7 +192,7 @@ LF/MF carriers need a lower sample rate. Hand-picking a slightly different carri
 | Exclusive hardware | One DMA channel, the PCM/I2S block (or PWM with `envelope_output=pwm`), VideoCore memory (140 bytes per ring slot), GPIO 0–9 frozen while streaming, one transmitter per system |
 | Clock tree | While a stream is open the VPU clock runs from PLLA, which the firmware must leave running; keep `gpu_freq=250`. Mini-UART, I2C, SPI and the SD host run at a different rate than the kernel believes |
 | Privileges | Root: `/dev/mem` and `/dev/vcio` |
-| Transmit only | No receive path and no timed writes (`SOAPY_SDR_HAS_TIME`) |
+| No timed writes | `SOAPY_SDR_HAS_TIME` is not supported; the receive path is the receiver attached with `rx=<driver>` |
 
 ---
 
@@ -480,7 +480,10 @@ receive samples are replaced by silence (zeros, mid-scale for unsigned formats, 
 included; flags and timestamps are kept), so an application can keep both streams running like on any transceiver.
 The receiver delivers its samples some time after it captured them (USB buffering), so the silence lasts
 `rx_mute_tail_ms` (default 50 ms) more after the unkeying; raise it when the end of a transmission still leaks into
-the received signal.
+the received signal. The mute acts on the samples as they are delivered, so `rx_mute_tail_ms` must be at least the
+buffering of the receiver (one USB transfer: for an RTL-SDR `bufflen` / 2 samples, ≈ 546 ms with the default
+`bufflen` of 262144 bytes at 240 kS/s, ≈ 34 ms with `bufflen=16384`). The `rx_muted` sensor tells an application which
+samples were replaced.
 
 **Antenna relay.** With `relay_gpio=<n>` the driver drives that GPIO as an output: RX position at open, TX position
 when the transmitter is keyed, back to RX when it is unkeyed and when the device is closed (the pin stays an output
@@ -570,7 +573,10 @@ as for the relay pin apply: GPIO2–27 except GPIO4, not the relay pin, not a pi
 | `rf_dac` | false | bool | GPIO20 as a second clock output, summed with GPIO4 by an external weighted network |
 
 Latency from `writeStream()` to the antenna ≈ FIFO fill + ¾ of the ring (≈ 64 ms for a 4096-slot ring at 48 kHz).
-An application that writes faster than real time keeps the FIFO full: latency ≈ `fifo_ms` + ¾ ring.
+An application that writes faster than real time keeps the FIFO full: latency ≈ `fifo_ms` + ¾ ring. An application
+that writes at the pace of the signal keeps the pre-roll in the FIFO; the `tx_latency` sensor reports that latency for
+the open stream, profile defaults, `slots_per_sample` and the keying sequence included (the first sample waits for the
+longer of the pre-roll and `relay_tx_delay_ms` + `ptt_tx_delay_ms`).
 
 ### Settings (also accepted as device arguments)
 
@@ -667,6 +673,8 @@ gain=7
 | `ptt` | bool | The transmitter is keyed: from the start of the keying sequence until the relay is back in RX; with `rx_mute_tx` the receiver is muted (always available) |
 | `ptt_line` | bool | The PTT GPIO (`ptt_gpio`) is asserted; always `false` without PTT line (always available) |
 | `ptt_count` | int | Times the transmitter has been keyed since the device was opened (always available) |
+| `rx_muted` | bool | The receive samples are being replaced by silence (`rx_mute_tx`, keyed or within `rx_mute_tail_ms` of the unkeying); always `false` without receiver (always available) |
+| `tx_latency` | float ms | Latency of the open TX stream for writes paced by the signal: the longer of `preroll_ms` and the keying sequence, plus ¾ of the DMA ring; `0` without TX stream |
 
 The channel sensors of the receiver are available on the RX channel (`listSensors(SOAPY_SDR_RX, 0)`).
 
